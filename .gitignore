@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+
+# Node / build output (mcp-server also has its own .gitignore)
+node_modules/
+**/node_modules/
+mcp-server/dist/
+*.tsbuildinfo
+
+# Secrets / local environment — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# Run artifacts
+agent-harness/runs/
+results*/
+*.log
+
+# R
+.Rhistory
+.RData
+.Rproj.user/

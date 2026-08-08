@@ -1,0 +1,25 @@
+{
+  "name": "experiment-design-mcp",
+  "version": "1.1.0",
+  "description": "MCP server wrapping the Experiment Design R framework",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test:lifecycle": "npm run build && node tests/lifecycle.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "overrides": {
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34",
+    "ip-address": "10.3.1"
+  }
+}

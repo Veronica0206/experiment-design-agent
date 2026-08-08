@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "experiment-design-ui",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "agent-harness/streamlit_app.py", "--server.headless", "true"],
+      "port": 8501
+    }
+  ]
+}
