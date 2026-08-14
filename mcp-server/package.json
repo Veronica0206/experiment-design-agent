@@ -2,6 +2,7 @@
   "name": "experiment-design-mcp",
   "version": "1.1.0",
   "private": true,
+  "license": "MPL-2.0",
   "description": "MCP server wrapping the Experiment Design R framework",
   "type": "module",
   "main": "dist/index.js",
