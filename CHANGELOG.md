@@ -4,6 +4,34 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## Unreleased — 2026-08-14 public distribution boundary
+
+- Made the public portfolio boundary prominent in both READMEs: the required
+  proprietary statistical engines are excluded, a fresh clone is not a
+  standalone executable agent, and a public build is not a complete readiness
+  attestation.
+- Added an executable-only MCP startup preflight that requires the private
+  engine entrypoints before transport connection or tool advertisement. Module
+  import remains side-effect free; an incomplete installation exits with one
+  fixed, path-free diagnostic and has no preflight bypass. The presence check
+  is explicitly not presented as scientific, regression, or release evidence.
+- Added a public-safe publishing policy that separates candidate-tree checks,
+  complete internal validation, and explicit push authorization while keeping
+  proprietary material, credentials, private data, and local paths outside the
+  public distribution.
+- Replaced the reusable publication clone with a temporary clone and a pinned,
+  public-only publication chain. The workflow resolves reviewed executables,
+  validates the fixed GitHub repository identity and every candidate state,
+  fixes commit metadata, requires an explicit publish mode, and applies the
+  manifest pin plus strict public path rules before and after commit creation.
+- Added `make public-check` for the source-review distribution. It validates
+  the public path policy, compiles the public MCP interface, and confirms npm
+  publication remains blocked without claiming that the omitted engines run.
+- Added a bounded pre-site sanitizer for RECORD-declared bytecode shipped in
+  locked wheels. It removes only regular `.pyc`/`.pyo` files inside the selected
+  venv package roots, rejects symlinks and traversal races, and immediately
+  hands the normalized environment to the exact distribution/RECORD validator.
+
 ## Unreleased — 2026-08-13 adversarial review (round 7)
 
 - Bound a fractional design's defining relation to the matrix it describes:
@@ -278,7 +306,7 @@ confirmed finding fixed and regression-covered.
   Rscripts no longer survive).
 
 ### Suite tooling
-- Root `README.md` (quickstart + verification model), `Makefile`
+- Root `README.md` (capability overview + verification model), `Makefile`
   (five R suites plus the local Python policy/unit matrix), `tools/bootstrap.sh`
   (fresh-checkout setup: toolchain check, npm build, R package check, full
   test run).

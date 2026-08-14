@@ -43,10 +43,15 @@ REQUIRED_RUNTIME_FILES = {
     "mcp-server/launch-server.sh",
     "tools/run-reviewed-r.sh",
     "tools/run-reviewed-python.sh",
+    "tools/run-publication-python.sh",
+    "tools/check_publish_source.py",
+    "tools/check_diff_credentials.py",
     "tools/reviewed_python_runner.py",
+    "tools/sanitize_python_environment.py",
     "tools/validate_r_environment.py",
     "tools/validate_r_lock.R",
     "tools/validate_python_environment.py",
+    "tools/validate_public_distribution.py",
     "hooks/launch_verification.sh",
     "hooks/launch_verification.mjs",
     "hooks/domain_tool_policy.mjs",
@@ -452,6 +457,9 @@ def valid_bootstrap_python_lock(bootstrap: str) -> bool:
     required_fragments = {
         '"$HARNESS_PYTHON" -E -s -S -B -I -c',
         "tools/run-reviewed-python.sh --validate-only",
+        '"$HARNESS_PYTHON" -E -s -S -B -I',
+        "tools/sanitize_python_environment.py",
+        "pip install --no-compile --require-hashes",
         "EXPDESIGN_PYTHON must be an absolute path",
         "EXPDESIGN_NODE must be an absolute path",
         "--check-python-lock",
@@ -530,6 +538,9 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r"^\s*@\$\(PYTHON_RUN\) --validate-only\s*$",
         r"^harness-release-check:\s*$",
         r"^release-check:\s*$",
+        r"^public-check:\s*$",
+        r'^\s*@tools/run-publication-python\.sh "\$\(CURDIR\)/tools/'
+        r'validate_public_distribution\.py" --public-clone "\$\(CURDIR\)"\s*$',
         r"^\s*@\$\(MAKE\) check-claude-version\s*$",
         r"^\s*@\$\(MAKE\) validate-python-lock\s*$",
         r"^\s*@\$\(MAKE\) harness-release-check\s*$",
@@ -541,6 +552,7 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r"^\s*@\$\(PYTHON_RUN\) hooks/tests/test_coordinator_verification\.py\s*$",
         r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_validate_python_environment\.py\s*$",
         r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_reviewed_python_runner\.py\s*$",
+        r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_sanitize_python_environment\.py\s*$",
     ))
     release = re.search(
         r"^release-check:\s*\n(?P<body>(?:^\t.*(?:\n|$))*)",
@@ -560,20 +572,92 @@ def valid_release_entrypoints(makefile: str) -> bool:
         and "check-claude-live" not in harness_release.group("body")
         and all(
             "$(PYTHON_RUN)" in line
+            or line.strip() == (
+                '@tools/run-publication-python.sh '
+                '"$(CURDIR)/tools/validate_public_distribution.py" '
+                '--public-clone "$(CURDIR)"'
+            )
             for line in makefile.splitlines()
             if line.startswith("\t") and ".py" in line
         )
     )
 
 
-def valid_publish_sync_guards(sync_script: str) -> bool:
-    required = {
-        'git -c core.hooksPath=/dev/null commit',
-        'check_publish_source.py" --tree-ish "$commit_sha"',
-        'git -c core.hooksPath=/dev/null push',
-        '"$commit_sha:refs/heads/main"',
+def valid_publish_sync_guards(
+    sync_script: str,
+    publication_runner: str,
+    public_validator: str,
+) -> bool:
+    """Validate the actual fail-closed public publication architecture."""
+    sync_required = {
+        '[ "$#" -eq 1 ] || usage',
+        "--dry-run) DRY=1 ;;",
+        "--publish-reviewed) DRY=0 ;;",
+        "EXPECTED_REPO=Veronica0206/experiment-design-agent",
+        "EXPECTED_CLONE_URL=https://github.com/Veronica0206/experiment-design-agent.git",
+        "MKTEMP_BIN=/usr/bin/mktemp",
+        "TEMP_ROOT=$($MKTEMP_BIN -d /tmp/experiment-design-publication.XXXXXX)",
+        "GH_ISOLATED_CONFIG=$TEMP_ROOT/gh-config",
+        'GH_CONFIG_DIR="$GH_ISOLATED_CONFIG" GH_TOKEN="$publication_token"',
+        '"$GH_BIN" auth token --hostname github.com',
+        'OWNER_HOME=$("$PYTHON_RUN" "$PUBLIC_GUARD" --owner-home)',
+        'validate_tree working "$CLONE"',
+        'validate_tree staged "$CLONE"',
+        'validate_tree committed "$CLONE" "$commit_sha"',
+        '"$PYTHON_RUN" "$PUBLISH_GUARD" "$tree"',
+        '"$PYTHON_RUN" "$PUBLIC_GUARD" "$tree"',
+        '"$PYTHON_RUN" "$PUBLISH_GUARD" --staged "$tree"',
+        '"$PYTHON_RUN" "$PUBLIC_GUARD" --staged "$tree"',
+        '"$PYTHON_RUN" "$PUBLISH_GUARD" --tree-ish "$object_id" "$tree"',
+        '"$PYTHON_RUN" "$PUBLIC_GUARD" --tree-ish "$object_id" "$tree"',
+        '"$PYTHON_RUN" "$PUBLIC_GUARD" --github-metadata "$metadata_dir"',
+        'prepush_sha=$(fetch_destination_metadata "$TEMP_ROOT/prepush")',
+        'published_sha=$(fetch_destination_metadata "$TEMP_ROOT/postpush")',
+        "--require-public-commit-metadata",
+        'run_git_commit -C "$CLONE" commit --quiet --message "$PUBLIC_COMMIT_MESSAGE"',
+        '--force-with-lease="refs/heads/$EXPECTED_BRANCH:$remote_sha"',
+        '"$commit_sha:refs/heads/$EXPECTED_BRANCH"',
     }
-    return all(fragment in sync_script for fragment in required)
+    runner_targets = {
+        '"$script_dir/check_publish_source.py"',
+        '"$script_dir/validate_public_distribution.py"',
+        '"$script_dir/check_diff_credentials.py"',
+    }
+    validator_required = {
+        'EXPECTED_NODE_ID = "R_kgDOTySG9w"',
+        "EXPECTED_REST_ID = 1327793911",
+        'EXPECTED_FULL_NAME = "Veronica0206/experiment-design-agent"',
+        'EXPECTED_BRANCH = "main"',
+        '"visibility": "public"',
+        'part.casefold().startswith("vera-")',
+        'path.name.casefold().endswith(".skill.enc")',
+        'mode.add_argument("--public-clone", type=Path)',
+        'root, "status", "--porcelain=v1", "--untracked-files=all"',
+        '"--ignored=matching"',
+        'PurePosixPath("mcp-server/node_modules")',
+        'PurePosixPath("mcp-server/dist")',
+        'root, "rev-parse", "--verify", "HEAD^{commit}"',
+    }
+    return (
+        sync_script.startswith("#!/bin/sh\n")
+        and publication_runner.startswith("#!/bin/sh\n")
+        and all(fragment in sync_script for fragment in sync_required)
+        and sync_script.count('validate_tree working "$PUBLISH_SRC"') >= 2
+        and sync_script.count("EXPDESIGN_REPO") == 1
+        and sync_script.count("EXPDESIGN_CLONE") == 1
+        and "${EXPDESIGN_REPO:-" not in sync_script
+        and "${EXPDESIGN_CLONE:-" not in sync_script
+        and "-m)" not in sync_script
+        and "--force " not in sync_script
+        and "--force\n" not in sync_script
+        and "/Users/" not in sync_script
+        and all(target in publication_runner for target in runner_targets)
+        and publication_runner.count('"$script_dir/') == 3
+        and "/usr/bin/env -i" in publication_runner
+        and 'EXPDESIGN_APPROVED_GIT="$git_bin"' in publication_runner
+        and all(fragment in public_validator for fragment in validator_required)
+        and "/Users/" not in public_validator
+    )
 
 
 def fail(message: str, failures: list[str]) -> None:
@@ -770,10 +854,19 @@ def main() -> int:
 
     try:
         sync_script = (ROOT / "tools" / "sync-to-github.sh").read_text(encoding="utf-8")
-        if not valid_publish_sync_guards(sync_script):
+        publication_runner = (ROOT / "tools" / "run-publication-python.sh").read_text(
+            encoding="utf-8"
+        )
+        public_validator = (ROOT / "tools" / "validate_public_distribution.py").read_text(
+            encoding="utf-8"
+        )
+        if not valid_publish_sync_guards(
+            sync_script, publication_runner, public_validator,
+        ):
             fail(
-                "publish sync must disable Git hooks, validate the committed tree, "
-                "and push the exact validated object",
+                "public sync must require explicit review, use an ephemeral clone, "
+                "pin repository identity, apply all public-tree gates, and push "
+                "the exact fixed-metadata commit under an exact-SHA lease",
                 failures,
             )
     except Exception as exc:

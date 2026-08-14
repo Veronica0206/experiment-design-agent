@@ -5,6 +5,7 @@ import fs from "node:fs";
 import {
   appendFileSync,
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -49,6 +50,8 @@ import {
 } from "../dist/r-bridge.js";
 import {
   assertFiniteNumericInputs,
+  MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE,
+  REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES,
   fingerprintStartupRuntime,
   installedProductionDependencyRoots,
   STARTUP_RUNTIME_FINGERPRINT,
@@ -316,6 +319,95 @@ try {
   ], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000 });
   assert.equal(importHandlerProbe.status, 0, importHandlerProbe.stderr);
   console.log("TEST importing_server_installs_no_process_handlers : PASS");
+
+  const dispatcherSource = readFileSync(
+    join(process.cwd(), "r-wrapper", "dispatcher.R"),
+    "utf8",
+  );
+  const dispatcherEngineFiles = [];
+  for (const match of dispatcherSource.matchAll(
+    /source_skill\(\s*"([^"]+)"([\s\S]*?)\)/g,
+  )) {
+    const skill = match[1];
+    for (const fileMatch of match[2].matchAll(/"([^"]+\.R)"/g)) {
+      dispatcherEngineFiles.push(`${skill}/scripts/R/${fileMatch[1]}`);
+    }
+  }
+  const expectedRequiredEngineFiles = [
+    ...new Set([
+      ...dispatcherEngineFiles,
+      ...REGRESSION_SKILLS.map(
+        (skill) => `${skill}/scripts/tests/run_tests.R`,
+      ),
+    ]),
+  ].sort();
+  assert.deepEqual(
+    [...REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES].sort(),
+    expectedRequiredEngineFiles,
+  );
+  console.log("TEST executable_engine_preflight_manifest_matches_dispatcher : PASS");
+
+  const publicCopyRoot = join(workspace, "public-portfolio-copy");
+  const publicCopyMcpRoot = join(publicCopyRoot, "mcp-server");
+  mkdirSync(publicCopyMcpRoot, { recursive: true, mode: 0o700 });
+  cpSync(join(process.cwd(), "dist"), join(publicCopyMcpRoot, "dist"), {
+    recursive: true,
+  });
+  cpSync(
+    join(process.cwd(), "package.json"),
+    join(publicCopyMcpRoot, "package.json"),
+  );
+  cpSync(
+    join(process.cwd(), "package-lock.json"),
+    join(publicCopyMcpRoot, "package-lock.json"),
+  );
+  symlinkSync(
+    realpathSync(join(process.cwd(), "node_modules")),
+    join(publicCopyMcpRoot, "node_modules"),
+    "dir",
+  );
+
+  const incompleteImportProbe = spawnSync(process.execPath, [
+    "--input-type=module", "-e", 'await import("./dist/index.js")',
+  ], {
+    cwd: publicCopyMcpRoot,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(incompleteImportProbe.status, 0, incompleteImportProbe.stderr);
+
+  const initializeRequest = JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05", capabilities: {},
+      clientInfo: { name: "incomplete-installation-regression", version: "1" },
+    },
+  });
+  const incompleteExecutableProbe = spawnSync(
+    process.execPath,
+    ["dist/index.js"],
+    {
+      cwd: publicCopyMcpRoot,
+      encoding: "utf8",
+      input: `${initializeRequest}\n`,
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        // A plausible bypass name must have no effect; no supported bypass
+        // exists for the executable startup preflight.
+        EXPDESIGN_SKIP_ENGINE_PREFLIGHT: "1",
+      },
+    },
+  );
+  assert.equal(incompleteExecutableProbe.status, 1, incompleteExecutableProbe.stderr);
+  assert.equal(incompleteExecutableProbe.stdout, "");
+  assert.equal(
+    incompleteExecutableProbe.stderr.trim(),
+    MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE,
+  );
+  assert.equal(incompleteExecutableProbe.stderr.includes(publicCopyRoot), false);
+  assert.equal(incompleteExecutableProbe.stderr.includes("vera-"), false);
+  console.log("TEST executable_preflight_refuses_incomplete_public_copy_before_mcp_connect : PASS");
 
   if (process.platform !== "win32") {
     const rMarker = join(workspace, "unexpected-r-execution.txt");

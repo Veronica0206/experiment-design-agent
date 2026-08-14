@@ -4,6 +4,7 @@ import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
+  lstatSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -31,6 +32,7 @@ import {
   FingerprintPromiseCache,
   fingerprintMutableEngineRuntime,
   hashFramedFields,
+  REGRESSION_SKILLS,
   shutdownActiveRuntimeProbeProcesses,
   waitForSharedPromise,
   type PythonRuntimeSnapshot,
@@ -52,6 +54,83 @@ const SUITE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const MCP_ROOT = join(SUITE_ROOT, "mcp-server");
 const MAX_STARTUP_DEPENDENCY_FILES = 20_000;
 const MAX_STARTUP_DEPENDENCY_BYTES = 256 * 1024 * 1024;
+export const MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE =
+  "Experiment Design MCP startup refused: the required private statistical " +
+  "engine installation is unavailable. This public portfolio copy is not a " +
+  "standalone executable distribution; use an authorized complete installation.";
+
+// This is an availability preflight, not a scientific or release-readiness
+// attestation. The later runtime fingerprint and regression gates remain the
+// authority for bytes and behavior. Keep this list limited to the private R
+// entry files directly sourced by the public dispatcher plus every required
+// regression entrypoint.
+export const REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES: readonly string[] = [
+  "vera-experiment-designing/scripts/R/config.R",
+  "vera-experiment-designing/scripts/R/sample_size.R",
+  "vera-experiment-designing/scripts/R/bayesian.R",
+  "vera-experiment-designing/scripts/R/frequentist.R",
+  "vera-experiment-designing/scripts/R/ppos.R",
+  "vera-experiment-designing/scripts/R/run_framework.R",
+  "vera-master-experiment-designing/scripts/R/shared_utils.R",
+  "vera-master-experiment-designing/scripts/R/master_config.R",
+  "vera-master-experiment-designing/scripts/R/basket_frequentist.R",
+  "vera-master-experiment-designing/scripts/R/basket_bhm.R",
+  "vera-master-experiment-designing/scripts/R/basket_bayesian.R",
+  "vera-master-experiment-designing/scripts/R/basket_borrowing.R",
+  "vera-master-experiment-designing/scripts/R/umbrella_mams.R",
+  "vera-master-experiment-designing/scripts/R/umbrella_dtl.R",
+  "vera-master-experiment-designing/scripts/R/umbrella_bar.R",
+  "vera-master-experiment-designing/scripts/R/platform_rar.R",
+  "vera-master-experiment-designing/scripts/R/platform_ncc.R",
+  "vera-master-experiment-designing/scripts/R/platform_simulation.R",
+  "vera-master-experiment-designing/scripts/R/run_master_framework.R",
+  "vera-indirect-comparing/scripts/R/indirect_comparison.R",
+  "vera-meta-analyzing/scripts/R/meta_endpoint_core.R",
+  "vera-doe-designing/scripts/R/doe.R",
+  ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/tests/run_tests.R`),
+];
+
+class MissingPrivateEngineInstallationError extends Error {
+  constructor() {
+    super(MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE);
+    this.name = "MissingPrivateEngineInstallationError";
+  }
+}
+
+/**
+ * Refuse executable startup when the private engine installation is absent.
+ *
+ * This check intentionally has no environment-variable bypass. It runs only
+ * from executable main, before the MCP transport is connected, so importing
+ * this module remains side-effect free and an incomplete public clone never
+ * advertises tools it cannot execute.
+ */
+export function assertRequiredPrivateEngineInstallation(
+  suiteRoot = SUITE_ROOT,
+): void {
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(resolve(suiteRoot));
+  } catch {
+    throw new MissingPrivateEngineInstallationError();
+  }
+
+  for (const relativePath of REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES) {
+    const candidate = resolve(canonicalRoot, ...relativePath.split("/"));
+    if (!candidate.startsWith(`${canonicalRoot}${sep}`)) {
+      throw new MissingPrivateEngineInstallationError();
+    }
+    try {
+      const entry = lstatSync(candidate);
+      if (!entry.isFile() || realpathSync(candidate) !== candidate) {
+        throw new MissingPrivateEngineInstallationError();
+      }
+    } catch {
+      throw new MissingPrivateEngineInstallationError();
+    }
+  }
+}
+
 const READ_ROOTS = (process.env.EXPDESIGN_ALLOWED_READ_ROOTS ?? SUITE_ROOT)
   .split(delimiter)
   .filter(Boolean)
@@ -1415,6 +1494,8 @@ registerStrictTool(
 );
 
 async function main() {
+  assertRequiredPrivateEngineInstallation();
+  installServerShutdownHandlers();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -1464,9 +1545,13 @@ try {
     realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
 } catch { /* imported modules and invalid argv never start a stdio server */ }
 if (invokedAsEntrypoint) {
-  installServerShutdownHandlers();
   main().catch(async (error) => {
-    console.error(error);
+    if (error instanceof MissingPrivateEngineInstallationError) {
+      // Keep the expected public-clone diagnostic fixed and path-free.
+      console.error(MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE);
+    } else {
+      console.error(error);
+    }
     await Promise.all([
       shutdownActiveRProcesses(),
       shutdownActiveVerifierProcesses(),

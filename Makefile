@@ -1,5 +1,5 @@
 # Experiment Design Agent Suite — single-command entry points.
-# `make release-check` is the complete release gate.
+# `make release-check` is the complete gate for an authorized installation.
 
 R_SUITES := vera-experiment-designing vera-master-experiment-designing \
             vera-doe-designing vera-indirect-comparing vera-meta-analyzing
@@ -8,7 +8,7 @@ PYTHON_RUN = EXPDESIGN_PYTHON="$(PYTHON)" tools/run-reviewed-python.sh
 
 .PHONY: test test-r test-py test-integration build deps validate-skills \
 	validate-config validate-r-lock validate-python-lock audit-deps check-claude-version \
-	check-claude-live harness-release-check release-check bootstrap
+	check-claude-live public-check harness-release-check release-check bootstrap
 
 test: test-r test-py
 
@@ -34,6 +34,7 @@ test-py:
 	@$(PYTHON_RUN) tools/tests/test_validate_manifests.py
 	@$(PYTHON_RUN) tools/tests/test_validate_python_environment.py
 	@$(PYTHON_RUN) tools/tests/test_reviewed_python_runner.py
+	@$(PYTHON_RUN) tools/tests/test_sanitize_python_environment.py
 	@$(PYTHON_RUN) tools/tests/test_validate_skills.py
 	@$(PYTHON_RUN) tools/tests/test_validate_r_lock.py
 
@@ -46,6 +47,16 @@ build:
 
 deps:
 	@cd mcp-server && npm ci
+
+# Runnable in the public portfolio distribution. This checks only the strict
+# public path policy, TypeScript build, and npm non-publication guard; it does
+# not claim that the omitted statistical engines or full release suite exist.
+public-check:
+	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-clone "$(CURDIR)"
+	@cd mcp-server && npm ci
+	@cd mcp-server && npm run build
+	@cd mcp-server && npm run test:private
+	@echo "== public-check: PASS (source-review surface only; analysis engines not tested) =="
 
 validate-skills:
 	@$(PYTHON_RUN) tools/validate_skills.py .
@@ -70,8 +81,9 @@ check-claude-version:
 check-claude-live:
 	@tools/bootstrap.sh --check-claude-live
 
-# Claude-independent gate for the standalone Python/MCP harness. This does not
-# claim that Claude Code's agent-scoped hooks are runnable on the host.
+# Claude-independent gate for the Python/MCP harness in an authorized complete
+# installation. This does not claim that Claude Code's agent-scoped hooks are
+# runnable on the host.
 harness-release-check:
 	@$(MAKE) deps
 	@$(MAKE) build
@@ -85,10 +97,10 @@ harness-release-check:
 	@echo "== harness-release-check: PASS =="
 
 # Complete agent release gate: enforce the minimum installed Claude Code version,
-# then run the standalone harness matrix. This gate does not require provider
-# authentication, but dependency installation and vulnerability audit steps do
-# require registry access. Check a live provider session separately with
-# `make check-claude-live`.
+# then run the authorized-installation harness matrix. This gate does not
+# require provider authentication, but dependency installation and
+# vulnerability audit steps do require registry access. Check a live provider
+# session separately with `make check-claude-live`.
 release-check:
 	@$(MAKE) check-claude-version
 	@$(MAKE) harness-release-check

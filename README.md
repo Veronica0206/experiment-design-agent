@@ -1,5 +1,12 @@
 # Experiment Design Agent
 
+> **Public portfolio distribution:** This repository intentionally excludes the
+> required proprietary statistical engine packages. It documents the agent
+> experience and includes the public orchestration, governance, verification,
+> and interface code for review, but a fresh clone is not a standalone
+> executable agent. MCP analyses and the complete internal release checks
+> require an authorized, complete local installation.
+
 Experiment Design Agent is a coordinated team of statistical specialists that
 helps researchers plan studies, evaluate complex trial designs, construct
 experiments and randomization plans, and synthesize comparative evidence.
@@ -126,10 +133,21 @@ or regulatory review.
 
 ## Availability
 
-This GitHub repository is a portfolio review copy of the agent experience and
-supported workflows. Proprietary statistical skill packages are not
-distributed, so full execution is available only through an authorized local
-installation.
+This public repository supports portfolio and source review of the distributed
+agent surface. A successful build or public-tree check does not establish that
+the omitted statistical engines are installed, that analyses can run, or that
+the complete internal release suite has passed. Full execution is available
+only through an authorized local installation containing those engines.
+
+In a public clone, the intentionally limited check is:
+
+```bash
+make public-check
+```
+
+It validates the public path policy, installs and compiles the distributed MCP
+interface, and confirms that the npm package remains non-publishable. It does
+not execute or attest the omitted statistical engines.
 
 This project is a research and design-support tool. Final study decisions remain
 the responsibility of qualified domain experts.

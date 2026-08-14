@@ -1,5 +1,11 @@
 # Experiment Design MCP Server
 
+> **Not a standalone public distribution:** The public portfolio repository
+> intentionally omits the required proprietary statistical engines. You can
+> inspect and compile the distributed TypeScript surface, but a fresh public
+> clone cannot execute the analysis tools. Operational use requires an
+> authorized, complete suite installation.
+
 Wraps the R experiment-design framework as 11 typed MCP tools over stdio:
 
 **Planning** — `validate_config`, `sample_size`, `simulate_design`,
@@ -7,13 +13,25 @@ Wraps the R experiment-design framework as 11 typed MCP tools over stdio:
 **Construction (DOE)** — `ab_test`, `factorial_design`, `rsm_design`, `randomize`
 **Verification** — `run_tests`
 
-## One-time setup
+## Build and authorized-installation prerequisites
+
+The commands below compile the public MCP interface. A successful build is not
+an operational-readiness or release attestation, and it does not supply the
+omitted engines.
 
 ```bash
 cd mcp-server
 npm ci
 npm run build      # compiles src/ -> dist/ (dist is gitignored)
 ```
+
+When the compiled entrypoint is executed, it checks for the required private
+engine entrypoints before connecting the MCP transport or advertising any
+tools. If the installation is incomplete, startup exits with a fixed,
+path-free explanation. This presence check has no bypass and is deliberately
+narrow: it does not validate scientific correctness, runtime dependencies,
+regression status, or complete release readiness. Those remain the job of the
+full authorized-installation validation and runtime gates.
 
 This package is intentionally non-publishable: `private: true` and a local
 `prepublishOnly` guard make an accidental `npm publish` fail closed.

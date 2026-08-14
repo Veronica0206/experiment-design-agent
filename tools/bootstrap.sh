@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# One-time setup for a fresh checkout: build the gitignored mcp-server/dist/
-# that .mcp.json points at, and verify the pinned Python, R, and Node runtimes.
+# Setup for an authorized complete checkout: build the gitignored
+# mcp-server/dist/ that .mcp.json points at, and verify the pinned Python, R,
+# and Node runtimes. The public portfolio distribution intentionally omits the
+# statistical engines; use `make public-check` there instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -89,13 +91,29 @@ raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
 }
 
 check_harness_dependencies() {
+  print_harness_setup_recipe() {
+    echo "Create a clean locked harness environment with:"
+    printf '  %q -E -s -S -B -I -m venv agent-harness/.venv\n' \
+      "$HARNESS_PYTHON"
+    echo "  agent-harness/.venv/bin/python -E -s -B -I -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock"
+    echo "Then rerun tools/bootstrap.sh. Set EXPDESIGN_PYTHON only to use another reviewed environment."
+  }
+
+  # A locked wheel may ship RECORD-declared bytecode. Normalize only the
+  # selected venv package roots under the same pre-site interpreter flags that
+  # protect the reviewed runner, then enforce the complete environment policy.
+  if ! "$HARNESS_PYTHON" -E -s -S -B -I \
+    tools/sanitize_python_environment.py
+  then
+    echo "ERROR: the pinned Python harness environment could not be sanitized safely."
+    print_harness_setup_recipe
+    exit 1
+  fi
   if ! EXPDESIGN_PYTHON="$HARNESS_PYTHON" \
     tools/run-reviewed-python.sh --validate-only
   then
-    echo "ERROR: the pinned Python harness environment is not ready. Run:"
-    echo "  python3 -m venv agent-harness/.venv"
-    echo "  agent-harness/.venv/bin/python -m pip install --require-hashes -r agent-harness/requirements.lock"
-    echo "Then rerun tools/bootstrap.sh. Set EXPDESIGN_PYTHON only to use another reviewed environment."
+    echo "ERROR: the pinned Python harness environment is not ready."
+    print_harness_setup_recipe
     exit 1
   fi
   echo "Python harness dependencies OK"

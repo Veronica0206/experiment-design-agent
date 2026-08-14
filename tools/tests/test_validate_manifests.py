@@ -249,6 +249,15 @@ python_launcher_text = (
 python_runner_text = (
     MODULE_PATH.parents[1] / "tools" / "reviewed_python_runner.py"
 ).read_text(encoding="utf-8")
+publish_sync_text = (
+    MODULE_PATH.parents[1] / "tools" / "sync-to-github.sh"
+).read_text(encoding="utf-8")
+publication_runner_text = (
+    MODULE_PATH.parents[1] / "tools" / "run-publication-python.sh"
+).read_text(encoding="utf-8")
+public_validator_text = (
+    MODULE_PATH.parents[1] / "tools" / "validate_public_distribution.py"
+).read_text(encoding="utf-8")
 lock_text = (MODULE_PATH.parents[1] / "agent-harness" / "requirements.lock").read_text(
     encoding="utf-8"
 )
@@ -259,6 +268,88 @@ r_integrity = json.loads(
 )
 checks["reviewed_r_integrity_manifest_accepted"] = (
     module.valid_r_package_integrity_manifest(r_integrity)
+)
+checks["public_publication_boundary_accepted"] = module.valid_publish_sync_guards(
+    publish_sync_text, publication_runner_text, public_validator_text,
+)
+checks["publication_runtime_files_are_required"] = {
+    "tools/run-publication-python.sh",
+    "tools/validate_public_distribution.py",
+    "tools/check_publish_source.py",
+    "tools/check_diff_credentials.py",
+}.issubset(module.REQUIRED_RUNTIME_FILES)
+checks["publication_without_explicit_review_flag_rejected"] = (
+    not module.valid_publish_sync_guards(
+        publish_sync_text.replace("--publish-reviewed) DRY=0 ;;", "--publish) DRY=0 ;;"),
+        publication_runner_text,
+        public_validator_text,
+    )
+)
+checks["persistent_publication_clone_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text.replace(
+        "TEMP_ROOT=$($MKTEMP_BIN -d /tmp/experiment-design-publication.XXXXXX)",
+        "TEMP_ROOT=$HOME/.cache/experiment-design-agent",
+    ),
+    publication_runner_text,
+    public_validator_text,
+)
+checks["missing_source_revalidation_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text.replace('validate_tree working "$PUBLISH_SRC"', "true", 1),
+    publication_runner_text,
+    public_validator_text,
+)
+checks["missing_staged_public_gate_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text.replace('validate_tree staged "$CLONE"', "true", 1),
+    publication_runner_text,
+    public_validator_text,
+)
+checks["missing_committed_public_validator_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text.replace(
+        '"$PYTHON_RUN" "$PUBLIC_GUARD" --tree-ish "$object_id" "$tree"',
+        "true",
+        1,
+    ),
+    publication_runner_text,
+    public_validator_text,
+)
+checks["wrong_public_repository_identity_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text,
+    publication_runner_text,
+    public_validator_text.replace("R_kgDOTySG9w", "wrong-node", 1),
+)
+checks["ambient_gh_config_reuse_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text.replace(
+        'GH_CONFIG_DIR="$GH_ISOLATED_CONFIG" GH_TOKEN="$publication_token"',
+        'HOME="$OWNER_HOME"',
+    ),
+    publication_runner_text,
+    public_validator_text,
+)
+checks["missing_public_clone_committed_mode_rejected"] = (
+    not module.valid_publish_sync_guards(
+        publish_sync_text,
+        publication_runner_text,
+        public_validator_text.replace(
+            'mode.add_argument("--public-clone", type=Path)',
+            'mode.add_argument("--working-tree", type=Path)',
+            1,
+        ),
+    )
+)
+checks["hardcoded_publication_home_rejected"] = not module.valid_publish_sync_guards(
+    publish_sync_text + "\nOWNER_HOME=/" + "Users/example\n",
+    publication_runner_text,
+    public_validator_text,
+)
+checks["arbitrary_publication_python_target_rejected"] = (
+    not module.valid_publish_sync_guards(
+        publish_sync_text,
+        publication_runner_text.replace(
+            '"$script_dir/check_diff_credentials.py") ;;',
+            '"$script_dir/check_diff_credentials.py"|"$script_dir/arbitrary.py") ;;',
+        ),
+        public_validator_text,
+    )
 )
 weakened_r_boundary = copy.deepcopy(r_integrity)
 weakened_r_boundary["proof_boundary"] = "versions are enough"

@@ -8,12 +8,32 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
 MANIFEST = "publish-manifest.json"
 LICENSE_NAMES = {"license", "license.md", "license.txt"}
+APPROVED_GIT_PATHS = {
+    "/usr/bin/git",
+    "/opt/homebrew/bin/git",
+    "/usr/local/bin/git",
+    "/opt/local/bin/git",
+}
+
+
+class DuplicateJsonKey(ValueError):
+    """Raised when an authorization manifest contains an ambiguous object."""
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKey(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
 
 def digest_bytes(value: bytes) -> str:
@@ -42,28 +62,76 @@ def _forbidden_proprietary_path(relative: str) -> str | None:
 
 def _working_entries(root: Path) -> tuple[dict[str, bytes], str | None]:
     entries: dict[str, bytes] = {}
-    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current, directories, files in os.walk(
+        root, topdown=True, onerror=raise_walk_error, followlinks=False,
+    ):
         current_path = Path(current)
         # Repository internals are neither release content nor manifest input.
-        directories[:] = [name for name in directories if name != ".git"]
+        if current_path == root and ".git" in directories:
+            git_metadata = current_path / ".git"
+            try:
+                metadata_mode = git_metadata.lstat().st_mode
+            except OSError as exc:
+                return {}, f"could not inspect repository metadata: {exc}"
+            if not stat.S_ISDIR(metadata_mode):
+                return {}, "root .git metadata must be a real directory"
+            directories.remove(".git")
         for name in directories:
             path = current_path / name
-            if path.is_symlink():
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                return {}, f"could not inspect publish-tree entry {path}: {exc}"
+            if stat.S_ISLNK(mode):
                 return {}, f"symlinks are forbidden in a publish tree: {path.relative_to(root)}"
+            if not stat.S_ISDIR(mode):
+                return {}, f"non-directory traversal entry is forbidden: {path.relative_to(root)}"
         for name in files:
             if name == ".git" and current_path == root:
-                continue
+                return {}, "root .git metadata must be a real directory"
             path = current_path / name
             relative = path.relative_to(root).as_posix()
-            if path.is_symlink():
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                return {}, f"could not inspect publish-tree entry {relative}: {exc}"
+            if stat.S_ISLNK(mode):
                 return {}, f"symlinks are forbidden in a publish tree: {relative}"
+            if not stat.S_ISREG(mode):
+                return {}, f"non-regular publish-tree entry is forbidden: {relative}"
             entries[relative] = path.read_bytes()
     return entries, None
 
 
+def _approved_git() -> str:
+    git = os.environ.get("EXPDESIGN_APPROVED_GIT", "")
+    if git not in APPROVED_GIT_PATHS:
+        raise RuntimeError("an approved absolute Git executable must be supplied")
+    path = Path(git)
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("the approved Git executable is unavailable")
+    return git
+
+
 def _git(root: Path, *args: str) -> bytes:
+    git = _approved_git()
     return subprocess.run(
-        ["git", "-C", str(root), *args], check=True, capture_output=True,
+        [git, "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
     ).stdout
 
 
@@ -75,7 +143,7 @@ def _staged_entries(root: Path) -> tuple[dict[str, bytes], str | None]:
             continue
         try:
             metadata, raw_name = record.split(b"\t", 1)
-            mode = metadata.split(b" ", 1)[0]
+            mode, object_id, stage = metadata.split(b" ", 2)
             name = raw_name.decode("utf-8", errors="surrogateescape")
         except Exception as exc:
             return {}, f"could not parse staged inventory: {exc}"
@@ -83,7 +151,9 @@ def _staged_entries(root: Path) -> tuple[dict[str, bytes], str | None]:
             return {}, f"symlinks are forbidden in a publish tree: {name}"
         if mode not in {b"100644", b"100755"}:
             return {}, f"unsupported staged entry mode {mode.decode()}: {name}"
-        entries[name] = _git(root, "show", f":{name}")
+        if stage != b"0" or re.fullmatch(rb"[0-9a-fA-F]{40,64}", object_id) is None:
+            return {}, f"unmerged or invalid staged entry is forbidden: {name}"
+        entries[name] = _git(root, "cat-file", "blob", object_id.decode("ascii"))
     return entries, None
 
 
@@ -127,7 +197,9 @@ def _validate(
             "EXPDESIGN_PUBLISH_MANIFEST_SHA256 to its reviewed SHA-256"
         )
     try:
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"), object_pairs_hook=_strict_object,
+        )
     except Exception as exc:
         return fail(f"invalid {MANIFEST}: {exc}")
     auth = manifest.get("authorization") if isinstance(manifest, dict) else None
@@ -154,7 +226,7 @@ def _validate(
         path = PurePosixPath(relative) if isinstance(relative, str) else None
         if path is None or path.is_absolute() or ".." in path.parts or str(path) != relative:
             return fail(f"unsafe manifest path: {relative!r}")
-        if not isinstance(expected, str) or len(expected) != 64:
+        if not isinstance(expected, str) or re.fullmatch(r"[0-9a-fA-F]{64}", expected) is None:
             return fail(f"invalid sha256 for {relative}")
         if digest_bytes(entries[relative]) != expected.lower():
             return fail(f"hash mismatch for {relative}")
@@ -169,6 +241,8 @@ def main() -> int:
     source_mode.add_argument("--tree-ish", metavar="OBJECT_ID")
     parser.add_argument("source", type=Path)
     args = parser.parse_args()
+    if args.source.is_symlink():
+        return fail("publish source root may not be a symlink")
     root = args.source.resolve()
     if not root.is_dir():
         return fail(f"publish source is not a directory: {root}")
