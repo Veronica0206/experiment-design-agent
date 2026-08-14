@@ -11,7 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
-from verification import (PUBLIC_LIMITATION_MESSAGES, content_hash,
+from verification import (PUBLIC_LIMITATION_MESSAGES, canonical_value,
+                          content_hash,
                           domain_arguments, identity_matches_call,
                           public_check_summary, public_envelope_matches_call,
                           public_limitation_codes)
@@ -42,22 +43,39 @@ _ENUM_VALUES = {
         "time_to_event", "incidence_single", "incidence_comparative",
     },
     "inference_method": {"hksj", "dl_z", "fixed_normal"},
+    "borrowing_method": {
+        "none", "complete", "simon_two_stage", "simons_bayesian",
+        "chen_confirmatory", "wathen_sti", "cbhm", "full_bhm", "snti",
+        "sep_gibbs",
+    },
+    "chen_strategy": {"d1", "d2", "d3"},
+    "fwer_control": {"bonferroni", "none"},
     "maic_endpoint_type": {"binary", "continuous", "rate", "tte"},
     "master_design_type": {"basket", "umbrella", "platform"},
     "method": {"simple", "block", "stratified", "bucher", "maic"},
     "metric": {"proportion", "mean"},
+    "ncc_method": {"none", "pooled", "regression", "time_machine"},
+    "phase": {"phase2", "phase3"},
     "point_type": {"factorial", "axial", "center", "edge"},
+    "power_type": {"one_minimum"},
     "rate_method": {"poisson"},
+    "selection_rule": {"rank_best", "threshold"},
     "study_type": {"signal_detection", "poc", "confirmatory"},
     "test": {"exact_binomial", "one_sample_t", "z_unpooled", "two_sample_t",
              "exponential_rate", "logrank", "exact_poisson", "poisson_rate_ratio"},
     "tte_method": {"exponential", "cox"},
     "type": {"full_factorial", "fractional_factorial", "central_composite", "box_behnken"},
+    "umbrella_method": {"mams", "drop_the_losers", "bayesian_adaptive_randomization"},
 }
 
 _BOOLEAN_FIELDS = {
     "interim_stopping_applied", "orthogonal", "random", "randomize",
-    "truly_active",
+    "rar_enabled", "shared_control", "truly_active",
+}
+
+_PRIOR_NAMES = {"jeffreys", "flat", "skeptical"}
+_CUSTOM_PRIOR_FIELDS = {
+    "a", "b", "mu0", "kappa0", "alpha0", "beta0", "shape", "rate",
 }
 
 _ENUM_ALIASES = {
@@ -115,7 +133,7 @@ _SINGLE_CONFIG = {
     "endpoint_type", "study_type", "design", "null_param", "alt_param", "sd",
     "alloc_ratio", "alphas", "powers", "go_threshold", "consider_threshold",
     "go_target", "accrual_time", "followup_time", "exposure_time", "tte_method",
-    "rate_method",
+    "rate_method", "prior",
 }
 _SAMPLE_ROW = {
     "design", "test", "alpha", "power_target", "power_achieved", "n", "n_total",
@@ -224,7 +242,12 @@ _MASTER_CONFIG = {
     "n_per_subgroup", "n_sims", "seed", "alpha", "n_arms", "n_stages",
     "n_per_arm_stage", "n_periods", "n_per_period", "arms_schedule", "go_threshold",
     "nogo_threshold", "futility_threshold", "effect_threshold", "sd", "accrual_time",
-    "followup_time", "exposure_time", "tte_method", "rate_method",
+    "followup_time", "exposure_time", "tte_method", "rate_method", "borrowing_method",
+    "phase", "n_interims", "n_per_interim", "tau_prior", "homogeneity_prior",
+    "response_prior", "cbhm_a", "cbhm_b", "ia_pruning_alpha", "chen_strategy",
+    "umbrella_method", "futility_boundaries", "n_drop_per_stage", "rar_gamma",
+    "selection_rule", "power_type", "shared_control", "ncc_method", "ncc_weight_decay",
+    "rar_enabled", "rar_burn_in", "rar_min_alloc", "interim_frequency", "fwer_control",
 }
 _ARG_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
     "validate_config": {(): set(_SINGLE_CONFIG)},
@@ -233,12 +256,15 @@ _ARG_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
         (): {"config", "seed", "n_oc", "b_oc", "delta"},
         ("config",): set(_SINGLE_CONFIG) | {"p2_data", "p2_data_ctrl", "p3_n",
                                                   "p3_alloc_ratio", "p3_alpha"},
+        ("config", "prior"): set(_CUSTOM_PRIOR_FIELDS),
         ("n_oc",): {"n", "n_trt", "n_ctrl"},
     },
     "master_simulate": {
         (): {"config"},
         ("config",): set(_MASTER_CONFIG),
         ("config", "arms_schedule"): {"enter", "leave"},
+        ("config", "tau_prior"): {"type", "params"},
+        ("config", "tau_prior", "params"): {"scale"},
     },
     "indirect_compare": {
         (): {"method", "comparisons", "covariates", "alpha", "analysis_scale",
@@ -272,6 +298,8 @@ _NUMERIC_SEQUENCE_PATHS = {
     ("master_simulate", "arguments", ("config", "alt_params")),
     ("master_simulate", "arguments", ("config", "arms_schedule", "enter")),
     ("master_simulate", "arguments", ("config", "arms_schedule", "leave")),
+    ("master_simulate", "arguments", ("config", "futility_boundaries")),
+    ("master_simulate", "arguments", ("config", "n_drop_per_stage")),
     ("factorial_design", "arguments", ("levels",)),
     ("factorial_design", "result", ("levels",)),
     ("randomize", "arguments", ("ratio",)),
@@ -303,7 +331,7 @@ _DROP = object()
 
 _CLARIFICATION_FIELDS = {
     "endpoint_type", "study_type", "design", "estimand", "null_param", "alt_param",
-    "sd", "alpha", "power", "allocation_ratio", "sample_size", "number_of_arms",
+    "sd", "alpha", "alpha_sidedness", "power", "allocation_ratio", "sample_size", "number_of_arms",
     "number_of_stages", "decision_threshold", "prior", "followup_time", "exposure_time",
     "randomization_method", "factor_levels", "analysis_method", "data_source",
 }
@@ -352,6 +380,19 @@ def _bounded_sequence(
     return projected
 
 
+def _factor_name_sort_key(name: str) -> tuple[int, int, str]:
+    """Sort canonical public aliases numerically and all other names stably."""
+    prefix = "factor_"
+    if name.startswith(prefix):
+        suffix = name[len(prefix):]
+        # Generated aliases are positive, canonical decimal integers.  Compare
+        # by digit length and then text so even an unexpectedly large suffix is
+        # ordered numerically without converting attacker-controlled text.
+        if suffix and suffix.isascii() and suffix.isdigit() and suffix[0] != "0":
+            return (0, len(suffix), suffix)
+    return (1, 0, name)
+
+
 def _project_design(value: Any) -> Any:
     """Preserve a numeric design matrix while pseudonymizing factor names."""
     if not isinstance(value, (list, tuple)):
@@ -359,11 +400,14 @@ def _project_design(value: Any) -> Any:
     if len(value) > 200:
         return _collection_summary(value)
     rows = [row for row in value if isinstance(row, dict)]
-    factor_names = sorted({
-        str(key) for row in rows for key, item in row.items()
-        if str(key).lower() not in {"point_type", "run"}
-        and _number(item) is not _DROP
-    })
+    factor_names = sorted(
+        {
+            str(key) for row in rows for key, item in row.items()
+            if str(key).lower() not in {"point_type", "run"}
+            and _number(item) is not _DROP
+        },
+        key=_factor_name_sort_key,
+    )
     aliases = {name: f"factor_{index + 1}" for index, name in enumerate(factor_names)}
     public_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -492,6 +536,19 @@ def _project_value(
         if normalized.startswith("pruned"):
             return "pruned"
         return _DROP
+    if mode == "arguments" and lowered == "prior" and tool in {
+        "validate_config", "sample_size", "simulate_design",
+    }:
+        if isinstance(value, str):
+            normalized = value.lower()
+            return normalized if normalized in _PRIOR_NAMES else _DROP
+        if isinstance(value, dict) and value and set(value) <= _CUSTOM_PRIOR_FIELDS:
+            projected = {str(name): _number(item) for name, item in sorted(value.items())}
+            return projected if all(item is not _DROP for item in projected.values()) else _DROP
+        return _DROP
+    if (tool == "master_simulate" and mode == "arguments"
+            and path == ("config", "tau_prior") and lowered == "type"):
+        return "half_normal" if value == "half_normal" else _DROP
     if lowered in _ENUM_VALUES:
         if not isinstance(value, str):
             return _DROP
@@ -610,17 +667,21 @@ def _render_report(
         f"- {PUBLIC_LIMITATION_MESSAGES[code]}" for code in blocked
     ) if blocked else "- None recorded."
 
+    title = (
+        "# Partially verified experiment-design result"
+        if blocked else "# Verified experiment-design result"
+    )
     return (
-        "# Verified experiment-design result\n\n"
+        f"{title}\n\n"
         "## Question and estimand\n"
         f"Tool: `{tool}`\n\n"
         "## Resolved assumptions\n"
         "```json\n"
-        f"{json.dumps(assumptions, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
+        f"{json.dumps(canonical_value(assumptions), sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
         "```\n\n"
         "## Result\n"
         "```json\n"
-        f"{json.dumps(safe_result, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
+        f"{json.dumps(canonical_value(safe_result), sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
         "```\n\n"
         "## Verification\n"
         f"- verification_id: `{analysis_id}`\n"
@@ -630,7 +691,7 @@ def _render_report(
         "## Limitations\n"
         f"{limitations}\n\n"
         "## Decision\n"
-        "Use only the decision fields, if any, in the verified Result block above; "
+        "Use only the decision fields, if any, in the presentable Result block above; "
         "no additional model-generated numeric interpretation is authorized."
     )
 

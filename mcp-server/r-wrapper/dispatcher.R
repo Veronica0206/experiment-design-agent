@@ -87,14 +87,52 @@ tryCatch({
   if (tool_name == "validate_config") {
     source_skill("vera-experiment-designing", "config.R")
     cfg <- do.call(create_config, params)
+    json_null_if_absent <- function(value) if (is.null(value)) NA else value
+    estimand <- switch(cfg$endpoint_type,
+      binary = if (cfg$design == "single_arm") "response_probability" else "risk_difference",
+      continuous = if (cfg$design == "single_arm") "mean" else "mean_difference",
+      tte = if (cfg$design == "single_arm") "hazard_rate" else "hazard_ratio",
+      incidence_rate = if (cfg$design == "single_arm") "incidence_rate" else "rate_difference"
+    )
     write_result(list(
       valid = TRUE,
+      # Retain the original flat fields for existing clients while exposing the
+      # complete privacy-safe preflight contract below.
       endpoint_type = cfg$endpoint_type,
       study_type = cfg$study_type,
       design = cfg$design,
       go_target = cfg$go_target,
       alphas = cfg$alphas,
-      powers = cfg$powers
+      powers = cfg$powers,
+      resolved_config = list(
+        endpoint_type = cfg$endpoint_type,
+        study_type = cfg$study_type,
+        design = cfg$design,
+        estimand = estimand,
+        direction = cfg$direction,
+        sidedness = "one_sided",
+        null_param = cfg$null_param,
+        alt_param = cfg$alt_param,
+        sd = json_null_if_absent(cfg$sd),
+        alloc_ratio = cfg$alloc_ratio,
+        alphas = cfg$alphas,
+        powers = cfg$powers,
+        prior_params = cfg$prior_params,
+        go_threshold = cfg$go_threshold,
+        consider_threshold = cfg$consider_threshold,
+        go_target = cfg$go_target,
+        p3_n = json_null_if_absent(cfg$p3_n),
+        p3_alloc_ratio = cfg$p3_alloc_ratio,
+        p3_alpha = cfg$p3_alpha,
+        accrual_time = json_null_if_absent(cfg$accrual_time),
+        followup_time = json_null_if_absent(cfg$followup_time),
+        tte_method = json_null_if_absent(cfg$tte_method),
+        exposure_time = json_null_if_absent(cfg$exposure_time),
+        rate_method = json_null_if_absent(cfg$rate_method),
+        has_p2_data = !is.null(cfg$p2_data),
+        has_p2_control_data = !is.null(cfg$p2_data_ctrl)
+      ),
+      simulation_defaults = list(seed = 42L, B_oc = 5000L)
     ))
 
   } else if (tool_name == "sample_size") {
@@ -282,6 +320,7 @@ tryCatch({
     formal_names <- names(formals(input_fn))
     yi <- rep(NA_real_, n_studies)
     vi <- rep(NA_real_, n_studies)
+    effect_measures <- rep(NA_character_, n_studies)
     drop_reason <- rep(NA_character_, n_studies)
     for (i in seq_len(n_studies)) {
       s <- get_study(i)
@@ -293,11 +332,18 @@ tryCatch({
       }
       yi[i] <- inp$yi
       vi[i] <- inp$vi
+      if (!is.null(inp$measure) && length(inp$measure) > 0L) {
+        effect_measures[i] <- as.character(inp$measure[[1L]])
+      }
       if ("exclusion_reason" %in% names(inp) &&
           length(inp$exclusion_reason) > 0L && !is.na(inp$exclusion_reason[[1]])) {
         drop_reason[i] <- as.character(inp$exclusion_reason[[1]])
       }
     }
+    # Fail before meta_iv() if successfully parsed studies are on different
+    # statistical scales. Pooling their numeric yi values would produce a
+    # dimensionless but scientifically meaningless result.
+    effect_measure <- common_effect_measure(effect_measures)
     # meta_iv() silently pools only studies with finite yi/vi and vi > 0. Mirror
     # that rule here so every exclusion is VISIBLE (n_input / k_used /
     # dropped_studies / dropped_detail) instead of silent, and NA-out non-finite
@@ -313,8 +359,11 @@ tryCatch({
     pool <- meta_iv(yi, vi, alpha = alpha, random = random,
                     inference_method = inference_method)
     result <- as.list(pool)
+    result$effect_measure <- effect_measure
+    result$endpoint_type <- endpoint_type
     result$study_effects <- yi
     result$study_variances <- vi
+    result$study_effect_measures <- effect_measures
     result$n_input <- n_studies
     result$k_used <- pool$k
     result$dropped_studies <- n_studies - pool$k

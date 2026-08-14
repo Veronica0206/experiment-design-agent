@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ IGNORE_DIRS = {".git", ".venv", "__pycache__", "runs"}
 IGNORE_FILES = {".DS_Store"}
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ABS_PATH_RE = re.compile(r"/Users/(?!<)[A-Za-z0-9_.-]+/")
+R_LAUNCHER = Path(__file__).resolve().with_name("run-reviewed-r.sh")
 
 
 def frontmatter(path: Path) -> dict[str, Any]:
@@ -84,6 +86,7 @@ def validate(skill: Path) -> list[str]:
     if not prompts.is_file():
         errors.append(f"{skill.name}: missing test-prompts.json")
 
+    prompt_ids: set[str] = set()
     for path in iter_files(skill):
         relative = path.relative_to(skill).as_posix()
         if path.suffix == ".json":
@@ -94,14 +97,51 @@ def validate(skill: Path) -> list[str]:
                     or not value["prompts"]
                 ):
                     errors.append(f"{skill.name}: test-prompts.json needs a non-empty prompts list")
+                elif path.name == "test-prompts.json":
+                    for index, prompt in enumerate(value["prompts"]):
+                        if (not isinstance(prompt, dict)
+                                or set(prompt) != {"id", "prompt", "expected"}
+                                or not all(isinstance(prompt.get(key), str) and prompt[key].strip()
+                                           for key in ("id", "prompt", "expected"))):
+                            errors.append(
+                                f"{skill.name}: test-prompts.json entry {index} must contain "
+                                "non-empty id, prompt, and expected strings")
+                            continue
+                        if prompt["id"] in prompt_ids:
+                            errors.append(
+                                f"{skill.name}: duplicate test-prompts id: {prompt['id']}")
+                        prompt_ids.add(prompt["id"])
             except Exception as exc:
                 errors.append(f"{skill.name}: {relative} invalid JSON: {exc}")
+        elif path.suffix in {".yaml", ".yml"}:
+            try:
+                yaml.safe_load(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                errors.append(f"{skill.name}: {relative} invalid YAML: {exc}")
         elif path.suffix == ".py":
             try:
                 compile(path.read_text(encoding="utf-8"), str(path), "exec")
             except Exception as exc:
                 errors.append(f"{skill.name}: {relative} does not compile: {exc}")
-        if path.suffix in {".md", ".json", ".yaml", ".yml", ".txt", ".py", ".sh"}:
+        elif path.suffix.lower() == ".r":
+            parsed = subprocess.run(
+                [
+                    "/bin/sh", str(R_LAUNCHER), "-e",
+                    "parse(file=commandArgs(TRUE)[1])", str(path),
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            if parsed.returncode != 0:
+                diagnostic = (parsed.stderr or parsed.stdout or "parse failed").strip().splitlines()[-1]
+                errors.append(f"{skill.name}: {relative} does not parse: {diagnostic}")
+        elif path.suffix == ".sh":
+            parsed = subprocess.run(
+                ["bash", "-n", str(path)], capture_output=True, text=True, timeout=10,
+            )
+            if parsed.returncode != 0:
+                diagnostic = (parsed.stderr or "parse failed").strip().splitlines()[-1]
+                errors.append(f"{skill.name}: {relative} does not parse: {diagnostic}")
+        if path.suffix in {".md", ".json", ".yaml", ".yml", ".txt", ".py", ".sh", ".R", ".r"}:
             if ABS_PATH_RE.search(path.read_text(encoding="utf-8", errors="replace")):
                 errors.append(f"{skill.name}: {relative} contains a hardcoded user path")
     return errors

@@ -3,8 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import copy
+import io
+import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -47,8 +54,8 @@ checks = {
     ),
     "exact_mcp_config_accepted": module.valid_mcp_config({
         "mcpServers": {"experiment-design": {
-            "command": "node",
-            "args": ["${CLAUDE_PROJECT_DIR:-.}/mcp-server/dist/index.js"],
+            "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR:-.}/mcp-server/launch-server.sh"],
         }}
     }),
     "arbitrary_mcp_command_rejected": not module.valid_mcp_config({
@@ -60,13 +67,58 @@ checks = {
     "extra_mcp_server_rejected": not module.valid_mcp_config({
         "mcpServers": {
             "experiment-design": {
-                "command": "node",
-                "args": ["${CLAUDE_PROJECT_DIR:-.}/mcp-server/dist/index.js"],
+                "command": "/bin/sh",
+                "args": ["${CLAUDE_PROJECT_DIR:-.}/mcp-server/launch-server.sh"],
             },
             "extra": {"command": "node", "args": ["extra.js"]},
         }
     }),
+    "private_mcp_package_accepted": module.valid_private_mcp_package(
+        {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+            "scripts": {
+                "prepublishOnly": "node scripts/block-publish.mjs",
+                "test:private": "node tests/private-package.mjs",
+                "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs",
+            },
+        },
+        {"packages": {"": {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+        }}},
+    ),
+    "publishable_mcp_package_rejected": not module.valid_private_mcp_package(
+        {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": False,
+            "scripts": {
+                "prepublishOnly": "node scripts/block-publish.mjs",
+                "test:private": "node tests/private-package.mjs",
+                "test:lifecycle": "npm run test:private",
+            },
+        },
+        {"packages": {"": {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+        }}},
+    ),
+    "missing_publish_blocker_rejected": not module.valid_private_mcp_package(
+        {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+            "scripts": {
+                "test:private": "node tests/private-package.mjs",
+                "test:lifecycle": "npm run test:private",
+            },
+        },
+        {"packages": {"": {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+        }}},
+    ),
     "record_launcher_accepted": module.valid_hook_launcher({
+        "type": "command",
+        "command": "/bin/sh",
+        "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
+                 "experiment-designer"],
+        "timeout": 120,
+    }, "record", "experiment-designer"),
+    "ambient_path_shell_rejected": not module.valid_hook_launcher({
         "type": "command",
         "command": "sh",
         "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
@@ -75,14 +127,14 @@ checks = {
     }, "record", "experiment-designer"),
     "wrong_hook_mode_rejected": not module.valid_hook_launcher({
         "type": "command",
-        "command": "sh",
+        "command": "/bin/sh",
         "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
                  "experiment-designer"],
         "timeout": 120,
     }, "enforce", "experiment-designer"),
     "wrong_hook_scope_rejected": not module.valid_hook_launcher({
         "type": "command",
-        "command": "sh",
+        "command": "/bin/sh",
         "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
                  "design-verifier"],
         "timeout": 120,
@@ -94,32 +146,527 @@ checks = {
     }, "enforce", "experiment-designer"),
     "agent_scoped_hooks_accepted": module.valid_agent_hooks({
         "PostToolBatch": [{"hooks": [{
-            "type": "command", "command": "sh",
+            "type": "command", "command": "/bin/sh",
             "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
                      "experiment-designer"],
             "timeout": 120,
         }]}],
         "Stop": [{"hooks": [{
-            "type": "command", "command": "sh",
+            "type": "command", "command": "/bin/sh",
             "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "enforce",
                      "experiment-designer"],
             "timeout": 120,
         }]}],
     }, "experiment-designer"),
+    "coordinator_prompt_binding_hooks_accepted": module.valid_agent_hooks({
+        "UserPromptSubmit": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "capture",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "PreToolUse": [{"matcher": "Agent", "hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "bind",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "PostToolBatch": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "Stop": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "enforce",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+    }, "experiment-design-coordinator", coordinator=True),
+    "coordinator_missing_capture_rejected": not module.valid_agent_hooks({
+        "PreToolUse": [{"matcher": "Agent", "hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "bind",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "PostToolBatch": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "Stop": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "enforce",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+    }, "experiment-design-coordinator", coordinator=True),
+    "coordinator_wrong_agent_matcher_rejected": not module.valid_agent_hooks({
+        "UserPromptSubmit": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "capture",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "PreToolUse": [{"matcher": "Agent|SendMessage", "hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "bind",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "PostToolBatch": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+        "Stop": [{"hooks": [{
+            "type": "command", "command": "/bin/sh",
+            "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "enforce",
+                     "experiment-design-coordinator"],
+            "timeout": 120,
+        }]}],
+    }, "experiment-design-coordinator", coordinator=True),
     "missing_stop_hook_rejected": not module.valid_agent_hooks({
         "PostToolBatch": [{"hooks": [{
-            "type": "command", "command": "sh",
+            "type": "command", "command": "/bin/sh",
             "args": ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record",
                      "experiment-designer"],
             "timeout": 120,
         }]}],
     }, "experiment-designer"),
 }
+
+bootstrap_text = (MODULE_PATH.parents[1] / "tools" / "bootstrap.sh").read_text(
+    encoding="utf-8"
+)
+python_launcher_text = (
+    MODULE_PATH.parents[1] / "tools" / "run-reviewed-python.sh"
+).read_text(encoding="utf-8")
+python_runner_text = (
+    MODULE_PATH.parents[1] / "tools" / "reviewed_python_runner.py"
+).read_text(encoding="utf-8")
+lock_text = (MODULE_PATH.parents[1] / "agent-harness" / "requirements.lock").read_text(
+    encoding="utf-8"
+)
+r_integrity = json.loads(
+    (MODULE_PATH.parents[1] / "governance" / "r-package-integrity.json").read_text(
+        encoding="utf-8"
+    )
+)
+checks["reviewed_r_integrity_manifest_accepted"] = (
+    module.valid_r_package_integrity_manifest(r_integrity)
+)
+weakened_r_boundary = copy.deepcopy(r_integrity)
+weakened_r_boundary["proof_boundary"] = "versions are enough"
+checks["weakened_r_integrity_boundary_rejected"] = (
+    not module.valid_r_package_integrity_manifest(weakened_r_boundary)
+)
+malformed_r_digest = copy.deepcopy(r_integrity)
+first_environment = malformed_r_digest["environments"][0]
+first_package = next(iter(first_environment["packages"].values()))
+first_package["tree_sha256"] = "not-a-sha256"
+checks["malformed_r_tree_digest_rejected"] = (
+    not module.valid_r_package_integrity_manifest(malformed_r_digest)
+)
+checks["fully_hashed_python_lock_accepted"] = module.valid_python_requirements_lock(
+    lock_text
+)
+
+
+def remove_first_entry_hashes(value: str) -> str:
+    """Return a syntactically pinned lock with one deliberately unhashed entry."""
+    output: list[str] = []
+    inside_first_entry = False
+    first_entry_finished = False
+    for line in value.splitlines():
+        if module.LOCK_PIN_RE.fullmatch(line):
+            if inside_first_entry:
+                first_entry_finished = True
+            inside_first_entry = not first_entry_finished
+            output.append(line)
+            continue
+        if inside_first_entry and "--hash=" in line:
+            continue
+        output.append(line)
+    return "\n".join(output) + "\n"
+
+
+checks["unhashed_python_lock_entry_rejected"] = not module.valid_python_requirements_lock(
+    remove_first_entry_hashes(lock_text)
+)
+checks["malformed_python_lock_hash_rejected"] = not module.valid_python_requirements_lock(
+    lock_text.replace("--hash=sha256:", "--hash=sha256:not-a-digest-", 1)
+)
+checks["plain_pin_with_disconnected_hash_rejected"] = not module.valid_python_requirements_lock(
+    "example==1.0.0\n# detached hash must not bind\n"
+    + "    --hash=sha256:" + "0" * 64 + "\n"
+)
+checks["continued_pin_with_interrupted_hashes_rejected"] = (
+    not module.valid_python_requirements_lock(
+        "example==1.0.0 \\\n# interruption is not part of the requirement\n"
+        + "    --hash=sha256:" + "0" * 64 + "\n"
+    )
+)
+checks["full_python_lock_validation_accepted"] = module.valid_bootstrap_python_lock(
+    bootstrap_text
+)
+checks["separate_claude_check_semantics_accepted"] = module.valid_claude_check_semantics(
+    bootstrap_text
+)
+checks["missing_live_auth_probe_rejected"] = not module.valid_claude_check_semantics(
+    bootstrap_text.replace('"$REVIEWED_CLAUDE" auth status', "true", 1)
+)
+checks["direct_only_python_validation_rejected"] = not module.valid_bootstrap_python_lock(
+    bootstrap_text.replace(
+        "tools/run-reviewed-python.sh --validate-only",
+        '"$HARNESS_PYTHON" -E -s -S -B tools/validate_python_environment.py',
+        1,
+    )
+)
+checks["reviewed_python_runner_policy_accepted"] = module.valid_reviewed_python_runner(
+    python_launcher_text, python_runner_text,
+)
+checks["runner_without_isolation_flag_rejected"] = not module.valid_reviewed_python_runner(
+    python_launcher_text.replace(" -I \\\n", " \\\n", 1), python_runner_text,
+)
+checks["runner_without_source_symlink_policy_rejected"] = (
+    not module.valid_reviewed_python_runner(
+        python_launcher_text,
+        python_runner_text.replace(
+            "symlinked project source entry is forbidden",
+            "project source entry could not be inspected",
+        ),
+    )
+)
+relative_python = subprocess.run(
+    ["/bin/bash", "tools/bootstrap.sh", "--check-python-lock"],
+    cwd=MODULE_PATH.parents[1],
+    env={**os.environ, "EXPDESIGN_PYTHON": "agent-harness/.venv/bin/python"},
+    capture_output=True,
+    text=True,
+    check=False,
+)
+checks["relative_python_override_rejected"] = (
+    relative_python.returncode != 0
+    and "EXPDESIGN_PYTHON must be an absolute path"
+    in relative_python.stdout + relative_python.stderr
+)
+relative_node = subprocess.run(
+    ["/bin/bash", "tools/bootstrap.sh", "--check-claude-version"],
+    cwd=MODULE_PATH.parents[1],
+    env={**os.environ, "EXPDESIGN_NODE": "node"},
+    capture_output=True,
+    text=True,
+    check=False,
+)
+checks["relative_node_override_rejected"] = (
+    relative_node.returncode != 0
+    and "EXPDESIGN_NODE must be an absolute path"
+    in relative_node.stdout + relative_node.stderr
+)
+
+
+def run_with_fake_claude(directory: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/bash", "tools/bootstrap.sh", "--check-claude-version"],
+        cwd=MODULE_PATH.parents[1],
+        env={
+            **os.environ,
+            "PATH": f"{directory}:/usr/bin:/bin",
+            "EXPDESIGN_CLAUDE": str(directory / "claude"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+with tempfile.TemporaryDirectory() as directory:
+    fake_bin = Path(directory)
+    (fake_bin / "claude").symlink_to("/bin/bash")
+    fake_bash = run_with_fake_claude(fake_bin)
+    checks["unrelated_executable_semver_is_rejected"] = (
+        fake_bash.returncode != 0
+        and "unrecognized Claude Code product/version output"
+        in fake_bash.stdout + fake_bash.stderr
+    )
+
+with tempfile.TemporaryDirectory() as directory:
+    fake_bin = Path(directory)
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '99.99.99 (Not Claude Code)'\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    fake_semver = run_with_fake_claude(fake_bin)
+    checks["fake_high_semver_product_is_rejected"] = (
+        fake_semver.returncode != 0
+        and "unrecognized Claude Code product/version output"
+        in fake_semver.stdout + fake_semver.stderr
+    )
+
+with tempfile.TemporaryDirectory() as directory:
+    fake_bin = Path(directory)
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '2.1.226 (Claude Code)'\n",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    canonical_claude = run_with_fake_claude(fake_bin)
+    checks["canonical_claude_code_output_is_accepted"] = (
+        canonical_claude.returncode == 0
+        and "claude:  2.1.226 (Claude Code)" in canonical_claude.stdout
+    )
+
+relative_claude = subprocess.run(
+    ["/bin/bash", "tools/bootstrap.sh", "--check-claude-version"],
+    cwd=MODULE_PATH.parents[1],
+    env={**os.environ, "EXPDESIGN_CLAUDE": "claude"},
+    capture_output=True,
+    text=True,
+    check=False,
+)
+checks["relative_claude_override_rejected"] = (
+    relative_claude.returncode != 0
+    and "EXPDESIGN_CLAUDE must be an absolute path"
+    in relative_claude.stdout + relative_claude.stderr
+)
+
+node_independent_python_check = subprocess.run(
+    ["/bin/bash", "tools/bootstrap.sh", "--check-python-lock"],
+    cwd=MODULE_PATH.parents[1],
+    env={
+        **os.environ,
+        "EXPDESIGN_NODE": "/definitely/not/an/executable/node",
+        "EXPDESIGN_PYTHON": sys.executable,
+    },
+    capture_output=True,
+    text=True,
+    check=False,
+)
+checks["python_lock_check_does_not_require_node"] = (
+    node_independent_python_check.returncode == 0
+    and "Python requirements.lock check passed"
+    in node_independent_python_check.stdout
+)
+
+makefile_text = (MODULE_PATH.parents[1] / "Makefile").read_text(encoding="utf-8")
+checks["authentication_independent_release_entrypoints_accepted"] = module.valid_release_entrypoints(
+    makefile_text
+)
+with tempfile.TemporaryDirectory() as directory:
+    hostile_root = Path(directory)
+    marker = hostile_root / "sitecustomize-executed"
+    (hostile_root / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['EXPDESIGN_PYTHON_MARKER']).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    isolated_make = subprocess.run(
+        ["make", "-s", "validate-config"],
+        cwd=MODULE_PATH.parents[1],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(hostile_root),
+            "EXPDESIGN_PYTHON_MARKER": str(marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    checks["release_python_entrypoints_ignore_hostile_pythonpath"] = (
+        isolated_make.returncode == 0 and not marker.exists()
+    )
+checks["live_auth_in_release_gate_rejected"] = not module.valid_release_entrypoints(
+    makefile_text.replace(
+        "\t@$(MAKE) check-claude-version\n",
+        "\t@$(MAKE) check-claude-version\n\t@$(MAKE) check-claude-live\n",
+        1,
+    )
+)
+checks["live_auth_in_harness_gate_rejected"] = not module.valid_release_entrypoints(
+    makefile_text.replace(
+        "\t@$(MAKE) validate-python-lock\n",
+        "\t@$(MAKE) validate-python-lock\n\t@$(MAKE) check-claude-live\n",
+        1,
+    )
+)
+registry = json.loads((MODULE_PATH.parents[1] / "governance" / "agents.json").read_text(
+    encoding="utf-8"
+))
+checks["registry_schema_accepted"] = module.validate_registry(registry)["schema_version"] == 1
+boolean_registry_version = copy.deepcopy(registry)
+boolean_registry_version["schema_version"] = True
+try:
+    module.validate_registry(boolean_registry_version)
+    checks["boolean_registry_schema_version_rejected"] = False
+except ValueError:
+    checks["boolean_registry_schema_version_rejected"] = True
+launcher_policy = module.load_launcher_domain_tool_policy()
+checks["launcher_domain_policy_matches_registry_and_python"] = (
+    module.valid_domain_tool_policy(registry, launcher_policy)
+)
+boolean_launcher_version = copy.deepcopy(launcher_policy)
+boolean_launcher_version["schema_version"] = True
+checks["boolean_launcher_schema_version_rejected"] = not module.valid_domain_tool_policy(
+    registry, boolean_launcher_version,
+)
+hook_environment = dict(os.environ)
+hook_environment.pop("EXPDESIGN_NODE", None)
+inspection_as_hook = subprocess.run(
+    [
+        "/bin/sh", str(MODULE_PATH.parents[1] / "hooks" / "launch_verification.sh"),
+        "describe-domain-policy", "experiment-designer",
+    ],
+    cwd=MODULE_PATH.parents[1],
+    input=json.dumps({
+        "hook_event_name": "Stop", "agent_type": "experiment-designer",
+        "session_id": "policy-mode", "prompt_id": "must-block",
+    }),
+    capture_output=True,
+    text=True,
+    env=hook_environment,
+    check=False,
+)
+checks["policy_inspection_is_not_a_successful_hook_mode"] = (
+    inspection_as_hook.returncode == 2
+    and "Unknown verification hook mode" in inspection_as_hook.stderr
+    and inspection_as_hook.stdout == ""
+)
+drifted_launcher_policy = copy.deepcopy(launcher_policy)
+drifted_launcher_policy["domain_tools"]["doe"].append("unreviewed_tool")
+checks["launcher_domain_policy_drift_is_rejected"] = not module.valid_domain_tool_policy(
+    registry, drifted_launcher_policy,
+)
+drifted_registry_policy = copy.deepcopy(registry)
+next(
+    agent for agent in drifted_registry_policy["agents"]
+    if agent.get("domain") == "doe"
+)["tools"].append("mcp__experiment-design__unreviewed_tool")
+checks["registry_domain_policy_drift_is_rejected"] = not module.valid_domain_tool_policy(
+    drifted_registry_policy, launcher_policy,
+)
+bad_extra = copy.deepcopy(registry)
+bad_extra["agents"][0]["unexpected"] = True
+try:
+    module.validate_registry(bad_extra)
+    checks["registry_extra_field_rejected"] = False
+except ValueError:
+    checks["registry_extra_field_rejected"] = True
+bad_child = copy.deepcopy(registry)
+coordinator = next(item for item in bad_child["agents"] if item["role"] == "coordinator")
+coordinator["allowed_children"].append("unknown-agent")
+coordinator["tools"] = [f"Agent({', '.join(coordinator['allowed_children'])})"]
+try:
+    module.validate_registry(bad_child)
+    checks["registry_unknown_child_rejected"] = False
+except ValueError:
+    checks["registry_unknown_child_rejected"] = True
+original_load_registry = module.load_registry
+try:
+    def reject_registry(_path):
+        raise module.RegistryError("synthetic invalid registry")
+
+    module.load_registry = reject_registry
+    invalid_registry_output = io.StringIO()
+    with contextlib.redirect_stdout(invalid_registry_output):
+        invalid_registry_status = module.main()
+    checks["invalid_registry_fails_deterministically"] = (
+        invalid_registry_status == 1
+        and "invalid governance/agents.json: synthetic invalid registry"
+        in invalid_registry_output.getvalue()
+    )
+except Exception:
+    checks["invalid_registry_fails_deterministically"] = False
+finally:
+    module.load_registry = original_load_registry
+coordinator_tools = next(
+    item["tools"] for item in registry["agents"] if item["role"] == "coordinator"
+)
+checks["coordinator_requires_yaml_list"] = (
+    module.valid_agent_tools(coordinator_tools, coordinator_tools, require_yaml_list=True)
+    and not module.valid_agent_tools(coordinator_tools[0], coordinator_tools, require_yaml_list=True)
+)
 try:
     module.normalized_tools({"Read": True})
     checks["malformed_tools_rejected"] = False
 except ValueError:
     checks["malformed_tools_rejected"] = True
+
+launch_text = (MODULE_PATH.parents[1] / ".claude" / "launch.json").read_text(
+    encoding="utf-8"
+)
+launch_config = json.loads(
+    launch_text, object_pairs_hook=module.reject_duplicate_keys,
+)
+checks["repository_launch_config_accepted"] = module.valid_preview_launch_config(
+    launch_config,
+)
+for label, mutate in (
+    ("bind_address", lambda c: c["configurations"][0]["runtimeArgs"].__setitem__(
+        c["configurations"][0]["runtimeArgs"].index("127.0.0.1"), "0.0.0.0")),
+    ("direct_streamlit", lambda c: c["configurations"][0].__setitem__(
+        "runtimeExecutable", "streamlit")),
+    ("arbitrary_executable", lambda c: c["configurations"][0].__setitem__(
+        "runtimeExecutable", "/bin/sh")),
+    ("added_flag", lambda c: c["configurations"][0]["runtimeArgs"].append(
+        "--server.enableCORS=false")),
+    ("numeric_autoport", lambda c: c["configurations"][0].__setitem__("autoPort", 0)),
+    ("true_autoport", lambda c: c["configurations"][0].__setitem__("autoPort", True)),
+    ("port_drift", lambda c: c["configurations"][0].__setitem__("port", 8502)),
+    ("boolean_port", lambda c: c["configurations"][0].__setitem__("port", True)),
+    ("extra_env", lambda c: c["configurations"][0].__setitem__("env", {})),
+    ("extra_cwd", lambda c: c["configurations"][0].__setitem__(
+        "cwd", "${workspaceFolder}")),
+    ("extra_program", lambda c: c["configurations"][0].__setitem__(
+        "program", "agent-harness/streamlit_app.py")),
+    ("extra_configuration", lambda c: c["configurations"].append(
+        c["configurations"][0])),
+    ("omitted_autoport", lambda c: c["configurations"][0].pop("autoPort")),
+):
+    mutated = copy.deepcopy(launch_config)
+    mutate(mutated)
+    checks[f"launch_config_{label}_mutation_rejected"] = (
+        not module.valid_preview_launch_config(mutated)
+    )
+
+def duplicate_keys_rejected(raw: str) -> bool:
+    try:
+        json.loads(raw, object_pairs_hook=module.reject_duplicate_keys)
+        return False
+    except ValueError:
+        return True
+
+
+checks["duplicate_launch_autoport_rejected"] = duplicate_keys_rejected(
+    launch_text.replace(
+        '"autoPort": false', '"autoPort": true, "autoPort": false', 1,
+    )
+)
+checks["duplicate_launch_executable_rejected"] = duplicate_keys_rejected(
+    launch_text.replace(
+        '"runtimeExecutable": "tools/run-reviewed-python.sh"',
+        '"runtimeExecutable": "/bin/sh", '
+        '"runtimeExecutable": "tools/run-reviewed-python.sh"',
+        1,
+    )
+)
+
+with tempfile.TemporaryDirectory() as directory:
+    fixture_root = Path(directory)
+    target = fixture_root / "launch-target.json"
+    target.write_text(launch_text, encoding="utf-8")
+    link = fixture_root / "launch.json"
+    link.symlink_to(target)
+    checks["launch_config_regular_file_accepted"] = module.is_regular_runtime_file(target)
+    checks["launch_config_leaf_symlink_rejected"] = not module.is_regular_runtime_file(link)
 
 checks["repository_manifest_main_passes"] = module.main() == 0
 

@@ -7,13 +7,13 @@ hooks:
   PostToolBatch:
     - hooks:
         - type: command
-          command: sh
+          command: /bin/sh
           args: ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "record", "design-verifier"]
           timeout: 120
   Stop:
     - hooks:
         - type: command
-          command: sh
+          command: /bin/sh
           args: ["${CLAUDE_PROJECT_DIR}/hooks/launch_verification.sh", "enforce", "design-verifier"]
           timeout: 120
 ---
@@ -32,7 +32,12 @@ design agent.
    original seed for stochastic work. If they are missing, return only an
    enforced clarification action such as
    `CLARIFICATION_REQUEST {"fields":["analysis_method","data_source"]}`. Use
-   one to eight supported field names and no natural-language question.
+   one to eight names from this exact vocabulary: `endpoint_type`, `study_type`,
+   `design`, `estimand`, `null_param`, `alt_param`, `sd`, `alpha`,
+   `alpha_sidedness`, `power`, `allocation_ratio`, `sample_size`,
+   `number_of_arms`, `number_of_stages`, `decision_threshold`, `prior`,
+   `followup_time`, `exposure_time`, `randomization_method`, `factor_levels`,
+   `analysis_method`, `data_source`; use no natural-language question.
 2. Call that analysis tool once with those arguments. Do not pass the original
    `verification_id`; the runtime must issue a fresh identity.
 3. After the analysis result, call `run_tests`. The agent-scoped hook requires a

@@ -1,10 +1,11 @@
 """Streamlit front-end for the Experiment Design Agent.
 
 Researcher-friendly UI for configuring and running experiment designs
-through the MCP tools directly (form modes) or the gated agent (chat mode).
+through the MCP tools directly (form modes) or the governed multi-agent
+coordinator (chat mode).
 
-Note: `harness` (and the Anthropic SDK) is imported lazily inside the chat
-mode only, so the four pure-R form modes work even without the SDK installed.
+Note: `multi_agent_harness` (and the Anthropic SDK) is imported lazily inside the chat
+mode only, so the six direct form modes work even without the SDK installed.
 """
 
 from __future__ import annotations
@@ -22,15 +23,17 @@ from verification import public_envelope_matches_call
 st.set_page_config(page_title="Experiment Design Agent", layout="wide")
 
 
-# ── Safe formatting (R NA -> JSON null -> Python None) ─────────────
+AGENT_LABELS = {
+    "single-endpoint-designer": "Single-endpoint designer",
+    "master-protocol-designer": "Master-protocol designer",
+    "doe-designer": "Design-of-experiments specialist",
+    "randomization-planner": "Randomization planner",
+    "indirect-comparison-analyst": "Indirect-comparison analyst",
+    "meta-analysis-analyst": "Meta-analysis analyst",
+}
 
-def fmt(value: Any, spec: str = ".4f") -> str:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return "n/a" if value is None else str(value)
-    try:
-        return format(value, spec)
-    except (ValueError, TypeError):
-        return str(value)
+CHAT_MODE = "Free-form (multi-agent chat)"
+MODE_STATE_KEY = "experiment_design_active_mode"
 
 
 def render_private_resources(
@@ -56,6 +59,124 @@ def render_private_resources(
         )
 
 
+def agent_event_view(event: dict[str, Any]) -> tuple[str, str] | None:
+    """Map orchestration lifecycle events to value-free UI messages.
+
+    This deliberately ignores tool arguments, task IDs, analysis IDs, and
+    artifact handles. Those values are unnecessary for progress display and
+    can contain identity or equality-oracle information at the UI boundary.
+    """
+    event_type = event.get("event")
+    if event_type == "route":
+        if event.get("action") == "dispatch":
+            labels = [
+                AGENT_LABELS.get(str(name), "Approved specialist")
+                for name in list(event.get("agents") or [])
+            ]
+            if labels:
+                return "info", "Coordinator selected: " + ", ".join(labels)
+        elif event.get("action") == "clarify":
+            fields = [str(item).replace("_", " ") for item in event.get("fields") or []]
+            if fields:
+                return "info", "Coordinator needs clarification: " + ", ".join(fields)
+        return "error", "The coordinator returned an invalid route; no analysis was run."
+    if event_type == "agent_start":
+        label = AGENT_LABELS.get(str(event.get("agent")), "Approved specialist")
+        return "info", f"{label} started."
+    if event_type == "agent_complete":
+        label = AGENT_LABELS.get(str(event.get("agent")), "Approved specialist")
+        status = str(event.get("status") or "UNKNOWN")
+        level = "warning" if status == "PASS_PARTIAL" else "success"
+        return level, f"{label} completed with status {status}."
+    if event_type == "agent_failed":
+        label = AGENT_LABELS.get(str(event.get("agent")), "Approved specialist")
+        return "error", f"{label} failed; its result was withheld."
+    return None
+
+
+def render_agent_event(event: dict[str, Any]) -> bool:
+    """Render a supported orchestration event and report whether it was handled."""
+    view = agent_event_view(event)
+    if view is None:
+        return False
+    level, message = view
+    getattr(st, level)(message)
+    return True
+
+
+def stop_agent_session() -> bool:
+    """Stop all lazily-created child runtimes before clearing UI session state."""
+    outcomes: dict[int, bool] = {}
+    cleanup_failed = False
+    for state_key in ("harness", "multi_agent_harness"):
+        harness = st.session_state.get(state_key)
+        if harness is None:
+            st.session_state.pop(state_key, None)
+            continue
+        identity = id(harness)
+        succeeded = outcomes.get(identity)
+        if succeeded is None:
+            try:
+                harness.stop()
+            except Exception:  # keep failed handles so cleanup can be retried
+                succeeded = False
+            else:
+                succeeded = True
+            outcomes[identity] = succeeded
+        if succeeded:
+            st.session_state.pop(state_key, None)
+        else:
+            cleanup_failed = True
+    if cleanup_failed:
+        st.error("The agent session could not be fully closed. Please retry.")
+        return False
+    st.session_state.messages = []
+    return True
+
+
+def reconcile_agent_mode(current_mode: str) -> bool:
+    """Close chat runtimes when the sidebar leaves chat mode.
+
+    A failed stop keeps each failed runtime handle and the previous-mode marker
+    so the next rerun retries cleanup instead of silently orphaning child MCP
+    processes.
+    """
+    legacy_runtime = st.session_state.get("harness") is not None
+    has_any_runtime = legacy_runtime or (
+        st.session_state.get("multi_agent_harness") is not None
+    )
+    # Any runtime is stale outside chat. A legacy single-agent runtime is also
+    # migrated before chat renders, so every mode is blocked if that stop fails.
+    needs_cleanup = legacy_runtime or (current_mode != CHAT_MODE and has_any_runtime)
+    if needs_cleanup and not stop_agent_session():
+        return False
+    st.session_state[MODE_STATE_KEY] = current_mode
+    return True
+
+
+def rsm_limits(design: str, n_factors: int) -> tuple[int, int, int | None]:
+    """Return the engine-aligned factor and CCD-fraction limits."""
+    if design == "bbd":
+        return 3, 5, None
+    if design == "ccd":
+        return 2, 8, max(0, int(n_factors) - 1)
+    raise ValueError("unsupported response-surface design")
+
+
+def clamp_session_integer(key: str, default: int, lower: int, upper: int) -> int:
+    """Keep a keyed number-input value valid when dynamic bounds shrink."""
+    try:
+        value = int(st.session_state.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    bounded = min(max(value, lower), upper)
+    if value != bounded:
+        # Remove the now-invalid widget value before the widget is recreated;
+        # its bounded `value` argument then becomes the new session value.
+        st.session_state.pop(key, None)
+    return bounded
+
+
 # ── Sidebar ────────────────────────────────────────────────────────
 
 st.sidebar.title("Experiment Design Agent")
@@ -64,14 +185,19 @@ mode = st.sidebar.radio(
     [
         "Single-endpoint design",
         "Multi-arm adaptive design",
+        "Design of experiments",
+        "Randomization",
         "Indirect comparison",
         "Meta-analysis",
-        "Free-form (agent chat)",
+        "Free-form (multi-agent chat)",
     ],
 )
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+mode_ready = reconcile_agent_mode(mode)
+if not mode_ready:
+    st.sidebar.warning("Agent cleanup is incomplete; the session handle was retained for retry.")
 
 
 # ── Parameter forms ────────────────────────────────────────────────
@@ -80,9 +206,10 @@ def single_endpoint_form() -> dict | None:
     with st.form("single_design"):
         st.subheader("Single-Endpoint Design")
         st.caption(
-            "Direction: for **tte** / **incidence_rate**, lower is better "
-            "(set alt < null). For **binary** / **continuous**, higher is better "
-            "(set alt > null)."
+            "Direction: for **tte**, lower hazard is better (set alt < null). "
+            "**incidence_rate** supports both a protective reduction (alt < null, "
+            "lower tail) and harm detection (alt > null, upper tail). For "
+            "**binary** / **continuous**, higher is better (set alt > null)."
         )
         col1, col2 = st.columns(2)
         with col1:
@@ -232,6 +359,207 @@ def adaptive_design_form() -> dict | None:
         return {"config": config}
 
 
+def doe_form() -> tuple[str, dict[str, Any]] | None:
+    """Collect a small, schema-aligned input for each governed DoE tool."""
+    st.subheader("Design of Experiments")
+    # Keep the branch selector outside the form so switching design families
+    # rerenders the appropriate controls before the user submits parameters.
+    design_type = st.selectbox(
+        "Design task", ["A/B sample size", "Factorial design", "Response surface"]
+    )
+    rsm_type: str | None = None
+    rsm_n_factors: int | None = None
+    if design_type == "Response surface":
+        rsm_type = st.selectbox(
+            "Response-surface design", ["ccd", "bbd"], key="rsm_design_type"
+        )
+        initial_min, initial_max, _ = rsm_limits(rsm_type, 3)
+        factor_value = clamp_session_integer(
+            "rsm_factors", 3, initial_min, initial_max
+        )
+        rsm_n_factors = int(st.number_input(
+            "Number of factors",
+            value=factor_value,
+            min_value=initial_min,
+            max_value=initial_max,
+            key="rsm_factors",
+        ))
+    with st.form("doe_design"):
+        if design_type == "A/B sample size":
+            col1, col2 = st.columns(2)
+            with col1:
+                metric = st.selectbox("Metric", ["proportion", "mean"])
+                baseline = st.number_input("Control baseline", value=0.10, format="%.4f")
+                effect = st.number_input("Minimum detectable effect", value=0.02,
+                                         format="%.4f")
+                effect_type = st.selectbox("Effect type", ["absolute", "relative"])
+            with col2:
+                sd = st.number_input("SD (mean metric)", value=1.0, min_value=0.0001)
+                alpha = st.number_input("Alpha", value=0.05, min_value=0.001,
+                                        max_value=0.5)
+                power = st.number_input("Power", value=0.80, min_value=0.5,
+                                        max_value=0.99)
+                sided = st.selectbox("Sidedness", [2, 1])
+                ratio = st.number_input("Treatment/control allocation ratio", value=1.0,
+                                        min_value=0.01)
+        elif design_type == "Factorial design":
+            col1, col2 = st.columns(2)
+            with col1:
+                n_factors = st.number_input("Number of factors", value=3,
+                                            min_value=1, max_value=12)
+                fraction = st.number_input("Fraction exponent (0 = full)", value=0,
+                                           min_value=0, max_value=11)
+                replicates = st.number_input("Replicates", value=1, min_value=1,
+                                             max_value=100)
+            with col2:
+                center_points = st.number_input("Center points", value=0, min_value=0,
+                                                max_value=1000)
+                randomize = st.checkbox("Randomize run order", value=False,
+                                        key="factorial_randomize")
+                seed = st.number_input("Random seed", value=42, min_value=0,
+                                       max_value=2147483647, key="factorial_seed")
+        else:
+            assert rsm_type is not None and rsm_n_factors is not None
+            n_factors = rsm_n_factors
+            col1, col2 = st.columns(2)
+            with col1:
+                center_points = st.number_input("Center points", value=3, min_value=0,
+                                                max_value=1000, key="rsm_center")
+            with col2:
+                if rsm_type == "ccd":
+                    alpha_choice = st.selectbox(
+                        "CCD axial distance", ["rotatable", "face"]
+                    )
+                    _, _, max_fraction = rsm_limits(rsm_type, n_factors)
+                    assert max_fraction is not None
+                    fraction_value = clamp_session_integer(
+                        "rsm_fraction", 0, 0, max_fraction
+                    )
+                    fraction = st.number_input(
+                        "CCD fraction exponent",
+                        value=fraction_value,
+                        min_value=0,
+                        max_value=max_fraction,
+                        key="rsm_fraction",
+                    )
+                else:
+                    alpha_choice = "rotatable"
+                    fraction = 0
+                    st.caption("Box-Behnken supports 3–5 factors; CCD-only controls are hidden.")
+                randomize = st.checkbox("Randomize run order", value=False,
+                                        key="rsm_randomize")
+                seed = st.number_input("Random seed", value=42, min_value=0,
+                                       max_value=2147483647, key="rsm_seed")
+
+        submitted = st.form_submit_button("Create design")
+        if not submitted:
+            return None
+        if design_type == "A/B sample size":
+            params: dict[str, Any] = {
+                "baseline": baseline,
+                "effect": effect,
+                "metric": metric,
+                "effect_type": effect_type,
+                "alpha": alpha,
+                "power": power,
+                "sided": sided,
+                "ratio": ratio,
+            }
+            if metric == "mean":
+                params["sd"] = sd
+            return "ab_test", params
+        if design_type == "Factorial design":
+            if int(fraction) >= int(n_factors):
+                st.error("The fraction exponent must be below the number of factors.")
+                return None
+            return "factorial_design", {
+                "n_factors": int(n_factors),
+                "fraction": int(fraction),
+                "center_points": int(center_points),
+                "replicates": int(replicates),
+                "randomize": randomize,
+                "seed": int(seed),
+            }
+        factor_min, factor_max, max_fraction = rsm_limits(rsm_type, int(n_factors))
+        if not factor_min <= int(n_factors) <= factor_max:
+            st.error(
+                f"{rsm_type.upper()} requires {factor_min}–{factor_max} factors."
+            )
+            return None
+        if rsm_type == "ccd" and (
+            max_fraction is None or int(fraction) > max_fraction
+        ):
+            st.error("The CCD fraction exponent must be below the number of factors.")
+            return None
+        params = {
+            "n_factors": int(n_factors),
+            "design": rsm_type,
+            "center_points": int(center_points),
+            "randomize": randomize,
+            "seed": int(seed),
+        }
+        if rsm_type == "ccd":
+            params.update({"alpha": alpha_choice, "fraction": int(fraction)})
+        return "rsm_design", params
+
+
+def randomization_form() -> dict[str, Any] | None:
+    with st.form("randomization"):
+        st.subheader("Randomization Plan")
+        st.caption(
+            "Assignments are withheld from model text and offered as a private download "
+            "only after verification."
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            n = st.number_input("Number of units", value=100, min_value=1, max_value=10000)
+            arms = st.number_input("Number of arms", value=2, min_value=2, max_value=100)
+            method = st.selectbox("Method", ["simple", "block", "stratified"])
+        with col2:
+            ratio_text = st.text_input("Allocation weights", value="1,1")
+            block_size = st.number_input("Block size", value=4, min_value=1,
+                                         max_value=10000)
+            seed = st.number_input("Random seed", value=42, min_value=0,
+                                   max_value=2147483647, key="randomization_seed")
+        strata_json = st.text_area(
+            "Per-unit strata (JSON array; stratified only)",
+            value="[]",
+            height=100,
+        )
+        submitted = st.form_submit_button("Generate assignments")
+        if not submitted:
+            return None
+        try:
+            ratio = [float(value.strip()) for value in ratio_text.split(",") if value.strip()]
+        except ValueError:
+            st.error("Allocation weights must be comma-separated numbers.")
+            return None
+        if len(ratio) != int(arms) or any(value <= 0 for value in ratio):
+            st.error("Provide one positive allocation weight per arm.")
+            return None
+        params: dict[str, Any] = {
+            "n": int(n), "arms": int(arms), "method": method,
+            "ratio": ratio, "seed": int(seed),
+        }
+        if method in {"block", "stratified"}:
+            params["block_size"] = int(block_size)
+        if method == "stratified":
+            try:
+                strata = json.loads(strata_json)
+            except json.JSONDecodeError:
+                st.error("Strata must be a valid JSON array.")
+                return None
+            if not isinstance(strata, list) or len(strata) != int(n):
+                st.error(f"Strata must contain exactly {int(n)} labels.")
+                return None
+            if any(isinstance(value, bool) or not isinstance(value, (str, int, float))
+                   for value in strata):
+                st.error("Each stratum label must be a string or number.")
+                return None
+            params["strata"] = strata
+        return params
+
+
 def indirect_comparison_form() -> dict | None:
     with st.form("indirect_compare"):
         st.subheader("Indirect Treatment Comparison (Bucher)")
@@ -345,12 +673,12 @@ def run_tool_directly(tool_name: str, params: dict):
                         notes=list(server_envelope.get("notes") or []),
                     ))
                 gate = combined_gate(*verdicts)
-        except Exception as e:  # noqa: BLE001 - surfaced to the user
-            st.error(f"Error: {e}")
+        except Exception:  # fail closed without exposing host/runtime details
+            st.error("The local analysis could not complete. No result was published.")
             return
 
     if isinstance(result, dict) and result.get("error"):
-        st.error(f"R error: {result['error']}")
+        st.error("The analysis was rejected. No result was published.")
         return
 
     if not gate.passed:
@@ -392,93 +720,48 @@ def run_tool_directly(tool_name: str, params: dict):
         st.error("Verified canonical report is missing; raw result remains withheld.")
 
 
-def display_result(tool_name: str, result: dict):
-    if tool_name in ("validate_config", "sample_size", "simulate_design"):
-        ss = result.get("results") or result.get("sample_size")
-        if ss:
-            st.subheader("Sample Size Table")
-            st.dataframe(ss)
-        oc = result.get("oc")
-        if oc is not None:
-            st.subheader("Operating Characteristics")
-            st.dataframe(oc) if isinstance(oc, list) else st.json(oc)
-        ppos = result.get("ppos")
-        if ppos is not None:
-            st.subheader("Predictive Probability of Success")
-            st.json(ppos)
-
-    elif tool_name == "master_simulate":
-        st.subheader("Multi-Arm Design Results")
-        st.json(result.get("result", result))
-        if result.get("output_dir"):
-            st.caption(f"Outputs written to: {result['output_dir']}")
-
-    elif tool_name == "indirect_compare":
-        comps = result.get("comparisons", [])
-        st.subheader("Indirect Comparison Results")
-        for comp in comps:
-            if isinstance(comp, list):
-                comp = comp[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Estimate", fmt(comp.get("estimate")))
-            c2.metric("SE", fmt(comp.get("se")))
-            c3.metric("95% CI",
-                      f"[{fmt(comp.get('lower'), '.3f')}, {fmt(comp.get('upper'), '.3f')}]")
-            if comp.get("natural_estimate") is not None:
-                st.caption(
-                    f"Natural scale: {fmt(comp.get('natural_estimate'))} "
-                    f"[{fmt(comp.get('natural_lower'))}, {fmt(comp.get('natural_upper'))}]"
-                )
-
-    elif tool_name == "meta_analyze":
-        st.subheader("Meta-Analysis Results")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pooled estimate", fmt(result.get("estimate")))
-        c2.metric("SE", fmt(result.get("se")))
-        c3.metric("I²", fmt(result.get("i2"), ".1f") + ("%" if result.get("i2") is not None else ""))
-        c4.metric("95% CI",
-                  f"[{fmt(result.get('lower'), '.3f')}, {fmt(result.get('upper'), '.3f')}]")
-        if result.get("tau2") is not None:
-            st.caption(f"τ² = {fmt(result.get('tau2'))},  k = {result.get('k', 'n/a')}")
-        effects = result.get("study_effects")
-        variances = result.get("study_variances")
-        if isinstance(effects, list) and isinstance(variances, list):
-            st.subheader("Study Effects")
-            for i, (yi, vi) in enumerate(zip(effects, variances)):
-                st.text(f"  Study {i + 1}: yi={fmt(yi)}, vi={fmt(vi)}")
-
-    with st.expander("Raw JSON"):
-        st.json(result)
-
-
 # ── Agent chat mode ────────────────────────────────────────────────
 
 def agent_chat():
-    st.subheader("Agent Chat")
-    st.caption("Describe your design problem in natural language. The agent "
-               "elicits details across turns, runs the analysis, verifies it, "
-               "then interprets. Conversation history is preserved.")
+    st.subheader("Multi-Agent Design Team")
+    st.caption(
+        "A routing-only coordinator assigns each independent request to the smallest "
+        "approved specialist set. Specialists use separate conversations and tool "
+        "permissions; only verified canonical reports are combined."
+    )
 
     # Lazy import so the SDK is only required for this mode (C-3).
     try:
-        from harness import ExperimentDesignHarness
-    except ImportError as e:
-        st.error(f"Agent chat needs the Anthropic SDK (`pip install anthropic`). "
-                 f"The form modes above work without it. Import error: {e}")
+        from multi_agent_harness import MultiAgentExperimentDesignHarness
+    except ImportError:
+        st.error(
+            "Agent chat dependencies are unavailable. Reinstall the pinned "
+            "harness environment; the direct form modes remain available."
+        )
         return
 
-    # One long-lived harness per session: preserves history and avoids
-    # re-spawning the MCP server per message (A-3 / C-5).
-    if "harness" not in st.session_state:
-        h = ExperimentDesignHarness()
+    # One long-lived coordinator per session preserves routing and per-domain
+    # conversations. Child MCP processes remain lazy and are stopped together.
+    if "multi_agent_harness" not in st.session_state:
+        h = None
         try:
+            h = MultiAgentExperimentDesignHarness()
             h.start()
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Could not start the agent: {e}")
+        except Exception:  # noqa: BLE001
+            if h is not None:
+                try:
+                    h.stop()
+                except Exception:
+                    pass
+            st.error("Could not start the multi-agent team.")
             return
-        st.session_state.harness = h
+        st.session_state.multi_agent_harness = h
 
-    harness = st.session_state.harness
+    harness = st.session_state.multi_agent_harness
+
+    if st.button("Start a new agent session", type="secondary"):
+        if stop_agent_session():
+            st.rerun()
 
     for message_index, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
@@ -510,21 +793,30 @@ def agent_chat():
                             )
                             break
                         etype = ev.get("event")
+                        if render_agent_event(ev):
+                            continue
                         if etype == "phase":
-                            st.info(f"Phase: {ev['phase']}")
+                            agent = AGENT_LABELS.get(str(ev.get("agent")), "Specialist")
+                            st.info(f"{agent} phase: {ev['phase']}")
                         elif etype == "message":
-                            st.markdown(ev["content"])
+                            # The completed RunResult is rendered once below.
+                            # Skipping this streamed duplicate also prevents the
+                            # canonical report from appearing twice on rerun.
+                            pass
                         elif etype == "unverified_message":
                             st.error("Unverified content was withheld.")
                         elif etype == "tool_call":
-                            st.caption(f"→ {ev['tool']}")
+                            agent = AGENT_LABELS.get(str(ev.get("agent")), "Specialist")
+                            st.caption(f"{agent} → {ev['tool']}")
                         elif etype == "tool_result":
-                            with st.expander(f"{ev['tool']} result"):
-                                st.json(ev["result"])
+                            # The harness has already reduced this to a verified
+                            # report, but the canonical final report is the only
+                            # result representation needed by this UI.
+                            st.caption(f"Verified {ev['tool']} result received.")
                         elif etype == "tool_result_withheld":
                             st.error(
                                 f"{ev['tool']} result withheld — "
-                                f"{ev.get('verification', {}).get('verification_status', 'FAILED')}"
+                                f"{ev.get('verification', {}).get('status', 'FAILED')}"
                             )
                         elif etype == "gate":
                             if ev["verdict"] in {"VERIFIED", "PASS_PARTIAL"}:
@@ -539,10 +831,12 @@ def agent_chat():
                         elif etype == "error":
                             # The harness rolled its history back; the session
                             # stays usable — the user can just retry (W-3).
-                            st.error(f"The agent hit an error and rolled back this "
-                                     f"turn (you can retry): {ev.get('message')}")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Agent error: {e}")
+                            st.error("The agent hit an internal error and rolled back this "
+                                     "turn. No result was published; you can retry.")
+                except Exception:  # noqa: BLE001
+                    # A thrown UI/runtime error is not a verified result and
+                    # must never be copied into conversation history.
+                    st.error("The agent team hit an internal error. No result was published.")
 
             if final_answer:
                 st.markdown(final_answer)
@@ -560,7 +854,12 @@ def agent_chat():
 
 st.title("Experiment Design Agent")
 
-if mode == "Single-endpoint design":
+if not mode_ready:
+    st.error(
+        "The previous agent session is still closing. Mode controls and execution "
+        "are disabled until cleanup succeeds; retry the selected mode."
+    )
+elif mode == "Single-endpoint design":
     p = single_endpoint_form()
     if p:
         run_tool_directly("simulate_design", p)
@@ -568,6 +867,15 @@ elif mode == "Multi-arm adaptive design":
     p = adaptive_design_form()
     if p:
         run_tool_directly("master_simulate", p)
+elif mode == "Design of experiments":
+    selection = doe_form()
+    if selection:
+        tool_name, p = selection
+        run_tool_directly(tool_name, p)
+elif mode == "Randomization":
+    p = randomization_form()
+    if p:
+        run_tool_directly("randomize", p)
 elif mode == "Indirect comparison":
     p = indirect_comparison_form()
     if p:
@@ -576,5 +884,5 @@ elif mode == "Meta-analysis":
     p = meta_analysis_form()
     if p:
         run_tool_directly("meta_analyze", p)
-elif mode == "Free-form (agent chat)":
+elif mode == "Free-form (multi-agent chat)":
     agent_chat()

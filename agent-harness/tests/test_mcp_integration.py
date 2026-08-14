@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 from mcp_client import MCPClient, MCPToolError  # noqa: E402
 from gates import combined_gate, design_checks_for  # noqa: E402
 from gates import check_reproducibility  # noqa: E402
-from verification import content_hash, domain_arguments  # noqa: E402
+from verification import content_hash, public_arguments_hash  # noqa: E402
 import verification_policy  # noqa: E402
 
 
@@ -91,6 +91,7 @@ def live_hook_allows(tool_name, arguments, result, regression_result):
         }]}},
     ]
     data = {
+        "hook_event_name": "Stop",
         "agent_type": "experiment-designer",
         "_expdesign_agent_scope": "experiment-designer",
         "last_assistant_message": result["_verification"]["report"],
@@ -134,10 +135,15 @@ with MCPClient() as client:
     })
     check("validate_config_scalar_grids_are_normalized_in_strict_public_dto",
           set(validated) == {"valid", "endpoint_type", "study_type", "design",
-                             "go_target", "alphas", "powers", "configuration_report"}
+                             "go_target", "alphas", "powers", "resolved_config",
+                             "simulation_defaults", "configuration_report"}
           and validated.get("valid") is True
           and validated.get("alphas") == [0.1]
           and validated.get("powers") == [0.8]
+          and validated.get("resolved_config", {}).get("sidedness") == "one_sided"
+          and validated.get("resolved_config", {}).get("estimand") == "response_probability"
+          and validated.get("resolved_config", {}).get("prior_params") == {"a": 0.5, "b": 0.5}
+          and validated.get("simulation_defaults") == {"seed": 42, "b_oc": 5000}
           and validated.get("configuration_report", "").startswith(
               "CONFIGURATION_VALIDATED {"), validated)
 
@@ -298,9 +304,11 @@ with MCPClient() as client:
     check("provenance_is_identity_bound",
           master.get("_verification", {}).get("identity", {}).get("provenance_hash")
           == content_hash(master.get("_provenance", {})), master.get("_verification"))
-    check("master_identity_hashes_original_caller_domain",
-          master.get("_verification", {}).get("identity", {}).get("args_hash")
-          == content_hash(domain_arguments(master_args)), master.get("_verification"))
+    check("master_identity_binds_public_caller_domain",
+          master.get("_verification", {}).get("identity", {}).get("public_args_hash")
+          == public_arguments_hash("master_simulate", master_args)
+          and "args_hash" not in master.get("_verification", {}).get("identity", {}),
+          master.get("_verification"))
     server_checks = master.get("_verification", {}).get("checks", {})
     check("master_result_contract_passes",
           server_checks.get("artifact_integrity") is True
@@ -321,6 +329,69 @@ with MCPClient() as client:
           server_checks)
     hook_ok, hook_detail = live_hook_allows("master_simulate", master_args, master, tests)
     check("live_master_result_passes_stop_hook", hook_ok, hook_detail)
+
+    # The dispatcher serializes with auto_unbox=TRUE, so a length-1 R vector
+    # reaches the gate as a scalar. Those shapes appear only in one-word,
+    # one-stage, and one-method results, so exercise them against the real
+    # serializer rather than a hand-built payload.
+    half_fraction_args = {"n_factors": 5, "fraction": 1}
+    half_fraction = client.call_tool("factorial_design", half_fraction_args)
+    check("live_half_fraction_defining_relation_is_presentable",
+          half_fraction.get("_verification", {}).get("presentable") is True,
+          half_fraction.get("_verification", {}).get("failures"))
+    hook_ok, hook_detail = live_hook_allows(
+        "factorial_design", half_fraction_args, half_fraction, tests,
+    )
+    check("live_half_fraction_passes_stop_hook", hook_ok, hook_detail)
+
+    replicated_fraction_args = {
+        "n_factors": 5, "fraction": 2, "replicates": 2,
+        "center_points": 1,
+    }
+    replicated_fraction = client.call_tool(
+        "factorial_design", replicated_fraction_args,
+    )
+    check("live_fractional_replicates_are_honored_and_presentable",
+          replicated_fraction.get("replicates") == 2
+          and replicated_fraction.get("n_runs") == 17
+          and replicated_fraction.get("_verification", {}).get("presentable") is True,
+          replicated_fraction.get("_verification", {}).get("failures"))
+    hook_ok, hook_detail = live_hook_allows(
+        "factorial_design", replicated_fraction_args, replicated_fraction, tests,
+    )
+    check("live_replicated_fraction_passes_stop_hook", hook_ok, hook_detail)
+
+    single_stage_args = {"config": {
+        "master_design_type": "umbrella", "endpoint_type": "continuous",
+        "n_subgroups": 2, "n_arms": 2, "n_stages": 1, "n_per_arm_stage": 10,
+        "sd": 1.0, "null_params": 0.0, "alt_params": [0.5, 0.5],
+        "n_sims": 1, "seed": 42,
+    }}
+    single_stage = client.call_tool("master_simulate", single_stage_args)
+    check("live_single_stage_umbrella_boundary_is_presentable",
+          single_stage.get("_verification", {}).get("presentable") is True,
+          single_stage.get("_verification", {}).get("failures"))
+    hook_ok, hook_detail = live_hook_allows(
+        "master_simulate", single_stage_args, single_stage, tests,
+    )
+    check("live_single_stage_umbrella_passes_stop_hook", hook_ok, hook_detail)
+
+    single_method_args = {"config": {
+        "master_design_type": "platform", "endpoint_type": "binary",
+        "n_subgroups": 2, "null_params": 0.2, "alt_params": [0.4, 0.4],
+        "n_periods": 2, "n_per_period": 10,
+        "arms_schedule": {"enter": [1, 1], "leave": [2, 2]},
+        "n_sims": 1, "seed": 42,
+    }}
+    single_method = client.call_tool("master_simulate", single_method_args)
+    check("live_single_analysis_method_platform_is_presentable",
+          single_method.get("_verification", {}).get("presentable") is True,
+          single_method.get("_verification", {}).get("failures"))
+    hook_ok, hook_detail = live_hook_allows(
+        "master_simulate", single_method_args, single_method, tests,
+    )
+    check("live_single_analysis_method_platform_passes_stop_hook",
+          hook_ok, hook_detail)
 
     random_args = {"n": 8, "seed": 42}
     random_one = client.call_tool("randomize", random_args)
@@ -437,8 +508,8 @@ const stillNewest = await orderingCache.get("new", async () => {
 const testsBound = REGRESSION_SKILLS.every((skill) =>
   files.includes(`${root}/${skill}/scripts/tests/run_tests.R`))
   && files.includes(`${root}/agent-harness/artifact_download.py`);
-const runtimeOne = currentRRuntimeSnapshot();
-const runtimeTwo = currentRRuntimeSnapshot();
+const runtimeOne = await currentRRuntimeSnapshot();
+const runtimeTwo = await currentRRuntimeSnapshot();
 const runtimeBound = runtimeOne.fingerprint === runtimeTwo.fingerprint
   && /^[0-9a-f]{64}$/.test(runtimeOne.fingerprint)
   && typeof runtimeOne.version === "string"
@@ -533,7 +604,7 @@ if hasattr(os, "mkfifo"):
 index_source = (suite / "mcp-server" / "src" / "index.ts").read_text(encoding="utf-8")
 preverify_calls = index_source.count("await preverify(")
 postverify_guards = index_source.count(
-    'assertEngineUnchanged(executionFingerprint, "the verifier was running");'
+    'assertEngineUnchanged(executionFingerprint, "the verifier was running", signal);'
 )
 check("every_gated_path_rechecks_fingerprint_after_verification",
       preverify_calls >= 1 and postverify_guards == preverify_calls,
@@ -592,9 +663,11 @@ with tempfile.TemporaryDirectory() as directory:
             "targets_file": str(targets), "treatment_arm": "TRT",
             "comparator_arm": "CTRL", "covariates": ["age_scaled"],
         }
-        check("maic_identity_hashes_original_caller_domain",
-              maic.get("_verification", {}).get("identity", {}).get("args_hash")
-              == content_hash(domain_arguments(original_maic_args)), maic.get("_verification"))
+        check("maic_identity_binds_only_public_caller_domain",
+              maic.get("_verification", {}).get("identity", {}).get("public_args_hash")
+              == public_arguments_hash("indirect_compare", original_maic_args)
+              and "args_hash" not in maic.get("_verification", {}).get("identity", {}),
+              maic.get("_verification"))
         import hashlib
         expected_input_hashes = {
                   "ipd_file": hashlib.sha256(ipd.read_bytes()).hexdigest(),

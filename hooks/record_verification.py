@@ -6,14 +6,13 @@ from __future__ import annotations
 import json
 import sys
 
-from verification_ledger import record_batch
+from verification_ledger import governed_agent, record_batch
 
 
 def main() -> int:
     try:
         data = json.load(sys.stdin)
-        if data.get("_expdesign_agent_scope") not in {"experiment-designer", "design-verifier"}:
-            raise ValueError("a governed agent scope is required")
+        governed_agent(data.get("_expdesign_agent_scope"))
         record_batch(data)
         return 0
     except Exception as exc:

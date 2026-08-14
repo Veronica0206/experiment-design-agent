@@ -2,15 +2,17 @@
 """Unit tests for gates.py — the verification safety net for every runtime
 (harness, SubagentStop hook, Streamlit form). Plain script, no pytest needed.
 
-Run: python3 agent-harness/tests/test_gates.py   (from the suite root)
+Run: tools/run-reviewed-python.sh agent-harness/tests/test_gates.py
 """
 from __future__ import annotations
 
 import os
+import random
 import signal
 import sys
 import tempfile
 import time
+from itertools import product
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
@@ -91,7 +93,8 @@ v = check_master_config_reserved({"master_design_type": "basket"})
 check("mr_clean_passes", v.passed, str(v))
 for bad in ({"fwer_control": "holm"}, {"power_type": "complete"},
             {"rar_eta": 0.5}, {"shared_control": False},
-            {"overdispersion": 2}, {"tte_method": "cox_ph"}):
+            {"overdispersion": 2}, {"tte_method": "cox_ph"},
+            {"effect_threshold": 0.99}):
     v = check_master_config_reserved(bad)
     check(f"mr_rejects_{list(bad)[0]}", not v.passed, str(v))
 v = check_master_config_reserved({"master_design_type": "umbrella",
@@ -102,6 +105,16 @@ v = check_master_config_reserved({"master_design_type": "umbrella",
                                   "umbrella_method": "mams",
                                   "selection_rule": "rank_best"})
 check("mr_nonderived_selection_fails", not v.passed, str(v))
+v = check_master_config_reserved({
+    "master_design_type": "platform", "endpoint_type": "binary",
+    "ncc_method": "regression", "futility_threshold": 0.1,
+})
+check("mr_inert_platform_interim_setting_fails", not v.passed, str(v))
+v = check_master_config_reserved({
+    "master_design_type": "platform", "endpoint_type": "binary",
+    "ncc_method": "none", "futility_threshold": 0.1,
+})
+check("mr_supported_platform_futility_setting_passes", v.passed, str(v))
 
 # ── check_sample_size ──────────────────────────────────────────────
 ok_row = {"design": "single_arm", "n_total": 40,
@@ -159,6 +172,38 @@ v = check_single_endpoint(
     {"design": "single_arm", "null_param": 0.2, "alt_param": 0.4},
 )
 check("se_distant_oc_rows_fail", not v.passed, str(v))
+
+sim_with_mc = {
+    "sample_size": [ok_row],
+    "B_used": 1000,
+    "oc": [
+        {"true_param": 0.2, "p_go": 0.05, "p_go_mcse": 0.0069,
+         "p_go_mc_lower": 0.038, "p_go_mc_upper": 0.065,
+         "mc_replicates": 1000, "mc_worst_case_se": 0.0158,
+         "mc_precision_ok": True},
+        {"true_param": 0.4, "p_go": 0.85, "p_go_mcse": 0.0113,
+         "p_go_mc_lower": 0.827, "p_go_mc_upper": 0.871,
+         "mc_replicates": 1000, "mc_worst_case_se": 0.0158,
+         "mc_precision_ok": True},
+    ],
+}
+v = check_single_endpoint(sim_with_mc, {"design": "single_arm",
+                                        "null_param": 0.2, "alt_param": 0.4})
+check("se_mc_uncertainty_passes", v.passed and not v.blocked, str(v))
+
+low_precision = dict(sim_with_mc, B_used=100)
+low_precision["oc"] = [dict(row, mc_replicates=100,
+                             mc_worst_case_se=0.05, mc_precision_ok=False)
+                       for row in sim_with_mc["oc"]]
+v = check_single_endpoint(low_precision, {"design": "single_arm",
+                                          "null_param": 0.2, "alt_param": 0.4})
+check("se_low_mc_precision_is_partial", v.passed and v.blocked, str(v))
+
+missing_mc = dict(sim_with_mc)
+missing_mc["oc"] = sim_ok["oc"]
+v = check_single_endpoint(missing_mc, {"design": "single_arm",
+                                       "null_param": 0.2, "alt_param": 0.4})
+check("se_missing_mc_uncertainty_fails", not v.passed, str(v))
 
 # ── check_ab_test ──────────────────────────────────────────────────
 ab_ok = {"n_total": 200, "n_control": 100, "n_treatment": 100, "mde": 0.05,
@@ -227,28 +272,80 @@ check("master_missing_result_fails",
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     (root / "basket_oc_table.csv").write_text(
-        "subgroup,null_param,alt_param,reject_rate\n1,0.2,0.4,80\n", encoding="utf-8")
-    (root / "basket_fwer.csv").write_text("scenario,fwer\nGlobal null,5\n", encoding="utf-8")
+        "subgroup,null_param,alt_param,reject_rate,reject_mcse_pct,"
+        "reject_ci_lower_pct,reject_ci_upper_pct,reject_precision_met\n"
+        "1,0.2,0.4,80,1.26,77.4,82.4,TRUE\n", encoding="utf-8")
+    (root / "basket_fwer.csv").write_text(
+        "scenario,n_true_null,fwer,fwer_mcse_pct,fwer_ci_lower_pct,"
+        "fwer_ci_upper_pct,precision_met,n_simulations\n"
+        "Global null,1,5,0.69,3.8,6.6,TRUE,1000\n", encoding="utf-8")
     (root / "basket_subgroup_decisions.csv").write_text(
         "subgroup,decision\n1,Go\n", encoding="utf-8")
     (root / "basket_oc_curves.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
     master_result = {
-        "result": {"oc_table": [{"subgroup": 1, "null_param": 0.2,
-                                   "alt_param": 0.4, "reject_rate": 80}]},
+        "result": {
+            "oc_table": [{"subgroup": 1, "null_param": 0.2,
+                          "alt_param": 0.4, "reject_rate": 80,
+                          "reject_mcse_pct": 1.26,
+                          "reject_ci_lower_pct": 77.4,
+                          "reject_ci_upper_pct": 82.4,
+                          "reject_precision_met": True}],
+            "fwer_table": [{"scenario": "Global null", "n_true_null": 1,
+                            "fwer": 5, "fwer_mcse_pct": 0.69,
+                            "fwer_ci_lower_pct": 3.8,
+                            "fwer_ci_upper_pct": 6.6,
+                            "precision_met": True, "n_simulations": 1000}],
+            "mc_precision_target_probability_half_width": 0.02,
+        },
         "output_dir": str(root),
     }
     check("master_artifacts_consistent_pass",
-          check_master_result(master_result, {"master_design_type": "basket"}).passed)
+          check_master_result(master_result, {"master_design_type": "basket",
+                                              "n_sims": 1000}).passed)
     (root / "basket_oc_table.csv").write_text(
-        "subgroup,null_param,alt_param,reject_rate\n1,0.2,0.4,NaN\n", encoding="utf-8")
+        "subgroup,null_param,alt_param,reject_rate,reject_mcse_pct,"
+        "reject_ci_lower_pct,reject_ci_upper_pct,reject_precision_met\n"
+        "1,0.2,0.4,NaN,1.26,77.4,82.4,TRUE\n", encoding="utf-8")
     check("master_artifact_nonfinite_rejected",
           not check_master_result(master_result, {"master_design_type": "basket"}).passed)
     (root / "basket_oc_table.csv").write_text(
-        "subgroup,null_param,alt_param,reject_rate\n1,0.2,0.4,70\n", encoding="utf-8")
+        "subgroup,null_param,alt_param,reject_rate,reject_mcse_pct,"
+        "reject_ci_lower_pct,reject_ci_upper_pct,reject_precision_met\n"
+        "1,0.2,0.4,70,1.26,77.4,82.4,TRUE\n", encoding="utf-8")
     check("master_artifact_json_mismatch_rejected",
           not check_master_result(master_result, {"master_design_type": "basket"}).passed)
     check("master_unknown_family_rejected",
           not check_master_result(master_result, {"master_design_type": "unknown"}).passed)
+
+    (root / "basket_oc_table.csv").write_text(
+        "subgroup,null_param,alt_param,reject_rate,reject_mcse_pct,"
+        "reject_ci_lower_pct,reject_ci_upper_pct,reject_precision_met\n"
+        "1,0.2,0.4,80,1.26,77.4,82.4,FALSE\n", encoding="utf-8")
+    low_precision_result = {
+        **master_result,
+        "result": {
+            **master_result["result"],
+            "oc_table": [dict(master_result["result"]["oc_table"][0],
+                              reject_precision_met=False)],
+        },
+    }
+    verdict = check_master_result(low_precision_result,
+                                  {"master_design_type": "basket", "n_sims": 1000})
+    check("master_low_mc_precision_is_partial", verdict.passed and verdict.blocked,
+          str(verdict))
+
+    (root / "basket_oc_table.csv").write_text(
+        "subgroup,null_param,alt_param,reject_rate,reject_mcse_pct,"
+        "reject_ci_lower_pct,reject_ci_upper_pct,reject_precision_met\n"
+        "1,0.2,0.4,80,1.26,77.4,82.4,TRUE\n", encoding="utf-8")
+    missing_mc_result = {
+        **master_result,
+        "result": {"oc_table": [{"subgroup": 1, "reject_rate": 80}],
+                   "mc_precision_target_probability_half_width": 0.02},
+    }
+    check("master_missing_mc_uncertainty_fails",
+          not check_master_result(missing_mc_result,
+                                  {"master_design_type": "basket"}).passed)
 
     artifact = root / "basket_oc_table.csv"
     artifact.unlink()
@@ -317,6 +414,490 @@ with tempfile.TemporaryDirectory() as directory:
         not csv_ok and not finite_ok and consistency is None,
     )
 
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    (root / "umbrella_power_table.csv").write_text(
+        "arm,per_arm_power,power_mcse_pct,power_ci_lower_pct,"
+        "power_ci_upper_pct,power_precision_met\n"
+        "1,80,1.26,77.4,82.4,TRUE\n", encoding="utf-8")
+    (root / "umbrella_arm_comparison.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    umbrella_result = {
+        "result": {
+            "oc_table": [{"arm": 1, "per_arm_power": 80,
+                          "power_mcse_pct": 1.26,
+                          "power_ci_lower_pct": 77.4,
+                          "power_ci_upper_pct": 82.4,
+                          "power_precision_met": True}],
+            "mc_precision_target_probability_half_width": 0.02,
+            "boundary_source": "approximation",
+            "boundary_approximation": True,
+            "boundary_fallback_reason": "MAMS package unavailable",
+            "decision_rule": "no interim efficacy; final Bonferroni",
+            "boundaries": {
+                "effect": [None, 2.24],
+                "efficacy_enabled_by_stage": [False, True],
+            },
+        },
+        "output_dir": str(root),
+    }
+    verdict = check_master_result(
+        umbrella_result,
+        {"master_design_type": "umbrella", "umbrella_method": "mams"},
+    )
+    check("master_mams_approximation_contract_passes", verdict.passed, str(verdict))
+    bad_umbrella = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundaries": {"effect": [2.0, 2.24],
+                           "efficacy_enabled_by_stage": [False, True]},
+        },
+    }
+    check("master_mams_unapplied_reported_boundary_fails",
+          not check_master_result(
+              bad_umbrella,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    # A one-stage fallback has only its final efficacy boundary, which jsonlite
+    # encodes as a scalar. That final stage must remain enabled.
+    single_stage = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundaries": {
+                "effect": 2.24, "efficacy_enabled_by_stage": True,
+            },
+        },
+    }
+    verdict = check_master_result(
+        single_stage,
+        {"master_design_type": "umbrella", "umbrella_method": "mams",
+         "n_stages": 1},
+    )
+    check("master_mams_single_stage_unboxed_boundary_passes",
+          verdict.passed
+          and verdict.checks.get("mams_boundary_contract") is True, str(verdict))
+    # The same one-stage payload must not satisfy a two-stage design.
+    check("master_mams_single_stage_boundary_rejects_two_stage_config",
+          not check_master_result(
+              single_stage,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    single_stage_disabled = {
+        **single_stage,
+        "result": {
+            **single_stage["result"],
+            "boundaries": {
+                "effect": None, "efficacy_enabled_by_stage": False,
+            },
+        },
+    }
+    check("master_mams_single_stage_disabled_final_boundary_fails_closed",
+          not check_master_result(
+              single_stage_disabled,
+              {"master_design_type": "umbrella", "umbrella_method": "mams",
+               "n_stages": 1},
+          ).passed)
+
+    single_stage_unapplied = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundaries": {"effect": 2.0, "efficacy_enabled_by_stage": False},
+        },
+    }
+    check("master_mams_single_stage_unapplied_boundary_fails",
+          not check_master_result(
+              single_stage_unapplied,
+              {"master_design_type": "umbrella", "umbrella_method": "mams",
+               "n_stages": 1},
+          ).passed)
+
+    missing_boundary_vector = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundaries": {"efficacy_enabled_by_stage": [False, True]},
+        },
+    }
+    check("master_mams_missing_boundary_vector_fails_closed",
+          not check_master_result(
+              missing_boundary_vector,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    # An absent or null boundary_source must not skip the contract entirely.
+    for label, source in (("null", None), ("absent", "__omit__")):
+        undeclared_source = dict(umbrella_result["result"])
+        if source == "__omit__":
+            undeclared_source.pop("boundary_source", None)
+        else:
+            undeclared_source["boundary_source"] = source
+        check(f"master_mams_{label}_boundary_source_fails_closed",
+              not check_master_result(
+                  {**umbrella_result, "result": undeclared_source},
+                  {"master_design_type": "umbrella", "umbrella_method": "mams"},
+              ).passed)
+
+    # The default umbrella method is MAMS, so an omitted method still requires
+    # the boundary contract.
+    check("master_default_umbrella_method_requires_boundary_contract",
+          not check_master_result(
+              {**umbrella_result,
+               "result": {key: value
+                          for key, value in umbrella_result["result"].items()
+                          if key != "boundary_source"}},
+              {"master_design_type": "umbrella"},
+          ).passed)
+
+    # Two reported boundaries cannot satisfy a three-stage design.
+    check("master_mams_boundary_count_must_match_stages",
+          not check_master_result(
+              umbrella_result,
+              {"master_design_type": "umbrella", "umbrella_method": "mams",
+               "n_stages": 3},
+          ).passed)
+    verdict = check_master_result(
+        umbrella_result,
+        {"master_design_type": "umbrella", "umbrella_method": "mams", "n_stages": 2},
+    )
+    check("master_mams_explicit_matching_stage_count_passes",
+          verdict.passed, str(verdict))
+
+    # The engine pairs MAMS_package with approximation FALSE and both
+    # approximation and user_supplied with TRUE; no other combination exists.
+    for source, approximated in (
+        ("approximation", False),
+        ("user_supplied", False),
+        ("MAMS_package", True),
+    ):
+        contradictory = {
+            **umbrella_result,
+            "result": {
+                **umbrella_result["result"],
+                "boundary_source": source,
+                "boundary_approximation": approximated,
+            },
+        }
+        check(f"master_mams_{source}_with_approximation_{approximated}_fails_closed",
+              not check_master_result(
+                  contradictory,
+                  {"master_design_type": "umbrella", "umbrella_method": "mams"},
+              ).passed)
+    user_supplied = {
+        **umbrella_result,
+        "result": {**umbrella_result["result"], "boundary_source": "user_supplied"},
+    }
+    user_supplied_config = {
+        "master_design_type": "umbrella", "umbrella_method": "mams",
+        "futility_boundaries": [-1.0, 2.24],
+    }
+    verdict = check_master_result(
+        user_supplied,
+        user_supplied_config,
+    )
+    check("master_mams_user_supplied_approximation_passes", verdict.passed, str(verdict))
+    check("master_mams_user_supplied_without_requested_boundaries_fails_closed",
+          not check_master_result(
+              user_supplied,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    package_calibrated = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundary_source": "MAMS_package",
+            "boundary_approximation": False,
+            "boundary_fallback_reason": None,
+            "boundaries": {
+                "effect": [2.0, 2.24],
+                "efficacy_enabled_by_stage": [True, True],
+            },
+        },
+    }
+    verdict = check_master_result(
+        package_calibrated,
+        {"master_design_type": "umbrella", "umbrella_method": "mams"},
+    )
+    check("master_mams_package_calibrated_pair_passes", verdict.passed, str(verdict))
+
+    check("master_mams_package_with_requested_user_boundaries_fails_closed",
+          not check_master_result(
+              package_calibrated,
+              {"master_design_type": "umbrella", "umbrella_method": "mams",
+               "futility_boundaries": [-1.0, 2.24]},
+          ).passed)
+
+    package_with_fallback = {
+        **package_calibrated,
+        "result": {
+            **package_calibrated["result"],
+            "boundary_fallback_reason": "must be absent for package calibration",
+        },
+    }
+    check("master_mams_package_fallback_reason_fails_closed",
+          not check_master_result(
+              package_with_fallback,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    wrong_fallback_flags = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundaries": {
+                "effect": [2.0, 2.24],
+                "efficacy_enabled_by_stage": [True, True],
+            },
+        },
+    }
+    check("master_mams_approximation_wrong_stage_flags_fail_closed",
+          not check_master_result(
+              wrong_fallback_flags,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+    check("master_mams_approximation_with_user_boundaries_fails_closed",
+          not check_master_result(
+              umbrella_result,
+              {"master_design_type": "umbrella", "umbrella_method": "mams",
+               "futility_boundaries": [-1.0, 2.24]},
+          ).passed)
+
+    blank_fallback = {
+        **umbrella_result,
+        "result": {
+            **umbrella_result["result"],
+            "boundary_fallback_reason": "   ",
+        },
+    }
+    check("master_mams_approximation_blank_fallback_fails_closed",
+          not check_master_result(
+              blank_fallback,
+              {"master_design_type": "umbrella", "umbrella_method": "mams"},
+          ).passed)
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    (root / "platform_arm_results.csv").write_text(
+        "arm,reject_rate,mean_n,requested_ncc_method,actual_analysis_method,"
+        "reject_mcse_pct,reject_ci_lower_pct,reject_ci_upper_pct,"
+        "reject_precision_met\n"
+        "1,5,100,regression,exact_concurrent_stratified,0.69,3.8,6.6,TRUE\n",
+        encoding="utf-8")
+    (root / "platform_oc_table.csv").write_text(
+        "metric,value,mcse,ci_lower,ci_upper,precision_met,n_simulations\n"
+        "FWER (%),5,0.69,3.8,6.6,TRUE,1000\n", encoding="utf-8")
+    (root / "platform_timeline.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (root / "platform_oc_curves.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    platform_result = {
+        "result": {
+            "arm_results": [{
+                "arm": 1, "reject_rate": 5, "mean_n": 100,
+                "requested_ncc_method": "regression",
+                "actual_analysis_method": "exact_concurrent_stratified",
+                "reject_mcse_pct": 0.69, "reject_ci_lower_pct": 3.8,
+                "reject_ci_upper_pct": 6.6, "reject_precision_met": True,
+            }],
+            "oc_table": [{"metric": "FWER (%)", "value": 5, "mcse": 0.69,
+                          "ci_lower": 3.8, "ci_upper": 6.6,
+                          "precision_met": True, "n_simulations": 1000}],
+            "interim_stopping_applied": False,
+            "interim_futility_enabled": False,
+            "interim_efficacy_enabled": False,
+            "interim_stopping_reason": "No NCC-consistent interim model",
+            "requested_ncc_method": "regression",
+            "actual_analysis_methods": ["exact_concurrent_stratified"],
+            "mc_precision_target_probability_half_width": 0.02,
+        },
+        "output_dir": str(root),
+    }
+    verdict = check_master_result(
+        platform_result,
+        {"master_design_type": "platform", "ncc_method": "regression"},
+    )
+    check("master_platform_actual_behavior_contract_passes", verdict.passed,
+          str(verdict))
+    bad_platform = {
+        **platform_result,
+        "result": {**platform_result["result"],
+                   "interim_efficacy_enabled": True},
+    }
+    check("master_platform_inert_efficacy_claim_fails",
+          not check_master_result(
+              bad_platform,
+              {"master_design_type": "platform", "ncc_method": "regression"},
+          ).passed)
+
+    # A run that uses one analysis method reports a length-1 vector, which
+    # jsonlite encodes as a bare string.
+    single_method = {
+        **platform_result,
+        "result": {**platform_result["result"],
+                   "actual_analysis_methods": "exact_concurrent_stratified"},
+    }
+    verdict = check_master_result(
+        single_method,
+        {"master_design_type": "platform", "ncc_method": "regression"},
+    )
+    check("master_platform_single_unboxed_analysis_method_passes",
+          verdict.passed
+          and verdict.checks.get("platform_actual_behavior_declared") is True,
+          str(verdict))
+
+    for label, methods in (
+        ("empty_string", ""),
+        ("nonstring", 3),
+        ("whitespace", "   "),
+        ("whitespace_member", ["exact_concurrent_stratified", "   "]),
+        ("duplicate_member", ["exact_concurrent_stratified",
+                              "exact_concurrent_stratified"]),
+        # An unhashable element must fail the contract, not raise before the
+        # verdict is returned.
+        ("unhashable_member", [{}]),
+        ("nested_list_member", [["exact_concurrent_stratified"]]),
+    ):
+        undeclared_method = {
+            **platform_result,
+            "result": {**platform_result["result"],
+                       "actual_analysis_methods": methods},
+        }
+        verdict = check_master_result(
+            undeclared_method,
+            {"master_design_type": "platform", "ncc_method": "regression"},
+        )
+        check(f"master_platform_{label}_analysis_method_fails_closed",
+              not verdict.passed
+              and verdict.checks.get("platform_actual_behavior_declared") is False,
+              str(verdict))
+
+    # An arm that used several methods across periods reports them ";"-joined,
+    # and the declared list is their union over every arm.
+    joined_label = "exact_concurrent_stratified;not_run_interim_futility"
+    with tempfile.TemporaryDirectory() as joined_directory:
+        joined_root = Path(joined_directory)
+        (joined_root / "platform_arm_results.csv").write_text(
+            "arm,reject_rate,mean_n,requested_ncc_method,actual_analysis_method,"
+            "reject_mcse_pct,reject_ci_lower_pct,reject_ci_upper_pct,"
+            "reject_precision_met\n"
+            f"1,5,100,regression,{joined_label},0.69,3.8,6.6,TRUE\n",
+            encoding="utf-8")
+        (joined_root / "platform_oc_table.csv").write_text(
+            "metric,value,mcse,ci_lower,ci_upper,precision_met,n_simulations\n"
+            "FWER (%),5,0.69,3.8,6.6,TRUE,1000\n", encoding="utf-8")
+        (joined_root / "platform_timeline.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+        (joined_root / "platform_oc_curves.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+        multi_method = {
+            "output_dir": str(joined_root),
+            "result": {
+                **platform_result["result"],
+                "actual_analysis_methods": [
+                    "exact_concurrent_stratified", "not_run_interim_futility",
+                ],
+                "arm_results": [
+                    {**platform_result["result"]["arm_results"][0],
+                     "actual_analysis_method": joined_label},
+                ],
+            },
+        }
+        verdict = check_master_result(
+            multi_method,
+            {"master_design_type": "platform", "ncc_method": "regression"},
+        )
+        check("master_platform_joined_arm_methods_reconcile", verdict.passed, str(verdict))
+
+    for label, joined in (
+        ("blank_token", "exact_concurrent_stratified;"),
+        ("padded_token", "exact_concurrent_stratified; not_run_interim_futility"),
+    ):
+        malformed_join = {
+            **platform_result,
+            "result": {
+                **multi_method["result"],
+                "arm_results": [
+                    {**platform_result["result"]["arm_results"][0],
+                     "actual_analysis_method": joined},
+                ],
+            },
+        }
+        verdict = check_master_result(
+            malformed_join,
+            {"master_design_type": "platform", "ncc_method": "regression"},
+        )
+        check(f"master_platform_{label}_arm_method_fails_closed",
+              not verdict.passed
+              and verdict.checks.get("platform_actual_behavior_declared") is False,
+              str(verdict))
+
+    duplicate_arm_token = {
+        **platform_result,
+        "result": {
+            **platform_result["result"],
+            "arm_results": [
+                {**platform_result["result"]["arm_results"][0],
+                 "actual_analysis_method":
+                     "exact_concurrent_stratified;exact_concurrent_stratified"},
+            ],
+        },
+    }
+    verdict = check_master_result(
+        duplicate_arm_token,
+        {"master_design_type": "platform", "ncc_method": "regression"},
+    )
+    check("master_platform_duplicate_arm_method_token_fails_closed",
+          not verdict.passed
+          and verdict.checks.get("platform_actual_behavior_declared") is False,
+          str(verdict))
+
+    # A declared method that no arm ran must fail even though every arm method
+    # is itself declared.
+    overdeclared = {
+        **platform_result,
+        "result": {
+            **platform_result["result"],
+            "actual_analysis_methods": [
+                "exact_concurrent_stratified", "never_ran_method",
+            ],
+        },
+    }
+    check("master_platform_overdeclared_method_fails_closed",
+          not check_master_result(
+              overdeclared,
+              {"master_design_type": "platform", "ncc_method": "regression"},
+          ).passed)
+
+    # A declared set that does not cover what the arms actually ran, and an arm
+    # row with no method at all, must both fail.
+    unreconciled = {
+        **platform_result,
+        "result": {**platform_result["result"],
+                   "actual_analysis_methods": ["some_other_method"]},
+    }
+    check("master_platform_unreconciled_arm_method_fails_closed",
+          not check_master_result(
+              unreconciled,
+              {"master_design_type": "platform", "ncc_method": "regression"},
+          ).passed)
+    unlabelled_arm = {
+        **platform_result,
+        "result": {
+            **platform_result["result"],
+            "arm_results": [
+                {key: value
+                 for key, value in platform_result["result"]["arm_results"][0].items()
+                 if key != "actual_analysis_method"}
+            ],
+        },
+    }
+    check("master_platform_unlabelled_arm_method_fails_closed",
+          not check_master_result(
+              unlabelled_arm,
+              {"master_design_type": "platform", "ncc_method": "regression"},
+          ).passed)
+
 # ── combined_gate semantics ────────────────────────────────────────
 from gates import GateVerdict  # noqa: E402
 g = combined_gate(GateVerdict(passed=True), GateVerdict(passed=False, failures=["x"]))
@@ -359,7 +940,9 @@ meta_ok = {"k": 3, "estimate": 0.5, "se": 0.1,
            "lower": round(0.5 - 1.959964 * 0.1, 4),
            "upper": round(0.5 + 1.959964 * 0.1, 4),
            "tau2": 0.01, "q": 2.5, "i2": 20.0,
+           "effect_measure": "mean_difference",
            "study_effects": [0.4, 0.5, 0.7],
+           "study_effect_measures": ["mean_difference"] * 3,
            "n_input": 3, "k_used": 3, "dropped_studies": 0}
 v = check_meta(meta_ok, {"alpha": 0.05})
 check("meta_good_passes", v.passed and not v.notes, str(v))
@@ -394,6 +977,19 @@ hksj_meta = dict(
 v = check_meta(hksj_meta, {"alpha": 0.05})
 check("meta_hksj_t_interval_is_not_mischecked_as_normal", v.passed, str(v))
 
+v = check_meta(dict(meta_ok,
+                    study_effect_measures=["risk_difference", "log_odds_ratio"]), {})
+check("meta_mixed_result_scales_fail", not v.passed, str(v))
+
+v = check_meta(meta_ok, {"studies": [
+    {"measure": "risk_difference"}, {"measure": "log_odds_ratio"},
+]})
+check("meta_mixed_requested_scales_fail", not v.passed, str(v))
+
+v = check_meta({k: value for k, value in meta_ok.items()
+                if k != "effect_measure"}, {})
+check("meta_missing_effect_measure_fails", not v.passed, str(v))
+
 # ── check_randomize ────────────────────────────────────────────────
 rand_ok = {"method": "block", "n": 4, "arms": ["control", "treatment"],
            "counts": {"control": 2, "treatment": 2}, "seed": 42,
@@ -421,21 +1017,408 @@ fact_ok = {"type": "full_factorial", "n_factors": 2, "n_runs": 4,
            "levels": [2, 2], "replicates": 1,
            "design": [{"A": -1, "B": -1}, {"A": 1, "B": -1},
                       {"A": -1, "B": 1}, {"A": 1, "B": 1}]}
-v = check_factorial(fact_ok, {})
+fact_ok_args = {"n_factors": 2}
+v = check_factorial(fact_ok, fact_ok_args)
 check("factorial_orthogonal_passes", v.passed, str(v))
-v = check_factorial(dict(fact_ok, design=fact_ok["design"][:3], n_runs=3), {})
+v = check_factorial(dict(fact_ok, design=fact_ok["design"][:3], n_runs=3),
+                    fact_ok_args)
 check("factorial_broken_orthogonality_fails", not v.passed, str(v))
-v = check_factorial(dict(fact_ok, n_runs=8), {})
+v = check_factorial(dict(fact_ok, n_runs=8), fact_ok_args)
 check("factorial_run_count_mismatch_fails", not v.passed, str(v))
-check("factorial_empty_fails", not check_factorial({}, {}).passed)
+check("factorial_empty_fails", not check_factorial({}, fact_ok_args).passed)
+
+for label, mismatched_args, check_name in (
+    ("n_factors", {"n_factors": 3}, "factorial_n_factors_matches_request"),
+    ("levels", {"n_factors": 2, "levels": [3, 3]},
+     "full_factorial_levels_match_request"),
+    ("replicates", {"n_factors": 2, "replicates": 2},
+     "full_factorial_replicates_match_request"),
+):
+    verdict = check_factorial(fact_ok, mismatched_args)
+    check(f"factorial_valid_output_mismatched_{label}_request_fails_closed",
+          not verdict.passed and verdict.checks.get(check_name) is False,
+          str(verdict))
+for label, levels in (
+    ("scalar", 2), ("length_one_list", [2]), ("list", [2, 2]),
+):
+    verdict = check_factorial(fact_ok, {"n_factors": 2, "levels": levels})
+    check(f"factorial_effective_{label}_levels_match_output",
+          verdict.passed
+          and verdict.checks.get("full_factorial_levels_match_request") is True,
+          str(verdict))
+
+
+def full_factorial_fixture(levels, replicates=1, center_points=0):
+    columns = [chr(ord("A") + index) for index in range(len(levels))]
+    values = ([(-1, 1) for _ in levels] if all(value == 2 for value in levels)
+              else [range(1, value + 1) for value in levels])
+    rows = [dict(zip(columns, combination))
+            for combination in product(*values)
+            for _ in range(replicates)]
+    center = ([0] * len(levels) if all(value == 2 for value in levels)
+              else [(value + 1) / 2 for value in levels])
+    rows.extend(dict(zip(columns, center)) for _ in range(center_points))
+    return {
+        "type": "full_factorial",
+        "n_factors": len(levels),
+        "n_runs": len(rows),
+        "levels": list(levels),
+        "replicates": replicates,
+        "design": rows,
+    }
+
+
+def full_factorial_request(result, center_points=0):
+    request = {"n_factors": result["n_factors"]}
+    result_levels = result.get("levels")
+    normalized_levels = (
+        [result_levels] if isinstance(result_levels, (int, float))
+        and not isinstance(result_levels, bool) else result_levels
+    )
+    if (isinstance(normalized_levels, list)
+            and any(value != 2 for value in normalized_levels)):
+        request["levels"] = result_levels
+    if result.get("replicates", 1) != 1:
+        request["replicates"] = result["replicates"]
+    if center_points != 0:
+        request["center_points"] = center_points
+    return request
+
+
+two_level_centers = full_factorial_fixture([2, 2, 2], center_points=3)
+two_level_args = full_factorial_request(two_level_centers, center_points=3)
+ordered_verdict = check_factorial(two_level_centers, two_level_args)
+check("factorial_ordered_centers_pass", ordered_verdict.passed, str(ordered_verdict))
+for shuffle_seed in (1, 7, 42, 99):
+    shuffled = dict(two_level_centers)
+    shuffled["design"] = list(two_level_centers["design"])
+    random.Random(shuffle_seed).shuffle(shuffled["design"])
+    verdict = check_factorial(shuffled, two_level_args)
+    check(f"factorial_randomized_centers_seed_{shuffle_seed}_passes",
+          verdict.passed and verdict.checks == ordered_verdict.checks, str(verdict))
+
+# A 3x3 base grid already contains the midpoint once per replicate. The gate
+# must preserve those two legitimate rows while removing only the three added
+# centers, irrespective of randomized run order.
+odd_level_replicated = full_factorial_fixture(
+    [3, 3], replicates=2, center_points=3,
+)
+random.Random(17).shuffle(odd_level_replicated["design"])
+v = check_factorial(
+    odd_level_replicated,
+    full_factorial_request(odd_level_replicated, center_points=3),
+)
+check("factorial_odd_levels_replicates_preserve_native_midpoints",
+      v.passed and v.checks.get("full_factorial_grid_complete") is True, str(v))
+
+# A mixed even/odd grid uses a half-level center that is absent from its base
+# grid. Exercise that coordinate path with replicates as well.
+mixed_level_replicated = full_factorial_fixture(
+    [3, 4], replicates=2, center_points=2,
+)
+random.Random(23).shuffle(mixed_level_replicated["design"])
+v = check_factorial(
+    mixed_level_replicated,
+    full_factorial_request(mixed_level_replicated, center_points=2),
+)
+check("factorial_mixed_levels_replicates_randomized_centers_pass",
+      v.passed and v.checks.get("center_rows_match_request") is True, str(v))
+
+insufficient_centers = full_factorial_fixture([2, 2, 2], center_points=3)
+insufficient_centers["design"][8] = dict(insufficient_centers["design"][0])
+v = check_factorial(
+    insufficient_centers,
+    full_factorial_request(insufficient_centers, center_points=3),
+)
+check("factorial_insufficient_center_rows_fail_closed",
+      not v.passed and v.checks.get("center_rows_match_request") is False, str(v))
+
+extra_midpoint = full_factorial_fixture([3, 3], replicates=2, center_points=3)
+extra_midpoint["design"][0] = {"A": 2, "B": 2}
+v = check_factorial(
+    extra_midpoint,
+    full_factorial_request(extra_midpoint, center_points=3),
+)
+check("factorial_extra_midpoint_missing_grid_row_fails_closed",
+      not v.passed and v.checks.get("center_rows_match_request") is False, str(v))
+
+v = check_factorial(two_level_centers, {"n_factors": 3, "center_points": 2.5})
+check("factorial_fractional_center_count_fails_closed", not v.passed, str(v))
+v = check_factorial(two_level_centers, {"n_factors": 3, "center_points": True})
+check("factorial_boolean_center_count_fails_closed", not v.passed, str(v))
+v = check_factorial(two_level_centers, {"n_factors": 3, "center_points": 2})
+check("factorial_valid_output_mismatched_center_request_fails_closed",
+      not v.passed and v.checks.get("center_rows_match_request") is False, str(v))
+malformed_factor_value = full_factorial_fixture([2, 2], center_points=1)
+malformed_factor_value["design"][0]["A"] = []
+v = check_factorial(
+    malformed_factor_value,
+    full_factorial_request(malformed_factor_value, center_points=1),
+)
+check("factorial_malformed_factor_value_fails_closed", not v.passed, str(v))
+
+for single_levels in (2, 3):
+    single_factor = full_factorial_fixture(
+        [single_levels], center_points=2,
+    )
+    # Match jsonlite's scalar encoding for an R vector of length one.
+    single_factor["levels"] = single_levels
+    random.Random(42).shuffle(single_factor["design"])
+    v = check_factorial(
+        single_factor,
+        full_factorial_request(single_factor, center_points=2),
+    )
+    check(f"factorial_single_factor_{single_levels}_levels_passes",
+          v.passed and v.checks.get("full_factorial_grid_complete") is True, str(v))
+
+multi_factor_scalar_levels = full_factorial_fixture([2, 2], center_points=0)
+multi_factor_scalar_levels["levels"] = 2
+v = check_factorial(
+    multi_factor_scalar_levels,
+    full_factorial_request(multi_factor_scalar_levels),
+)
+check("factorial_multifactor_scalar_levels_fail_closed", not v.passed, str(v))
+
+for label, first_row in (
+    ("boolean", {"A": True, "B": False}),
+    ("string", {"A": "low", "B": "high"}),
+    ("absent", {}),
+):
+    malformed_first_row = full_factorial_fixture([2, 2], center_points=0)
+    malformed_first_row["design"][0] = first_row
+    v = check_factorial(
+        malformed_first_row, full_factorial_request(malformed_first_row),
+    )
+    check(f"factorial_{label}_first_row_columns_fail_closed",
+          not v.passed
+          and v.checks.get("factor_columns_match_n_factors") is False
+          and v.checks.get("factor_matrix_numeric_and_rectangular") is False,
+          str(v))
+
+inconsistent_keys = full_factorial_fixture([2, 2], center_points=0)
+inconsistent_keys["design"][1]["C"] = 1
+v = check_factorial(inconsistent_keys, full_factorial_request(inconsistent_keys))
+check("factorial_inconsistent_factor_keys_fail_closed",
+      not v.passed
+      and v.checks.get("factor_matrix_numeric_and_rectangular") is False, str(v))
+
+nonobject_row = full_factorial_fixture([2, 2], center_points=0)
+nonobject_row["design"].append("not a row object")
+# A forged n_runs matching only the four surviving dictionary rows must not
+# allow the malformed fifth row to disappear through _design_rows filtering.
+v = check_factorial(nonobject_row, full_factorial_request(nonobject_row))
+check("factorial_nonobject_row_fails_closed",
+      not v.passed and v.checks.get("design_rows_are_objects") is False, str(v))
+
+for invalid_type in (None, "bogus"):
+    invalid_typed = full_factorial_fixture([2, 2], center_points=0)
+    invalid_typed["type"] = invalid_type
+    v = check_factorial(invalid_typed, full_factorial_request(invalid_typed))
+    check(f"factorial_type_{invalid_type!s}_fails_closed",
+          not v.passed and v.checks.get("factorial_type_supported") is False,
+          str(v))
+
+wrong_n_factors = full_factorial_fixture([2, 2], center_points=0)
+wrong_n_factors["n_factors"] = 3
+v = check_factorial(wrong_n_factors, {"n_factors": 2})
+check("factorial_n_factors_column_mismatch_fails_closed",
+      not v.passed
+      and v.checks.get("factor_columns_match_n_factors") is False, str(v))
+
 frac = {"type": "fractional_factorial", "n_factors": 4, "n_runs": 8,
+        "replicates": 1,
         "resolution": 4, "defining_relation": ["ABCD"],
         "design": [{"A": a, "B": b, "C": c, "D": a * b * c}
                    for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)]}
-v = check_factorial(frac, {})
+frac_args = {"n_factors": 4, "fraction": 1}
+v = check_factorial(frac, frac_args)
 check("fractional_resolution_matches", v.passed, str(v))
-v = check_factorial(dict(frac, resolution=3), {})
+v = check_factorial(dict(frac, resolution=3), frac_args)
 check("fractional_resolution_mismatch_fails", not v.passed, str(v))
+v = check_factorial(frac, {"n_factors": 4})
+check("fractional_missing_requested_fraction_fails_closed",
+      not v.passed and v.checks.get("fractional_fraction_valid") is False, str(v))
+
+# A half fraction has exactly one defining word, which jsonlite encodes as a
+# scalar. Match that shape rather than the multi-word array.
+half_fraction = dict(frac, defining_relation="ABCD")
+v = check_factorial(half_fraction, frac_args)
+check("fractional_unboxed_defining_relation_passes",
+      v.passed and v.checks.get("resolution_matches_relation") is True, str(v))
+v = check_factorial(dict(half_fraction, resolution=3), frac_args)
+check("fractional_unboxed_resolution_mismatch_fails", not v.passed, str(v))
+missing_relation = {key: value for key, value in frac.items()
+                    if key != "defining_relation"}
+v = check_factorial(missing_relation, frac_args)
+check("fractional_missing_defining_relation_fails_closed", not v.passed, str(v))
+
+# len(str(value)) would read each of these as a four-character defining word.
+for label, forged in (("null", None), ("boolean", True), ("number", 1000)):
+    v = check_factorial(dict(frac, defining_relation=forged), frac_args)
+    check(f"fractional_{label}_defining_relation_fails_closed",
+          not v.passed
+          and v.checks.get("defining_relation_well_formed") is False, str(v))
+
+for label, forged in (
+    ("padded", " ABCD "),
+    ("single_letter", "A"),
+    ("repeated_letter", "AABC"),
+    ("foreign_letter", "ABCZ"),
+):
+    v = check_factorial(dict(frac, defining_relation=[forged]), frac_args)
+    check(f"fractional_{label}_defining_word_fails_closed",
+          not v.passed
+          and v.checks.get("defining_relation_well_formed") is False, str(v))
+
+v = check_factorial(dict(frac, defining_relation=["ABCD", "ABCD"]), frac_args)
+check("fractional_duplicate_defining_words_fail_closed",
+      not v.passed and v.checks.get("defining_relation_well_formed") is False, str(v))
+
+# A word is a claim about the built matrix, not a label. This design is
+# generated as D=AB, so its true relation is I=ABD; claiming I=ABCD would report
+# resolution IV while main effects are aliased with two-factor interactions.
+forged_relation = dict(
+    frac,
+    design=[{"A": a, "B": b, "C": c, "D": a * b}
+            for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)],
+)
+v = check_factorial(forged_relation, frac_args)
+check("fractional_forged_defining_relation_fails_closed",
+      not v.passed
+      and v.checks.get("defining_relation_holds_in_design") is False, str(v))
+v = check_factorial(dict(forged_relation, resolution=3, defining_relation=["ABD"]),
+                    frac_args)
+check("fractional_true_defining_relation_of_same_design_passes", v.passed, str(v))
+
+# A real 2^(5-2): basic A,B,C with D=AB and E=AC, so I=ABD=ACE=BCDE.
+frac_two = {
+    "type": "fractional_factorial", "n_factors": 5, "n_runs": 8,
+    "replicates": 1, "resolution": 3,
+    "defining_relation": ["ABD", "ACE", "BCDE"],
+    "design": [{"A": a, "B": b, "C": c, "D": a * b, "E": a * c}
+               for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)],
+}
+frac_two_args = {"n_factors": 5, "fraction": 2}
+v = check_factorial(frac_two, frac_two_args)
+check("fractional_complete_defining_group_passes",
+      v.passed and v.checks.get("defining_relation_cardinality") is True
+      and v.checks.get("defining_relation_group_closed") is True
+      and v.checks.get("defining_relation_holds_in_design") is True, str(v))
+
+for label, mismatched_args, check_name in (
+    ("n_factors", {"n_factors": 6, "fraction": 2},
+     "factorial_n_factors_matches_request"),
+    ("levels", {**frac_two_args, "levels": 3},
+     "fractional_levels_match_request"),
+    ("replicates", {**frac_two_args, "replicates": 2},
+     "fractional_replicates_match_request"),
+):
+    verdict = check_factorial(frac_two, mismatched_args)
+    check(f"fractional_valid_output_mismatched_{label}_request_fails_closed",
+          not verdict.passed and verdict.checks.get(check_name) is False,
+          str(verdict))
+verdict = check_factorial(frac_two, {**frac_two_args, "levels": [2]})
+check("fractional_length_one_levels_list_normalizes_to_two_level",
+      verdict.passed
+      and verdict.checks.get("fractional_levels_match_request") is True,
+      str(verdict))
+
+replicated_frac_two = {
+    **frac_two,
+    "n_runs": 16,
+    "replicates": 2,
+    "design": [dict(row) for row in frac_two["design"] for _ in range(2)],
+}
+verdict = check_factorial(
+    replicated_frac_two, {**frac_two_args, "replicates": 2},
+)
+check("fractional_requested_replicate_multiplicity_passes",
+      verdict.passed
+      and verdict.checks.get("fractional_replicates_match_request") is True
+      and verdict.checks.get("fractional_run_count_matches_fraction") is True,
+      str(verdict))
+
+v = check_factorial(dict(frac_two, defining_relation=["ABD"]), frac_two_args)
+check("fractional_truncated_defining_relation_fails_closed",
+      not v.passed and v.checks.get("defining_relation_cardinality") is False, str(v))
+v = check_factorial(
+    dict(frac_two, defining_relation=["ABD", "ACE"]), frac_two_args,
+)
+check("fractional_non_group_cardinality_fails_closed",
+      not v.passed and v.checks.get("defining_relation_cardinality") is False, str(v))
+
+# The right number and lengths of words are insufficient. This forged set is a
+# closed group, but two words do not multiply to +1 in the actual matrix.
+closed_but_forged = dict(
+    frac_two, defining_relation=["ABC", "ADE", "BCDE"],
+)
+v = check_factorial(closed_but_forged, frac_two_args)
+check("fractional_closed_but_forged_relation_fails_design_binding",
+      not v.passed
+      and v.checks.get("defining_relation_group_closed") is True
+      and v.checks.get("defining_relation_holds_in_design") is False, str(v))
+
+# Conversely, a same-cardinality set that omits the symmetric difference of two
+# members is not the complete defining group.
+nonclosed_relation = dict(
+    frac_two, defining_relation=["ABD", "ACE", "ABCE"],
+)
+v = check_factorial(nonclosed_relation, frac_two_args)
+check("fractional_same_cardinality_nonclosed_relation_fails_closed",
+      not v.passed
+      and v.checks.get("defining_relation_cardinality") is True
+      and v.checks.get("defining_relation_group_closed") is False, str(v))
+
+# Centers may be randomized through the run table, but they must be excluded
+# from relation products and counted exactly.
+frac_two_centers = {
+    **frac_two,
+    "n_runs": 10,
+    "design": [*frac_two["design"],
+               {column: 0 for column in ("A", "B", "C", "D", "E")},
+               {column: 0 for column in ("A", "B", "C", "D", "E")}],
+}
+random.Random(31).shuffle(frac_two_centers["design"])
+v = check_factorial(
+    frac_two_centers, {**frac_two_args, "center_points": 2},
+)
+check("fractional_randomized_centers_preserve_relation_checks",
+      v.passed
+      and v.checks.get("fractional_center_rows_match_request") is True
+      and v.checks.get("defining_relation_holds_in_design") is True, str(v))
+v = check_factorial(
+    frac_two_centers, {**frac_two_args, "center_points": 1},
+)
+check("fractional_center_count_must_match_request",
+      not v.passed
+      and v.checks.get("fractional_center_rows_match_request") is False, str(v))
+
+duplicate_base = {**frac_two, "design": list(frac_two["design"])}
+duplicate_base["design"][0] = dict(duplicate_base["design"][1])
+v = check_factorial(duplicate_base, frac_two_args)
+check("fractional_base_runs_must_be_unique",
+      not v.passed
+      and v.checks.get("fractional_run_count_matches_fraction") is False, str(v))
+
+mixed_zero_row = {**frac_two, "design": [dict(row) for row in frac_two["design"]]}
+mixed_zero_row["design"][0]["A"] = 0
+v = check_factorial(mixed_zero_row, frac_two_args)
+check("fractional_mixed_zero_row_fails_closed",
+      not v.passed
+      and v.checks.get("fractional_rows_are_base_or_center") is False, str(v))
+v = check_factorial(frac_two, {**frac_two_args, "center_points": True})
+check("fractional_boolean_center_count_fails_closed",
+      not v.passed
+      and v.checks.get("fractional_center_count_valid") is False, str(v))
+
+# Eight runs cannot satisfy a requested 2^(5-3) design; that requires four base
+# runs plus any explicitly requested centers.
+v = check_factorial(
+    dict(frac_two, n_factors=5), {"n_factors": 5, "fraction": 3},
+)
+check("fractional_run_count_must_match_fraction",
+      not v.passed
+      and v.checks.get("fractional_run_count_matches_fraction") is False, str(v))
 
 # ── check_rsm ──────────────────────────────────────────────────────
 ccd = {"type": "central_composite", "n_factors": 2, "alpha": 1.4142,

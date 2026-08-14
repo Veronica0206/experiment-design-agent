@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -29,7 +30,7 @@ def _forbidden_proprietary_path(relative: str) -> str | None:
     lowered = path.name.lower()
     if lowered == "skill.md" or lowered.endswith(".skill"):
         return f"proprietary plaintext/bundle filename forbidden: {relative}"
-    if any(part.startswith("vera-") for part in path.parts):
+    if any(part.lower().startswith("vera-") for part in path.parts):
         allowed = lowered.endswith(".skill.enc") or lowered in LICENSE_NAMES
         if not allowed:
             return (
@@ -86,6 +87,31 @@ def _staged_entries(root: Path) -> tuple[dict[str, bytes], str | None]:
     return entries, None
 
 
+def _tree_entries(root: Path, treeish: str) -> tuple[dict[str, bytes], str | None]:
+    # The sync path passes a resolved commit object ID. Restricting this input
+    # to an object ID avoids option/revision-expression injection and makes the
+    # exact bytes being authorized unambiguous.
+    if re.fullmatch(r"[0-9a-fA-F]{40,64}", treeish) is None:
+        return {}, "tree-ish must be a resolved Git object ID"
+    raw = _git(root, "ls-tree", "-r", "-z", "--full-tree", treeish)
+    entries: dict[str, bytes] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_name = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ", 2)
+            name = raw_name.decode("utf-8", errors="surrogateescape")
+        except Exception as exc:
+            return {}, f"could not parse committed inventory: {exc}"
+        if mode == b"120000":
+            return {}, f"symlinks are forbidden in a publish tree: {name}"
+        if mode not in {b"100644", b"100755"} or object_type != b"blob":
+            return {}, f"unsupported committed entry mode {mode.decode()}: {name}"
+        entries[name] = _git(root, "cat-file", "blob", object_id.decode("ascii"))
+    return entries, None
+
+
 def _validate(
     root: Path,
     entries: dict[str, bytes],
@@ -138,16 +164,24 @@ def _validate(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--staged", action="store_true")
+    source_mode = parser.add_mutually_exclusive_group()
+    source_mode.add_argument("--staged", action="store_true")
+    source_mode.add_argument("--tree-ish", metavar="OBJECT_ID")
     parser.add_argument("source", type=Path)
     args = parser.parse_args()
     root = args.source.resolve()
     if not root.is_dir():
         return fail(f"publish source is not a directory: {root}")
+    inspected = "committed" if args.tree_ish else ("staged" if args.staged else "working")
     try:
-        entries, error = (_staged_entries(root) if args.staged else _working_entries(root))
+        if args.tree_ish:
+            entries, error = _tree_entries(root, args.tree_ish)
+        elif args.staged:
+            entries, error = _staged_entries(root)
+        else:
+            entries, error = _working_entries(root)
     except Exception as exc:
-        return fail(f"could not inspect {'staged' if args.staged else 'working'} publish tree: {exc}")
+        return fail(f"could not inspect {inspected} publish tree: {exc}")
     if error:
         return fail(error)
     pin = os.environ.get("EXPDESIGN_PUBLISH_MANIFEST_SHA256", "").lower()

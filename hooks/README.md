@@ -1,19 +1,65 @@
 # Hooks
 
+## Coordinator prompt capture and dispatch binding
+
+The native coordinator is a **main-agent-only** entrypoint. Run it with
+`claude --agent experiment-design-coordinator`. Current Claude Code releases
+can nest subagents, but the `Agent(child-a, child-b)` type allowlist is enforced
+only for a main agent; inside a subagent definition the parenthesized list is
+ignored. Requiring the coordinator as main preserves both its child allowlist
+and its user-prompt binding.
+
+Before each main-thread user turn, the coordinator's `UserPromptSubmit` hook
+captures a keyed HMAC commitment to the exact raw prompt. The commitment is
+keyed by `session_id`, `prompt_id`, and `main:experiment-design-coordinator`.
+The raw prompt is never written to disk. The commitment ledger, key, and lock
+files use mode `0600` inside a mode-`0700` host directory.
+
+Before an `Agent` call executes, the coordinator's `PreToolUse` hook requires:
+
+1. the exact committed user prompt, byte-for-byte;
+2. one registry-approved child type;
+3. the deterministic description `Dispatch current request to <child>`;
+4. explicit foreground execution (`run_in_background: false`); and
+5. no extra model, resume, follow-up, naming, isolation, or team fields;
+6. at most one dispatch to each child for this prompt; and
+7. one registry-domain-derived phase (`evidence` or `planning`) for the turn.
+
+A missing capture, prompt paraphrase, cross-turn replay, nested-coordinator
+principal, repeated child, evidence/planning mix, asynchronous call, or
+unsupported input shape blocks before the child starts. Child names already
+authorized for the turn are committed atomically without storing the prompt;
+distinct same-phase fan-out remains allowed. The per-prompt commitment is
+removed when the coordinator emits a terminal governed response.
+`PostToolBatch` still sanitizes the completed child call to its approved type
+plus final text, and `Stop` still binds the coordinator's final output to that
+ledger. A legacy/malformed mixed ledger may terminate only with the exact
+value-free failure report, which also clears the turn state.
+
 ## enforce_verification.py — agent-scoped `Stop` / `SubagentStop` gate
 
 Gives both Claude Code main-agent (`claude --agent ...`) and spawned-subagent
-runtimes the same design-level verification the MCP server enforces in code.
-`PostToolBatch` records the exact tool inputs and model-visible responses
-synchronously, and `Stop` binds the current `last_assistant_message` to those
-server-issued verification records. Claude Code automatically treats an
+runtimes fail-closed enforcement of the MCP server's design verdict. The private
+raw-result checks run once inside the server verifier; the hook does not receive
+that raw payload and does not recompute them. Instead, `PostToolBatch` records the
+exact tool inputs and model-visible responses synchronously, and `Stop` validates
+the server-bound public envelope and attestation, requires fresh regression
+evidence, and binds the current `last_assistant_message` to the server-issued
+canonical report. Claude Code automatically treats an
 agent-frontmatter `Stop` hook as `SubagentStop` when that agent is spawned.
 
 **Scope.** Each governed agent declares its own hooks in frontmatter and passes
-an explicit trusted scope (`experiment-designer` or `design-verifier`) through
-the launcher. The launcher rejects an invalid scope or a conflicting runtime
-`agent_type`. `.claude/settings.json` intentionally contains no duplicate
-global registration.
+an explicit trusted registry scope through the launcher. The launcher rejects
+an invalid scope or a conflicting runtime `agent_type`; it also rejects a
+coordinator carrying a subagent `agent_id`. `.claude/settings.json`
+intentionally contains no duplicate global registration.
+The launcher imports a fixed, frozen domain-tool authorization table rather than
+trusting the mutable registry alone. A separate validator-only inspector reads
+that same side-effect-free policy module; `validate-config` requires exact parity
+with both `governance/agents.json` and the Python registry boundary. The
+production launcher recognizes only `capture`, `bind`, `record`, and `enforce`,
+so policy inspection can never act as a successful Hook mode; the runtime still
+independently fails closed.
 
 **Synchronous ledger.** The production hook does not use either transcript
 path as a trust source. Claude Code writes transcripts asynchronously, so they
@@ -21,7 +67,9 @@ may omit the current turn. The ledger is keyed by `session_id`, `prompt_id`,
 and a trusted principal: `main:<scope>` for `claude --agent`, or
 `subagent:<scope>:<agent_id>` for a spawned agent. Production and tests use the
 same ledger semantics; tests inject an in-memory line source where isolation is
-needed. No ambient environment variable can switch the trust source.
+needed. No ambient environment variable can switch the trust source. The
+ledger root must be a private, owned, non-symlink directory; lock and data
+files are opened with no-follow semantics and must be owned regular files.
 
 **Grouping.** Each `PostToolBatch` event is one attempt group, so a parallel
 fan-out is enforced together and never miscounted as several retries.
@@ -63,10 +111,17 @@ to the same tool may supersede. Invalid ledger structure, a missing response or
 batch gap, invalid hook input, unreadable ledgers, and gate-import failures fail closed; after a bounded
 stop cycle they may produce only the same value-free `INTERNAL_ERROR` report.
 
-**Registered in** each `.claude/agents/*.md` frontmatter block. A portable shell
-wrapper invokes the Node launcher, which resolves `python3` or `python`; every
+**Registered in** each `.claude/agents/*.md` frontmatter block with exact
+`/bin/sh`, never ambient `sh`. The portable shell wrapper never resolves Node
+through ambient `PATH`: it accepts an explicitly
+reviewed absolute `EXPDESIGN_NODE` or one of the fixed system/package-manager
+locations, then the Node launcher selects an approved absolute Python and
+strips Python startup/profile variables. Every
 missing-launcher/interpreter/policy failure is normalized to blocking exit code
-2. The generous hook
+2. The project MCP declaration invokes absolute `/bin/sh`, then its dedicated
+launcher applies the same fixed-or-explicit-absolute Node policy. Neither
+governed launch path inherits a Node executable from ambient `PATH`.
+The generous hook
 timeout is not the only trust boundary: the MCP server verifies before release.
 It keys on the MCP server name `mcp__experiment-design__` — if you register the
 server under a different name in `.mcp.json`, update `SERVER` in the hook.
@@ -78,8 +133,11 @@ combined minimum.
 **Tests.** `hooks/tests/test_enforce_verification.py` covers identity-safe
 correction, laundering, framework schemas, and value-free escape behavior.
 `hooks/tests/test_verification_ledger.py` exercises the production event path,
-including incomplete batches and concurrent writers. Hooks read event JSON on stdin and
-exit 0 (allow) or 2 (block).
+including incomplete batches and concurrent writers.
+`hooks/tests/test_coordinator_verification.py` covers exact prompt binding,
+private persistence, replay/paraphrase attacks, strict foreground Agent input,
+child-result fan-in, and coordinator stop enforcement. Hooks read event JSON on
+stdin and exit 0 (allow) or 2 (block).
 
 ## Observability — proving the hook actually ran
 
@@ -95,14 +153,18 @@ Every invocation is recorded by default in a private temporary log. Set
 export EXPDESIGN_HOOK_LOG=/tmp/expdesign-hook.log
 ```
 
-Each line is `ALLOW|BLOCK <TAB> reason_sha256=<digest>`. The reason itself is
-not persisted, so verification details cannot leak through diagnostics.
+Each line is a private-permission JSON event containing the timestamp,
+monotonic sequence token, session/prompt identifiers when supplied by the host,
+governed principal, hook event, and `ALLOW`/`BLOCK` outcome. Gate reasons and
+deterministic reason hashes are deliberately omitted because low-entropy values
+remain guessable from unsalted hashes.
 
 ```
-ALLOW	reason_sha256=7c1b...f09a
-BLOCK	reason_sha256=83d4...1e20
+{"hook_event":"Stop","outcome":"ALLOW","principal":"main:experiment-designer","schema_version":1,"sequence":123,"timestamp":123.0}
 ```
 
-An empty log after a governed agent run means the hook was **never invoked** —
-check the hook command and scope in that agent's frontmatter.
-Logging failures never change the enforcement decision.
+An empty log means either the hook was not invoked or observability failed; it
+must not be treated as proof of one specific cause. Set
+`EXPDESIGN_HOOK_LOG_REQUIRED=1` in environments where an unwritable trace must
+block an otherwise allowing decision. By default, logging failures do not change
+the enforcement decision.

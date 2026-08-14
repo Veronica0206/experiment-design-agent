@@ -7,41 +7,88 @@ can be unit-tested without coupling it to Claude Code process wiring.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from verification_ledger import clear as clear_ledger
+from verification_ledger import context_principal
+from verification_ledger import governed_agent
 from verification_ledger import read_lines as read_ledger_lines
+from private_state import (
+    append_bytes_at,
+    locked_private_directory,
+)
+from governance.registry import RegistryError, domain_phase, get_agent
 
 
 SERVER = "mcp__experiment-design__"
 VERIFY_TOOL = "run_tests"
 UNGATED = {"validate_config", VERIFY_TOOL}
-ENFORCED_AGENTS = {"experiment-designer", "design-verifier"}
 RUNTESTS_ESCAPE = 2
 DESIGN_FAIL_ESCAPE = 3
 SAFE_FAILURE_MESSAGE = "Verification failed; results withheld as not trustworthy."
 
 
+_TRACE_CONTEXT: dict[str, Any] = {}
+
+
+def _set_trace_context(data: dict[str, Any], principal: str | None) -> None:
+    scope = data.get("_expdesign_agent_scope")
+    _TRACE_CONTEXT.clear()
+    _TRACE_CONTEXT.update({
+        "session_id": data.get("session_id") if isinstance(data.get("session_id"), str) else None,
+        "prompt_id": data.get("prompt_id") if isinstance(data.get("prompt_id"), str) else None,
+        "principal": principal,
+        "hook_event": data.get("hook_event_name") if isinstance(data.get("hook_event_name"), str) else None,
+        "orchestration_id": data.get("orchestration_id") if isinstance(data.get("orchestration_id"), str) else None,
+        "task_id": data.get("task_id") if isinstance(data.get("task_id"), str) else None,
+        "parent_task_id": data.get("parent_task_id") if isinstance(data.get("parent_task_id"), str) else None,
+        "attempt": data.get("attempt") if isinstance(data.get("attempt"), int) else None,
+    })
+
+
 def _trace(outcome: str, detail: str = "") -> None:
-    path = Path(os.environ.get(
-        "EXPDESIGN_HOOK_LOG",
-        str(Path(tempfile.gettempdir()) / "experiment-design-hook.log"),
-    ))
+    configured_path = os.environ.get("EXPDESIGN_HOOK_LOG")
+    path = (
+        Path(configured_path)
+        if configured_path
+        else Path(tempfile.gettempdir()) / "experiment-design-hook-traces" / "hook.jsonl"
+    )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            digest = hashlib.sha256(detail.encode("utf-8", errors="replace")).hexdigest()[:16]
-            handle.write(f"{outcome}\treason_sha256={digest}\n")
-        os.chmod(path, 0o600)
-    except Exception:
+        if configured_path and not path.is_absolute():
+            raise OSError("configured hook trace path must be absolute")
+        with locked_private_directory(
+            path.parent,
+            ".trace.lock",
+            "hook trace directory",
+            "hook trace lock",
+        ) as directory_fd:
+            # Do not persist a deterministic digest of the full reason: gate
+            # diagnostics may contain low-entropy parameters that remain
+            # dictionary-testable after an unsalted hash.
+            event = {
+                "schema_version": 1,
+                "timestamp": time.time(),
+                "sequence": time.time_ns(),
+                "outcome": outcome,
+                **_TRACE_CONTEXT,
+            }
+            line = json.dumps(event, sort_keys=True, allow_nan=False) + "\n"
+            append_bytes_at(
+                directory_fd,
+                path.name,
+                line.encode("utf-8"),
+                "hook trace",
+            )
+    except Exception as exc:
         # Governance must not depend on observability; the decision still runs.
-        pass
+        if os.environ.get("EXPDESIGN_HOOK_LOG_REQUIRED") == "1":
+            sys.stderr.write(f"INTERNAL_ERROR. Required hook trace could not be written: {exc}")
+            raise SystemExit(2) from exc
 
 
 def _allow(reason: str) -> None:
@@ -82,6 +129,17 @@ def _safe_failure_report(message: str) -> bool:
     return " ".join(message.split()) == SAFE_FAILURE_MESSAGE
 
 
+def _coordinator_child_phase(child: str) -> str:
+    """Classify a child through the registry domain, not a name convention."""
+    try:
+        entry = get_agent(child)
+        if entry.get("role") != "domain_executor":
+            raise RegistryError("coordinator children must be domain executors")
+        return domain_phase(str(entry.get("domain")))
+    except RegistryError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _safe_partial_report(message: str, limitations: list[str]) -> bool:
     lower = message.lower()
     labelled = ("pass_partial" in lower or "partial verification" in lower) and any(
@@ -99,7 +157,6 @@ def _load_gates() -> dict[str, Any]:
         MANUAL_CHECKS,
         check_regression_tests,
         combined_gate,
-        design_checks_for,
     )
     from verification import (canonical_json, content_hash, domain_arguments,
                               public_check_summary,
@@ -117,7 +174,6 @@ def _load_gates() -> dict[str, Any]:
         "MANUAL_CHECKS": public_limitation_codes(list(MANUAL_CHECKS)),
         "check_regression_tests": check_regression_tests,
         "combined_gate": combined_gate,
-        "design_checks_for": design_checks_for,
         "content_hash": content_hash,
         "canonical_json": canonical_json,
         "domain_arguments": domain_arguments,
@@ -258,6 +314,132 @@ def _terminal_or_block(data: dict, reason: str, status: str) -> None:
     )
 
 
+def _coordinator_calls(lines: list[str], allowed_children: list[str]) -> list[dict[str, str]]:
+    """Parse only the sanitized Agent-call pairs emitted by the trusted ledger."""
+    if len(lines) % 2:
+        raise ValueError("coordinator ledger contains an unpaired child call")
+    calls: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_children: set[str] = set()
+    for offset in range(0, len(lines), 2):
+        try:
+            use_row = json.loads(lines[offset])
+            result_row = json.loads(lines[offset + 1])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("coordinator ledger contains malformed JSON") from exc
+        use_message = use_row.get("message") if isinstance(use_row, dict) else None
+        result_message = result_row.get("message") if isinstance(result_row, dict) else None
+        use_blocks = use_message.get("content") if isinstance(use_message, dict) else None
+        result_blocks = result_message.get("content") if isinstance(result_message, dict) else None
+        if (
+            not isinstance(use_blocks, list) or len(use_blocks) != 1
+            or not isinstance(result_blocks, list) or len(result_blocks) != 1
+            or not isinstance(use_blocks[0], dict) or not isinstance(result_blocks[0], dict)
+        ):
+            raise ValueError("coordinator ledger contains malformed child records")
+        use = use_blocks[0]
+        result = result_blocks[0]
+        call_id = use.get("id")
+        args = use.get("input")
+        if (
+            use.get("type") != "tool_use" or use.get("name") != "Agent"
+            or not isinstance(call_id, str) or not call_id or call_id in seen_ids
+            or not isinstance(args, dict)
+            or set(args) != {"subagent_type"}
+            or args.get("subagent_type") not in allowed_children
+        ):
+            raise ValueError("coordinator ledger contains an unapproved or asynchronous child call")
+        child = str(args["subagent_type"])
+        if child in seen_children:
+            raise ValueError("coordinator may not present duplicate child results")
+        if (
+            result.get("type") != "tool_result" or result.get("tool_use_id") != call_id
+        ):
+            raise ValueError("coordinator child response does not match its call")
+        content = result.get("content")
+        final = _text_content(content)
+        if not isinstance(final, str) or not final.strip() or final.startswith("EXPDESIGN_LEDGER_ERROR:"):
+            raise ValueError("coordinator child response lacks completed final content")
+        seen_ids.add(call_id)
+        seen_children.add(child)
+        calls.append({"child": child, "final": final})
+    return calls
+
+
+def _enforce_coordinator(
+    data: dict[str, Any], line_source: Callable[[dict[str, Any]], list[str]],
+    agent: dict[str, Any], api: dict[str, Any],
+) -> None:
+    message = _last_message_text(data.get("last_assistant_message"))
+    try:
+        lines = line_source(data)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if api["is_elicitation_message"](message):
+            clear_ledger(data)
+            _allow("coordinator has no child ledger; explicit open-ended elicitation")
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("coordinator has no child ledger; value-free failure report")
+        _block(f"INTERNAL_ERROR. The coordinator ledger could not be read: {exc}")
+
+    try:
+        calls = _coordinator_calls(lines, list(agent["allowed_children"]))
+    except ValueError as exc:
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("malformed child workflow ended with value-free failure report")
+        _block(f"INTERNAL_ERROR. {exc}")
+
+    if not calls:
+        if api["is_elicitation_message"](message):
+            clear_ledger(data)
+            _allow("coordinator made no child call; explicit open-ended elicitation")
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("coordinator made no child call; value-free failure report")
+        _block("UNBOUND_FREE_TEXT. Coordinator output is not bound to a completed child result.")
+
+    failures = [call for call in calls if _safe_failure_report(call["final"])]
+    if failures:
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("child failure propagated as the value-free failure report")
+        _block(
+            "UNVERIFIED_ESCAPE. A failed child cannot be combined with or laundered by "
+            "a successful sibling; return only the value-free failure report."
+        )
+
+    try:
+        selected_phases = {_coordinator_child_phase(call["child"]) for call in calls}
+    except ValueError as exc:
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("invalid child phase ended with value-free failure report")
+        _block(f"INTERNAL_ERROR. {exc}")
+    if len(selected_phases) > 1:
+        if _safe_failure_report(message):
+            clear_ledger(data)
+            _allow("mixed workflow phases ended with value-free failure report")
+        _block(
+            "SEQUENTIAL_BOUNDARY. Evidence analysis and prospective planning may not "
+            "run in the same user turn; return the evidence request first and require "
+            "a new user prompt that explicitly confirms any downstream design input."
+        )
+
+    order = {name: index for index, name in enumerate(agent["allowed_children"])}
+    ordered = sorted(calls, key=lambda call: order[call["child"]])
+    expected = ordered[0]["final"] if len(ordered) == 1 else "\n\n---\n\n".join(
+        call["final"] for call in ordered
+    )
+    if message != expected:
+        _block(
+            "VERIFIED. Coordinator output must copy the completed child result exactly, "
+            "or join multiple results in registry order with blank-line horizontal-rule separators."
+        )
+    clear_ledger(data)
+    _allow(f"VERIFIED: {len(ordered)} exact child result(s)")
+
+
 def enforce(
     data: dict[str, Any],
     line_source: Callable[[dict[str, Any]], list[str]] = read_ledger_lines,
@@ -267,21 +449,30 @@ def enforce(
     Tests may inject an in-memory ledger reader. Production callers never read
     transcript paths or environment-selected alternate trust sources.
     """
-    agent_type = data.get("agent_type") or None
     scope = data.get("_expdesign_agent_scope")
-    if scope not in ENFORCED_AGENTS:
-        _block("INTERNAL_ERROR. A governed agent scope is required for verification.")
-    if agent_type is not None and agent_type != scope:
-        _block("INTERNAL_ERROR. Verification hook agent scope mismatch.")
+    try:
+        if data.get("hook_event_name") not in {"Stop", "SubagentStop"}:
+            raise ValueError("verification enforcement accepts only Stop or SubagentStop")
+        agent = governed_agent(scope)
+        principal = context_principal(data, scope)
+    except ValueError as exc:
+        _set_trace_context(data, None)
+        _block(f"INTERNAL_ERROR. {exc}")
+    _set_trace_context(data, principal)
+
+    try:
+        api = _load_gates()
+    except Exception as exc:
+        _terminal_or_block(data, f"Verification gates could not load: {exc}.", "INTERNAL_ERROR")
+
+    if agent["ledger_policy"] == "coordinator":
+        _enforce_coordinator(data, line_source, agent, api)
+        return
 
     try:
         lines = line_source(data)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         message = _last_message_text(data.get("last_assistant_message"))
-        try:
-            api = _load_gates()
-        except Exception as load_exc:
-            _terminal_or_block(data, f"Verification gates could not load: {load_exc}.", "INTERNAL_ERROR")
         if api["is_elicitation_message"](message):
             _allow("no ledger; explicit open-ended elicitation")
         if _safe_failure_report(message):
@@ -289,14 +480,18 @@ def enforce(
             _allow("no ledger; value-free failure report")
         _terminal_or_block(data, f"The synchronous verification ledger could not be read: {exc}.", "INTERNAL_ERROR")
 
-    try:
-        api = _load_gates()
-    except Exception as exc:
-        _terminal_or_block(data, f"Verification gates could not load: {exc}.", "INTERNAL_ERROR")
-
     calls, runtests, ungated, parse_errors = _parse_transcript(lines, api)
     if parse_errors:
         _terminal_or_block(data, "; ".join(parse_errors[:5]), "INTERNAL_ERROR")
+    allowed_tools = set(agent["tools"])
+    if f"{SERVER}*" not in allowed_tools:
+        used_tools = {f"{SERVER}{item['tool']}" for item in calls + runtests + ungated}
+        outside = sorted(used_tools - allowed_tools)
+        if outside:
+            _terminal_or_block(
+                data, f"Tools outside the registered agent allowlist were used: {outside}.",
+                "INTERNAL_ERROR",
+            )
     if not calls:
         message = _last_message_text(data.get("last_assistant_message")) or _last_assistant_text(lines)
         validate_history = [
@@ -307,10 +502,24 @@ def enforce(
             result = latest_config.get("result")
             fields = {
                 "valid", "endpoint_type", "study_type", "design",
-                "go_target", "alphas", "powers", "configuration_report",
+                "go_target", "alphas", "powers", "resolved_config",
+                "simulation_defaults", "configuration_report",
+            }
+            resolved_fields = {
+                "endpoint_type", "study_type", "design", "estimand", "direction",
+                "sidedness", "null_param", "alt_param", "sd", "alloc_ratio",
+                "alphas", "powers", "prior_params", "go_threshold",
+                "consider_threshold", "go_target", "p3_n", "p3_alloc_ratio",
+                "p3_alpha", "accrual_time", "followup_time", "tte_method",
+                "exposure_time", "rate_method", "has_p2_data",
+                "has_p2_control_data",
             }
             if (latest_config.get("result_error") is None
                     and isinstance(result, dict) and set(result) == fields
+                    and isinstance(result.get("resolved_config"), dict)
+                    and set(result["resolved_config"]) == resolved_fields
+                    and isinstance(result.get("simulation_defaults"), dict)
+                    and set(result["simulation_defaults"]) == {"seed", "b_oc"}
                     and result.get("valid") is True):
                 core = {key: result[key] for key in fields - {"configuration_report"}}
                 expected = "CONFIGURATION_VALIDATED " + api["canonical_json"](core)
@@ -349,10 +558,28 @@ def enforce(
         for later in calls
     )]
     if unresolved_withheld:
+        # A safe failure sentence is a terminal escape, not a way to bypass the
+        # documented retry budget on the second Stop-hook invocation. Count
+        # distinct assistant message groups so parallel fan-out remains one
+        # attempt. Malformed/missing transport envelopes may terminate through
+        # INTERNAL_ERROR immediately; ordinary server-rejected designs require
+        # the advertised number of attempts.
+        design_rejections = [call for call in unresolved_withheld if (
+            call.get("result_error") is None
+            and isinstance(call.get("verification"), dict)
+            and call["verification"].get("presentable") is False
+        )]
+        rejected_attempts = len({call["group"] for call in design_rejections})
+        if design_rejections and rejected_attempts < DESIGN_FAIL_ESCAPE:
+            _block(
+                "RETRY_REQUIRED. The analysis result was withheld by server verification. "
+                f"Correct and rerun the same tool ({rejected_attempts}/{DESIGN_FAIL_ESCAPE} "
+                "failed attempts); a value-free terminal failure is not yet authorized."
+            )
         _terminal_or_block(
             data,
             "An analysis result was withheld or malformed and was not corrected by a later presentable call to the same tool.",
-            "FAILED",
+            "UNVERIFIED_ESCAPE" if design_rejections else "INTERNAL_ERROR",
         )
 
     # A server-withheld payload contains no raw result and is safe to supersede

@@ -1,15 +1,62 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PYTHON_EXECUTABLE } from "./integrity.js";
+import {
+  PYTHON_EXECUTABLE,
+  sanitizedPythonChildEnvironment,
+} from "./integrity.js";
+import {
+  killRuntimeProcessTree,
+  spawnRuntimeProcess,
+} from "./runtime-supervisor.js";
 
 const SUITE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const VERIFIER = resolve(SUITE_ROOT, "agent-harness", "server_verify.py");
 const VERIFY_TIMEOUT_MS = 30_000;
 
+interface ActiveVerifierProcessGroup {
+  terminate: () => void;
+  closed: Promise<void>;
+}
+
+const activeVerifierProcessGroups = new Map<number, ActiveVerifierProcessGroup>();
+let acceptingVerifierProcesses = true;
+
+/** Number of live verifier process groups; exported for lifecycle observability/tests. */
+export function activeVerifierProcessGroupCount(): number {
+  return activeVerifierProcessGroups.size;
+}
+
+/**
+ * Permanently stop accepting verifier work, terminate every active verifier
+ * process group, and wait for each group leader to close. Because every
+ * verifier is a detached process-group leader on POSIX, the same signal also
+ * covers descendants created by verifier code.
+ */
+export async function shutdownActiveVerifierProcesses(): Promise<void> {
+  acceptingVerifierProcesses = false;
+  for (;;) {
+    const active = [...activeVerifierProcessGroups.values()];
+    if (active.length === 0) return;
+    for (const group of active) group.terminate();
+    await Promise.all(active.map((group) => group.closed));
+  }
+}
+
+function verifierAbortError(): Error {
+  const error = new Error("Verification cancelled by the MCP client");
+  error.name = "AbortError";
+  return error;
+}
+
 export interface VerificationEnvelope {
-  identity?: { analysis_id: string; call_id: string; tool: string; args_hash: string; provenance_hash: string };
+  identity?: {
+    analysis_id: string;
+    call_id: string;
+    tool: string;
+    public_args_hash: string;
+    provenance_hash: string;
+  };
   status: string;
   presentable: boolean;
   checks?: Record<string, boolean>;
@@ -22,6 +69,133 @@ export interface VerificationEnvelope {
   public_result_hash?: string;
 }
 
+/**
+ * Run the verifier under the pinned Python interpreter. The path override is
+ * exported only so lifecycle tests can exercise cancellation against a
+ * deliberately blocked verifier; production preverification always uses the
+ * fixed audited VERIFIER path below.
+ */
+export function runVerifierRequest(
+  request: string,
+  signal?: AbortSignal,
+  verifierPath = VERIFIER,
+): Promise<VerificationEnvelope> {
+  if (!acceptingVerifierProcesses) {
+    return Promise.reject(new Error("Verifier runtime is shutting down"));
+  }
+  if (signal?.aborted) return Promise.reject(verifierAbortError());
+  return new Promise((resolvePromise, reject) => {
+    // Ignore PYTHON* environment injection, user site packages, and automatic
+    // sitecustomize loading. The verifier imports only its adjacent audited
+    // modules and Python's standard library. A detached POSIX process group
+    // lets cancellation terminate any verifier descendants as well.
+    const proc = spawnRuntimeProcess(
+      PYTHON_EXECUTABLE, ["-E", "-s", "-S", verifierPath],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+        env: sanitizedPythonChildEnvironment(),
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let stopping = false;
+    let abortListening = false;
+    let closedMarked = false;
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolveClosedPromise) => {
+      resolveClosed = resolveClosedPromise;
+    });
+    const processGroupId = proc.pid;
+
+    const markClosed = () => {
+      if (closedMarked) return;
+      closedMarked = true;
+      if (processGroupId !== undefined) activeVerifierProcessGroups.delete(processGroupId);
+      resolveClosed();
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (abortListening) signal?.removeEventListener("abort", onAbort);
+      abortListening = false;
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const succeed = (value: VerificationEnvelope) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolvePromise(value);
+    };
+    const stopProcessGroup = (error: Error) => {
+      if (!stopping) {
+        stopping = true;
+        killRuntimeProcessTree(proc, "SIGKILL");
+      }
+      fail(error);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      // Cancellation is an explicit request to stop work, so terminate the
+      // whole group immediately rather than leaving an escalation timer alive.
+      stopProcessGroup(verifierAbortError());
+    };
+    const terminateForShutdown = () => {
+      stopProcessGroup(new Error("Verifier runtime is shutting down"));
+    };
+    const timer = setTimeout(() => {
+      stopProcessGroup(
+        new Error(`verification process timed out after ${VERIFY_TIMEOUT_MS / 1000}s`),
+      );
+    }, VERIFY_TIMEOUT_MS);
+
+    proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(-4000);
+    });
+    proc.stdin?.on("error", () => { /* close/error supplies the final verdict */ });
+    proc.on("error", (error) => {
+      // A failed spawn has no process group and no group to await. If a pid was
+      // assigned, retain the registry entry until the subsequent close event.
+      if (processGroupId === undefined) markClosed();
+      fail(new Error(`failed to spawn verifier: ${error.message}`));
+    });
+    proc.on("close", (code) => {
+      markClosed();
+      if (settled) return;
+      try {
+        const parsed = JSON.parse(stdout) as VerificationEnvelope;
+        if (code !== 0 || !parsed || typeof parsed.presentable !== "boolean") {
+          fail(new Error(`verification process failed: ${stderr || stdout}`));
+        } else succeed(parsed);
+      } catch (error) {
+        fail(new Error(`verification process returned invalid JSON: ${String(error)}`));
+      }
+    });
+    if (processGroupId !== undefined) {
+      activeVerifierProcessGroups.set(processGroupId, {
+        terminate: terminateForShutdown,
+        closed,
+      });
+    }
+    if (signal) {
+      abortListening = true;
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+    }
+    proc.stdin?.end(request);
+  });
+}
+
 export async function preverify(
   tool: string,
   args: Record<string, unknown>,
@@ -31,6 +205,7 @@ export async function preverify(
   extraBlocked: string[] = [],
   publicProvenance: Record<string, unknown> = {},
   regression: unknown = undefined,
+  signal?: AbortSignal,
 ): Promise<VerificationEnvelope> {
   const runtimeId = `analysis-${randomUUID()}`;
   const request = JSON.stringify({
@@ -38,31 +213,5 @@ export async function preverify(
     extra_blocked: extraBlocked, runtime_id: runtimeId,
     public_provenance: publicProvenance, regression,
   });
-  return new Promise((resolvePromise, reject) => {
-    // Ignore PYTHON* environment injection, user site packages, and automatic
-    // sitecustomize loading. The verifier imports only its adjacent audited
-    // modules and Python's standard library.
-    const proc = spawn(
-      PYTHON_EXECUTABLE, ["-E", "-s", "-S", VERIFIER],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => proc.kill("SIGKILL"), VERIFY_TIMEOUT_MS);
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-4000); });
-    proc.on("error", reject);
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      try {
-        const parsed = JSON.parse(stdout) as VerificationEnvelope;
-        if (code !== 0 || !parsed || typeof parsed.presentable !== "boolean") {
-          reject(new Error(`verification process failed: ${stderr || stdout}`));
-        } else resolvePromise(parsed);
-      } catch (error) {
-        reject(new Error(`verification process returned invalid JSON: ${String(error)}`));
-      }
-    });
-    proc.stdin.end(request);
-  });
+  return runVerifierRequest(request, signal);
 }

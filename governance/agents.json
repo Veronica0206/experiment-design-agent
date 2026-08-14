@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "agents": [
+    {
+      "name": "experiment-designer",
+      "role": "legacy_executor",
+      "domain": "all",
+      "tools": ["mcp__experiment-design__*"],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "design-verifier",
+      "role": "reexecutor",
+      "domain": "verification",
+      "tools": ["mcp__experiment-design__*"],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "experiment-design-coordinator",
+      "role": "coordinator",
+      "domain": "coordination",
+      "tools": ["Agent(single-endpoint-designer, master-protocol-designer, doe-designer, randomization-planner, indirect-comparison-analyst, meta-analysis-analyst)"],
+      "allowed_children": [
+        "single-endpoint-designer",
+        "master-protocol-designer",
+        "doe-designer",
+        "randomization-planner",
+        "indirect-comparison-analyst",
+        "meta-analysis-analyst"
+      ],
+      "ledger_policy": "coordinator"
+    },
+    {
+      "name": "single-endpoint-designer",
+      "role": "domain_executor",
+      "domain": "single_endpoint",
+      "tools": [
+        "mcp__experiment-design__validate_config",
+        "mcp__experiment-design__sample_size",
+        "mcp__experiment-design__simulate_design",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "master-protocol-designer",
+      "role": "domain_executor",
+      "domain": "master_protocol",
+      "tools": [
+        "mcp__experiment-design__master_simulate",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "doe-designer",
+      "role": "domain_executor",
+      "domain": "doe",
+      "tools": [
+        "mcp__experiment-design__ab_test",
+        "mcp__experiment-design__factorial_design",
+        "mcp__experiment-design__rsm_design",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "randomization-planner",
+      "role": "domain_executor",
+      "domain": "randomization",
+      "tools": [
+        "mcp__experiment-design__randomize",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "indirect-comparison-analyst",
+      "role": "domain_executor",
+      "domain": "indirect_comparison",
+      "tools": [
+        "mcp__experiment-design__indirect_compare",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    },
+    {
+      "name": "meta-analysis-analyst",
+      "role": "domain_executor",
+      "domain": "meta_analysis",
+      "tools": [
+        "mcp__experiment-design__meta_analyze",
+        "mcp__experiment-design__run_tests"
+      ],
+      "allowed_children": [],
+      "ledger_policy": "mcp"
+    }
+  ]
+}

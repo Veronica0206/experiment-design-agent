@@ -15,8 +15,9 @@ from final_report import (canonical_public_report, canonical_report,
                           is_elicitation_message, privacy_safe_view,
                           public_arguments_view)  # noqa: E402
 from verification import (PublicVerificationIdentity, VerificationIdentity, VerificationLedger,
-                          VerificationStatus, envelope_from_verdict,
+                          VerificationStatus, canonical_value, envelope_from_verdict,
                           content_hash, identity_matches_call,
+                          public_arguments_hash,
                           public_envelope_matches_call)  # noqa: E402
 
 
@@ -38,6 +39,23 @@ def check(name, condition):
     else:
         print(f"TEST {name} : FAIL")
         failed += 1
+
+
+def node_json_roundtrip(value):
+    """Return a value after the JavaScript transport's parse/stringify pass."""
+    completed = subprocess.run(
+        [
+            "node", "-e",
+            "const fs=require('fs');"
+            "const value=JSON.parse(fs.readFileSync(0,'utf8'));"
+            "process.stdout.write(JSON.stringify(value));",
+        ],
+        input=json.dumps(value, separators=(",", ":"), allow_nan=False),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
 
 
 ledger = VerificationLedger()
@@ -72,6 +90,30 @@ check("nonfinite_output_can_be_identity_hashed",
 check("integral_float_and_integer_share_canonical_identity",
       content_hash({"sd": 2.0, "allocation": [-0.0, 3.0]}) ==
       content_hash({"sd": 2, "allocation": [0, 3]}))
+wire_float_payload = {
+    "small": 2.0,
+    "negative_zero": -0.0,
+    "unsafe_integer_float": 1.0000000000000001e18,
+    "fixed_notation_upper_edge": 9.999999999999999e20,
+    "exponential_notation_edge": 1e21,
+}
+wire_float_roundtrip = node_json_roundtrip(wire_float_payload)
+check("integral_floats_match_node_wire_canonical_identity",
+      content_hash(wire_float_payload) == content_hash(wire_float_roundtrip)
+      and canonical_value(wire_float_payload) == {
+          "small": 2,
+          "negative_zero": 0,
+          "unsafe_integer_float": 1000000000000000100,
+          "fixed_notation_upper_edge": 999999999999999900000,
+          "exponential_notation_edge": 1e21,
+      })
+adjacent_huge_integers = [1000000000000000128, 1000000000000000129]
+adjacent_huge_roundtrip = node_json_roundtrip(adjacent_huge_integers)
+check("adjacent_huge_python_integers_remain_distinct_in_python_identity",
+      canonical_value(adjacent_huge_integers) == adjacent_huge_integers
+      and content_hash(adjacent_huge_integers[0])
+      != content_hash(adjacent_huge_integers[1])
+      and adjacent_huge_roundtrip[0] == adjacent_huge_roundtrip[1])
 bound = identity("bound", "analysis-bound", 9)
 check("identity_match_recomputes_hashes",
       identity_matches_call(bound, "sample_size", {"value": 9}, {"n": 9}))
@@ -132,8 +174,46 @@ check("canonical_report_uses_public_not_raw_commitment",
       report_env.identity.analysis_id in report
       and report_env.identity.result_hash not in report
       and "public_result_hash" in report)
+check("partial_report_title_matches_partial_status",
+      report.startswith("# Partially verified experiment-design result"))
 check("canonical_report_redacts_paths",
       "/private/source.csv" not in report and "/private/results" not in report)
+
+full_args = {"endpoint_type": "binary", "study_type": "poc",
+             "design": "single_arm", "null_param": 0.2, "alt_param": 0.4}
+full_result = {"results": [{"n_total": 30}]}
+full_identity = VerificationIdentity.from_call(
+    "sample_size", full_args, full_result, "call-analysis-full")
+full_env = envelope_from_verdict(full_identity, GateVerdict(passed=True))
+full_report = canonical_report(
+    "sample_size", full_args, full_result, full_env.to_dict())
+check("verified_report_title_requires_no_blocked_checks",
+      full_report.startswith("# Verified experiment-design result"))
+
+single_assumptions = public_arguments_view("simulate_design", {"config": {
+    "endpoint_type": "binary", "study_type": "poc", "design": "single_arm",
+    "null_param": 0.2, "alt_param": 0.4,
+    "prior": {"a": 2, "b": 3},
+}})
+check("canonical_assumptions_retain_result_affecting_prior",
+      single_assumptions.get("config", {}).get("prior") == {"a": 2, "b": 3})
+
+master_assumptions = public_arguments_view("master_simulate", {"config": {
+    "master_design_type": "basket", "endpoint_type": "binary",
+    "n_subgroups": 2, "null_params": [0.2, 0.2], "alt_params": [0.4, 0.4],
+    "borrowing_method": "full_bhm", "phase": "phase2", "n_interims": 2,
+    "tau_prior": {"type": "half_normal", "params": {"scale": 1}},
+    "homogeneity_prior": 0.5, "response_prior": 0.5,
+    "fwer_control": "bonferroni",
+}})
+master_config = master_assumptions.get("config", {})
+check("canonical_assumptions_retain_master_method_and_priors",
+      master_config.get("borrowing_method") == "full_bhm"
+      and master_config.get("phase") == "phase2"
+      and master_config.get("n_interims") == 2
+      and master_config.get("tau_prior") == {
+          "type": "half_normal", "params": {"scale": 1}}
+      and master_config.get("fwer_control") == "bonferroni")
 try:
     canonical_report("sample_size", report_args, {"n": 31}, report_env.to_dict())
     mismatch_rejected = False
@@ -282,6 +362,10 @@ public_envelope["report"] = random_report
 public_envelope["public_result_hash"] = content_hash(public_result)
 public_envelope["report_hash"] = content_hash(random_report)
 public_envelope["identity"].pop("result_hash", None)
+public_envelope["identity"]["public_args_hash"] = public_arguments_hash(
+    "randomize", random_args,
+)
+public_envelope["identity"].pop("args_hash", None)
 check("public_envelope_binds_safe_result_and_report",
       public_envelope_matches_call(
           public_envelope, "randomize", random_args, public_result, {}))
@@ -314,6 +398,8 @@ except ValueError:
 check("presentable_flag_cannot_promote_failed_envelope", promoted_failure_rejected)
 check("only_structured_clarification_is_accepted",
       is_elicitation_message('CLARIFICATION_REQUEST {"fields":["endpoint_type"]}')
+      and is_elicitation_message(
+          'CLARIFICATION_REQUEST {"fields":["alpha_sidedness"]}')
       and not is_elicitation_message("What does n_total=30 mean?")
       and not is_elicitation_message("What is the endpoint?"))
 failed_summary = failed_env.public_summary()
@@ -404,6 +490,27 @@ check("public_envelope_rejects_raw_result_commitment",
       not public_envelope_matches_call(
           raw_public_oracle, "randomize", random_args, public_result, {}))
 
+private_path_a = {
+    "method": "maic", "ipd_file": "/private/patient-a.csv",
+    "targets_file": "/private/target-a.csv",
+}
+private_path_b = {
+    "method": "maic", "ipd_file": "/private/patient-b.csv",
+    "targets_file": "/private/target-b.csv",
+}
+check("public_argument_commitment_is_not_a_private_path_oracle",
+      public_arguments_hash("indirect_compare", private_path_a)
+      == public_arguments_hash("indirect_compare", private_path_b))
+private_strata_a = {
+    "n": 2, "method": "stratified", "strata": ["patient-a", "patient-b"],
+}
+private_strata_b = {
+    "n": 2, "method": "stratified", "strata": ["patient-c", "patient-d"],
+}
+check("public_argument_commitment_is_not_a_strata_oracle",
+      public_arguments_hash("randomize", private_strata_a)
+      == public_arguments_hash("randomize", private_strata_b))
+
 case_projection = privacy_safe_view("sample_size", {
     "RESULTS": [{"N_TOTAL": 30}],
 })
@@ -441,6 +548,143 @@ mixed_design = privacy_safe_view("factorial_design", {
 check("design_projection_skips_drop_sentinel_values",
       mixed_design == {"design": [{"factor_1": 1}, {}]}
       and "object at" not in str(mixed_design))
+factorial_views = []
+for factor_count in range(1, 13):
+    # Reverse insertion order demonstrates that arbitrary private names retain
+    # a deterministic lexical projection before canonical aliases are ordered
+    # numerically on every subsequent projection.
+    raw_design = [{
+        f"Private Factor {index:02d}": index
+        for index in range(factor_count, 0, -1)
+    }]
+    public_design = privacy_safe_view("factorial_design", {"design": raw_design})
+    factorial_views.append(public_design)
+check("factorial_public_dto_is_idempotent_for_one_to_twelve_factors",
+      all(privacy_safe_view("factorial_design", view) == view
+          for view in factorial_views)
+      and factorial_views[9]["design"][0]["factor_10"] == 10
+      and factorial_views[11]["design"][0]["factor_12"] == 12)
+
+ten_factor_args = {"n_factors": 10, "fraction": 5}
+ten_factor_raw = {
+    "n_factors": 10,
+    "fraction": 5,
+    "n_runs": 1,
+    "design": [{f"Private Factor {index:02d}": index for index in range(1, 11)}],
+}
+ten_factor_env = report_envelope(
+    "factorial_design", ten_factor_args, ten_factor_raw, "analysis-ten-factor",
+)
+ten_factor_report = canonical_report(
+    "factorial_design", ten_factor_args, ten_factor_raw, ten_factor_env.to_dict(),
+)
+ten_factor_public = privacy_safe_view("factorial_design", ten_factor_raw)
+ten_factor_server_envelope = ten_factor_env.to_dict()
+ten_factor_server_envelope["report"] = ten_factor_report
+ten_factor_server_envelope["public_result_hash"] = content_hash(ten_factor_public)
+ten_factor_server_envelope["report_hash"] = content_hash(ten_factor_report)
+ten_factor_server_envelope["identity"].pop("result_hash", None)
+ten_factor_server_envelope["identity"].pop("args_hash", None)
+ten_factor_server_envelope["identity"]["public_args_hash"] = public_arguments_hash(
+    "factorial_design", ten_factor_args,
+)
+ten_factor_rebuilt_report = canonical_public_report(
+    "factorial_design", ten_factor_args, ten_factor_public,
+    ten_factor_server_envelope, ten_factor_server_envelope, {},
+)
+check("ten_factor_stop_rebuild_preserves_server_report_and_hash",
+      ten_factor_rebuilt_report == ten_factor_report
+      and ten_factor_server_envelope["public_result_hash"]
+      == content_hash(privacy_safe_view("factorial_design", ten_factor_public))
+      and public_envelope_matches_call(
+          ten_factor_server_envelope, "factorial_design", ten_factor_args,
+          ten_factor_public, {},
+      ))
+
+# The MCP boundary serializes 1.0 as 1, so the verifier hashes and renders an
+# integral float exactly as the host does when it reads the same argument
+# straight from JSON. Otherwise the Stop hook rejects a correct report.
+whole_number_float_args = {
+    "n_factors": 2, "levels": 2.0, "center_points": 0.0,
+}
+whole_number_int_args = {
+    "n_factors": 2, "levels": 2, "center_points": 0,
+}
+whole_number_result = {
+    "type": "full_factorial", "n_factors": 2, "levels": [2, 2], "n_runs": 4,
+    "replicates": 1,
+    "design": [{"A": a, "B": b} for a in (-1, 1) for b in (-1, 1)],
+}
+whole_number_reports = []
+for whole_number_args in (whole_number_float_args, whole_number_int_args):
+    whole_number_identity = VerificationIdentity.from_call(
+        "factorial_design", {**whole_number_args, "verification_id": "analysis-whole"},
+        whole_number_result, "call-whole",
+    )
+    whole_number_envelope = {
+        "identity": {
+            "analysis_id": whole_number_identity.analysis_id,
+            "call_id": whole_number_identity.call_id,
+            "tool": whole_number_identity.tool,
+            "args_hash": whole_number_identity.args_hash,
+            "result_hash": whole_number_identity.result_hash,
+            "provenance_hash": whole_number_identity.provenance_hash,
+        },
+        "status": "VERIFIED", "presentable": True, "checks": {}, "failures": [],
+        "blocked": [], "notes": [],
+    }
+    whole_number_reports.append(canonical_report(
+        "factorial_design", whole_number_args, whole_number_result,
+        whole_number_envelope, {},
+    ))
+check("integral_float_and_int_arguments_render_one_canonical_report",
+      whole_number_reports[0] == whole_number_reports[1]
+      and '"levels": 2,' in whole_number_reports[0]
+      and "2.0" not in whole_number_reports[0])
+
+# Integral floats below 1e21 use JavaScript's fixed-notation wire value, even
+# above 2**53; at 1e21 JSON.stringify switches to exponential notation. Native
+# Python integers never take this path and retain arbitrary precision.
+check("integral_floats_follow_javascript_fixed_notation_boundary",
+      canonical_value(2.0) == 2
+      and isinstance(canonical_value(2.0), int)
+      and canonical_value(float(2 ** 53)) == 2 ** 53
+      and isinstance(canonical_value(float(2 ** 53)), int)
+      and canonical_value(float(2 ** 53 + 2)) == 2 ** 53 + 2
+      and isinstance(canonical_value(float(2 ** 53 + 2)), int)
+      and canonical_value(1.0000000000000001e18) == 1000000000000000100
+      and isinstance(canonical_value(1.0000000000000001e18), int)
+      and isinstance(canonical_value(1e21), float))
+
+unsafe_float_args = {
+    "endpoint_type": "continuous", "study_type": "poc",
+    "design": "single_arm", "null_param": 0.0,
+    "alt_param": 1.0000000000000001e18,
+    "sd": 1.0000000000000001e18,
+}
+unsafe_float_wire_args = node_json_roundtrip(unsafe_float_args)
+unsafe_float_result = {
+    "results": [{
+        "design": "single_arm", "n_total": 2,
+        "power_target": 0.8, "power_achieved": 0.9,
+    }],
+}
+unsafe_float_reports = []
+for report_args_value in (unsafe_float_args, unsafe_float_wire_args):
+    report_env_value = report_envelope(
+        "sample_size", report_args_value, unsafe_float_result,
+        "analysis-unsafe-float",
+    )
+    unsafe_float_reports.append(canonical_report(
+        "sample_size", report_args_value, unsafe_float_result,
+        report_env_value.to_dict(), {},
+    ))
+check("unsafe_integral_float_node_roundtrip_preserves_report_and_argument_hash",
+      public_arguments_hash("sample_size", unsafe_float_args)
+      == public_arguments_hash("sample_size", unsafe_float_wire_args)
+      and unsafe_float_reports[0] == unsafe_float_reports[1]
+      and "1000000000000000100" in unsafe_float_reports[0]
+      and "1000000000000000128" not in unsafe_float_reports[0])
 
 simulation_completeness = privacy_safe_view("simulate_design", {
     "B_used": 250,

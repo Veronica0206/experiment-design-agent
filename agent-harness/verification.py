@@ -13,6 +13,7 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -154,11 +155,16 @@ def _canonicalize(value: Any) -> Any:
             return {"__nonfinite_float__": repr(value)}
         # JSON has one number type. JavaScript parses 2 and 2.0 to the same
         # Number and serializes both as 2, while Python otherwise preserves the
-        # lexical distinction. Normalize integral floats in the range where
-        # JSON.stringify uses ordinary integer notation so host and MCP hashes
-        # bind the same semantic arguments.
+        # lexical distinction. In JavaScript's fixed-notation range, use the
+        # integer represented by Python's shortest round-tripping decimal
+        # spelling. Do not use int(value): above 2**53 that exposes the exact
+        # binary integer (for example 1000000000000000128), while
+        # JSON.stringify emits the shortest decimal identifying the Number
+        # (1000000000000000100). Native Python ints are deliberately untouched,
+        # so adjacent arbitrary-size integers remain distinct here; the governed
+        # MCP boundary separately rejects unsafe integral inputs before execution.
         if value.is_integer() and abs(value) < 1e21:
-            return int(value)
+            return int(Decimal(repr(value)))
     if isinstance(value, dict):
         return {str(key): _canonicalize(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -171,6 +177,17 @@ def _canonicalize(value: Any) -> Any:
 def _json_default(value: Any) -> dict[str, str]:
     return {"__python_object__": f"{type(value).__module__}.{type(value).__qualname__}",
             "value": str(value)}
+
+
+def canonical_value(value: Any) -> Any:
+    """Return the canonical form used for hashing, for renderers to reuse.
+
+    A whole-number argument crosses the MCP boundary through JavaScript, which
+    serializes 1.0 as 1, while the same argument read directly in Python stays a
+    float. Identity hashes already normalize that, so any renderer that must
+    agree byte-for-byte across both paths has to normalize it too.
+    """
+    return _canonicalize(value)
 
 
 def canonical_json(value: Any) -> str:
@@ -194,6 +211,27 @@ def domain_arguments(arguments: dict[str, Any] | None) -> dict[str, Any]:
     cleaned = dict(arguments or {})
     cleaned.pop("verification_id", None)
     return cleaned
+
+
+def public_arguments_hash(
+    tool: str,
+    arguments: dict[str, Any] | None,
+) -> str:
+    """Commit only to the allowlisted arguments already safe to disclose.
+
+    The verifier still binds the raw statistical arguments internally through
+    :class:`VerificationIdentity`.  The model-visible identity deliberately
+    commits only to ``public_arguments_view``.  Hashing private file paths,
+    free-form labels, study rows, or randomization strata would otherwise give
+    the model (or a transcript reader) an offline equality oracle for values
+    that the public DTO intentionally removed.
+
+    The import is local to avoid a module cycle: ``final_report`` imports this
+    module for the identity primitives used by its canonical renderer.
+    """
+    from final_report import public_arguments_view  # type: ignore
+
+    return content_hash(public_arguments_view(tool, domain_arguments(arguments)))
 
 
 def identity_matches_call(
@@ -263,8 +301,9 @@ def public_envelope_matches_call(
         isinstance(identity, dict)
         and identity.get("analysis_id")
         and "result_hash" not in identity
+        and "args_hash" not in identity
         and identity.get("tool") == tool
-        and identity.get("args_hash") == content_hash(domain_arguments(arguments))
+        and identity.get("public_args_hash") == public_arguments_hash(tool, arguments)
         and bool(identity.get("provenance_hash"))
         and identity.get("provenance_hash") == content_hash(provenance or {})
         and envelope.get("public_result_hash") == content_hash(public_result)
@@ -276,22 +315,28 @@ def public_envelope_matches_call(
 class PublicVerificationIdentity:
     """Identity fields safe to expose with an allowlisted public result.
 
-    The raw result commitment remains verifier-internal.  Publishing it would
-    provide an offline equality oracle for values deliberately removed from the
-    public DTO.
+    Raw argument and result commitments remain verifier-internal. Publishing
+    either would provide an offline equality oracle for values deliberately
+    removed from the public DTO. ``public_args_hash`` binds only the allowlisted
+    argument projection that is already included in the canonical report.
     """
 
     analysis_id: str
     call_id: str
     tool: str
-    args_hash: str
+    public_args_hash: str
     provenance_hash: str
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PublicVerificationIdentity":
-        if not isinstance(value, dict) or "result_hash" in value:
+        if (not isinstance(value, dict)
+                or "result_hash" in value
+                or "args_hash" in value):
             raise ValueError("public verification identity is malformed")
-        fields = ("analysis_id", "call_id", "tool", "args_hash", "provenance_hash")
+        fields = (
+            "analysis_id", "call_id", "tool", "public_args_hash",
+            "provenance_hash",
+        )
         data = {field: value.get(field) for field in fields}
         if not all(isinstance(item, str) and item for item in data.values()):
             raise ValueError("public verification identity is incomplete")

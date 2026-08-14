@@ -4,6 +4,17 @@ type JsonRecord = Record<string, unknown>;
 const ENDPOINT_TYPES = new Set(["binary", "continuous", "tte", "incidence_rate"]);
 const STUDY_TYPES = new Set(["signal_detection", "poc", "confirmatory"]);
 const DESIGNS = new Set(["single_arm", "controlled"]);
+const ESTIMANDS = new Set([
+  "response_probability", "risk_difference", "mean", "mean_difference",
+  "hazard_rate", "hazard_ratio", "incidence_rate", "rate_difference",
+]);
+const DIRECTIONS = new Set(["greater", "less"]);
+const SIDEDNESS = new Set(["one_sided"]);
+const TTE_METHODS = new Set(["exponential"]);
+const RATE_METHODS = new Set(["poisson"]);
+const PRIOR_FIELDS = new Set([
+  "a", "b", "mu0", "kappa0", "alpha0", "beta0", "shape", "rate",
+]);
 
 const REGRESSION_SUITES = [
   "vera-experiment-designing",
@@ -14,11 +25,11 @@ const REGRESSION_SUITES = [
 ] as const;
 
 const EXPECTED_REGRESSION_PASS_COUNTS: Record<(typeof REGRESSION_SUITES)[number], number> = {
-  "vera-experiment-designing": 26,
-  "vera-master-experiment-designing": 47,
+  "vera-experiment-designing": 31,
+  "vera-master-experiment-designing": 53,
   "vera-indirect-comparing": 15,
-  "vera-meta-analyzing": 12,
-  "vera-doe-designing": 13,
+  "vera-meta-analyzing": 14,
+  "vera-doe-designing": 14,
 };
 
 export const REGRESSION_STATUS_CHECKS = [
@@ -61,12 +72,89 @@ function fixedEnum(value: unknown, allowed: Set<string>, field: string): string 
 }
 
 
+function nullableFiniteNumber(value: unknown, field: string): number | null {
+  if (value === null) return null;
+  return finiteNumber(value, field);
+}
+
+
+function nullableEnum(
+  value: unknown, allowed: Set<string>, field: string,
+): string | null {
+  if (value === null) return null;
+  return fixedEnum(value, allowed, field);
+}
+
+
+function fixedBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`validate_config returned an invalid ${field}`);
+  }
+  return value;
+}
+
+
+function finitePrior(value: unknown): JsonRecord {
+  const source = record(value);
+  if (!source || Object.keys(source).length < 2 || Object.keys(source).length > 4 ||
+      Object.keys(source).some((key) => !PRIOR_FIELDS.has(key))) {
+    throw new Error("validate_config returned invalid prior_params");
+  }
+  const projected: JsonRecord = {};
+  for (const key of Object.keys(source).sort()) {
+    projected[key] = finiteNumber(source[key], `prior_params.${key}`);
+  }
+  return projected;
+}
+
+
 /** Project the validator result to its exact, value-typed public DTO. */
 export function publicValidatedConfig(value: unknown): JsonRecord {
   const source = record(value);
   if (!source || source.valid !== true) {
     throw new Error("validate_config did not return a valid configuration");
   }
+  const resolvedSource = record(source.resolved_config);
+  const simulationSource = record(source.simulation_defaults);
+  if (!resolvedSource || !simulationSource) {
+    throw new Error("validate_config omitted resolved defaults");
+  }
+  const resolvedConfig = {
+    endpoint_type: fixedEnum(resolvedSource.endpoint_type, ENDPOINT_TYPES, "resolved_config.endpoint_type"),
+    study_type: fixedEnum(resolvedSource.study_type, STUDY_TYPES, "resolved_config.study_type"),
+    design: fixedEnum(resolvedSource.design, DESIGNS, "resolved_config.design"),
+    estimand: fixedEnum(resolvedSource.estimand, ESTIMANDS, "resolved_config.estimand"),
+    direction: fixedEnum(resolvedSource.direction, DIRECTIONS, "resolved_config.direction"),
+    sidedness: fixedEnum(resolvedSource.sidedness, SIDEDNESS, "resolved_config.sidedness"),
+    null_param: finiteNumber(resolvedSource.null_param, "resolved_config.null_param"),
+    alt_param: finiteNumber(resolvedSource.alt_param, "resolved_config.alt_param"),
+    sd: nullableFiniteNumber(resolvedSource.sd, "resolved_config.sd"),
+    alloc_ratio: finiteNumber(resolvedSource.alloc_ratio, "resolved_config.alloc_ratio"),
+    alphas: finiteNumberArray(resolvedSource.alphas, "resolved_config.alphas"),
+    powers: finiteNumberArray(resolvedSource.powers, "resolved_config.powers"),
+    prior_params: finitePrior(resolvedSource.prior_params),
+    go_threshold: finiteNumber(resolvedSource.go_threshold, "resolved_config.go_threshold"),
+    consider_threshold: finiteNumber(resolvedSource.consider_threshold, "resolved_config.consider_threshold"),
+    go_target: finiteNumber(resolvedSource.go_target, "resolved_config.go_target"),
+    p3_n: nullableFiniteNumber(resolvedSource.p3_n, "resolved_config.p3_n"),
+    p3_alloc_ratio: finiteNumber(resolvedSource.p3_alloc_ratio, "resolved_config.p3_alloc_ratio"),
+    p3_alpha: finiteNumber(resolvedSource.p3_alpha, "resolved_config.p3_alpha"),
+    accrual_time: nullableFiniteNumber(resolvedSource.accrual_time, "resolved_config.accrual_time"),
+    followup_time: nullableFiniteNumber(resolvedSource.followup_time, "resolved_config.followup_time"),
+    tte_method: nullableEnum(resolvedSource.tte_method, TTE_METHODS, "resolved_config.tte_method"),
+    exposure_time: nullableFiniteNumber(resolvedSource.exposure_time, "resolved_config.exposure_time"),
+    rate_method: nullableEnum(resolvedSource.rate_method, RATE_METHODS, "resolved_config.rate_method"),
+    has_p2_data: fixedBoolean(resolvedSource.has_p2_data, "resolved_config.has_p2_data"),
+    has_p2_control_data: fixedBoolean(
+      resolvedSource.has_p2_control_data, "resolved_config.has_p2_control_data",
+    ),
+  };
+  const seed = finiteNumber(simulationSource.seed, "simulation_defaults.seed");
+  const bOc = finiteNumber(simulationSource.B_oc, "simulation_defaults.B_oc");
+  if (!Number.isInteger(seed) || seed < 0 || !Number.isInteger(bOc) || bOc < 1) {
+    throw new Error("validate_config returned invalid simulation defaults");
+  }
+  const simulationDefaults = { seed, b_oc: bOc };
   const projected = {
     valid: true,
     endpoint_type: fixedEnum(source.endpoint_type, ENDPOINT_TYPES, "endpoint_type"),
@@ -75,6 +163,8 @@ export function publicValidatedConfig(value: unknown): JsonRecord {
     go_target: finiteNumber(source.go_target, "go_target"),
     alphas: finiteNumberArray(source.alphas, "alphas"),
     powers: finiteNumberArray(source.powers, "powers"),
+    resolved_config: resolvedConfig,
+    simulation_defaults: simulationDefaults,
   };
   const reportValue = {
     alphas: projected.alphas,
@@ -82,6 +172,8 @@ export function publicValidatedConfig(value: unknown): JsonRecord {
     endpoint_type: projected.endpoint_type,
     go_target: projected.go_target,
     powers: projected.powers,
+    resolved_config: projected.resolved_config,
+    simulation_defaults: projected.simulation_defaults,
     study_type: projected.study_type,
     valid: projected.valid,
   };

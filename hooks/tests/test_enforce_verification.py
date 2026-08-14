@@ -23,13 +23,16 @@ import contextlib
 import io
 import json
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "agent-harness"))
 import verification_policy  # noqa: E402
-from verification import canonical_json, content_hash, domain_arguments  # noqa: E402
+from verification import (canonical_json, content_hash, domain_arguments,
+                          public_arguments_hash)  # noqa: E402
 from gates import MANUAL_CHECKS, combined_gate, design_checks_for  # noqa: E402
 from final_report import canonical_report, join_reports, privacy_safe_view  # noqa: E402
 
@@ -103,6 +106,8 @@ def tool_result_line(tid, result):
             envelope["public_result_hash"] = content_hash(public_result)
             envelope["report_hash"] = content_hash(envelope["report"])
         envelope["identity"].pop("result_hash", None)
+        envelope["identity"].pop("args_hash", None)
+        envelope["identity"]["public_args_hash"] = public_arguments_hash(short, inp)
         result = dict(public_result) if isinstance(public_result, dict) else {"result": public_result}
         result["_verification"] = envelope
         result["_provenance"] = provenance
@@ -112,7 +117,12 @@ def tool_result_line(tid, result):
 
 
 def run_hook(lines, stdin_extra=None):
-    stdin = {"agent_type": "experiment-designer"}
+    stdin = {
+        "agent_type": "experiment-designer",
+        "session_id": "in-memory-session",
+        "prompt_id": "in-memory-prompt",
+        "hook_event_name": "Stop",
+    }
     reports_by_call = {}
     call_keys = {}
     call_groups = {}
@@ -231,6 +241,11 @@ lines = [
 ]
 rc, err = run_hook(lines)
 check("D_installed_policy_still_blocks", rc, 2, err)
+rc, err = run_hook(lines, stdin_extra={
+    "stop_hook_active": True,
+    "last_assistant_message": "Verification failed; results withheld as not trustworthy.",
+})
+check("D2_single_failure_cannot_skip_retry_budget", rc, 2, err)
 
 # E — ambient transcript paths are ignored; only the injected ledger is read.
 rc, err = run_hook(lines, stdin_extra={
@@ -300,6 +315,19 @@ validated = {
     "valid": True, "endpoint_type": "binary", "study_type": "poc",
     "design": "single_arm", "go_target": 0.8,
     "alphas": [0.1], "powers": [0.8],
+    "resolved_config": {
+        "endpoint_type": "binary", "study_type": "poc", "design": "single_arm",
+        "estimand": "response_probability", "direction": "greater",
+        "sidedness": "one_sided", "null_param": 0.2, "alt_param": 0.4,
+        "sd": None, "alloc_ratio": 1, "alphas": [0.1], "powers": [0.8],
+        "prior_params": {"a": 0.5, "b": 0.5}, "go_threshold": 0.9,
+        "consider_threshold": 0.6, "go_target": 0.8, "p3_n": None,
+        "p3_alloc_ratio": 1, "p3_alpha": 0.025, "accrual_time": None,
+        "followup_time": None, "tte_method": None, "exposure_time": None,
+        "rate_method": None, "has_p2_data": False,
+        "has_p2_control_data": False,
+    },
+    "simulation_defaults": {"seed": 42, "b_oc": 5000},
 }
 validated["configuration_report"] = "CONFIGURATION_VALIDATED " + canonical_json(validated)
 lines = [
@@ -557,6 +585,152 @@ lines = [
 ]
 rc, err = run_hook(lines)
 check("V2_malformed_result_unrelated_success_blocks", rc, 2, err)
+
+# W — hook observability is structured and does not persist a deterministic
+#     digest of potentially sensitive gate diagnostics.
+with tempfile.TemporaryDirectory() as directory:
+    previous_log = os.environ.get("EXPDESIGN_HOOK_LOG")
+    trace_path = os.path.join(directory, "hook.jsonl")
+    os.environ["EXPDESIGN_HOOK_LOG"] = trace_path
+    try:
+        rc, err = run_hook([], {
+            "session_id": "session-test",
+            "prompt_id": "prompt-test",
+            "hook_event_name": "Stop",
+            "last_assistant_message": (
+                'CLARIFICATION_REQUEST {"fields":["endpoint_type"]}'
+            ),
+        })
+        with open(trace_path, encoding="utf-8") as handle:
+            trace_rows = [json.loads(line) for line in handle.read().splitlines()]
+        expected_trace_fields = {
+            "schema_version", "timestamp", "sequence", "outcome", "session_id",
+            "prompt_id", "principal", "hook_event",
+        }
+        structured = (
+            bool(trace_rows)
+            and expected_trace_fields <= set(trace_rows[-1])
+            and "reason_sha256" not in trace_rows[-1]
+        )
+        check("W_structured_private_hook_trace", int(not (rc == 0 and structured)), 0, err)
+
+        target_path = os.path.join(directory, "unrelated.txt")
+        symlink_path = os.path.join(directory, "trace-link.jsonl")
+        with open(target_path, "w", encoding="utf-8") as handle:
+            handle.write("unchanged")
+        os.chmod(target_path, 0o644)
+        os.symlink(target_path, symlink_path)
+        os.environ["EXPDESIGN_HOOK_LOG"] = symlink_path
+        os.environ["EXPDESIGN_HOOK_LOG_REQUIRED"] = "1"
+        symlink_rc, _symlink_err = run_hook([], {
+            "session_id": "session-symlink",
+            "prompt_id": "prompt-symlink",
+            "hook_event_name": "Stop",
+            "last_assistant_message": (
+                'CLARIFICATION_REQUEST {"fields":["endpoint_type"]}'
+            ),
+        })
+        with open(target_path, encoding="utf-8") as handle:
+            target_unchanged = handle.read() == "unchanged"
+        target_mode_unchanged = stat.S_IMODE(os.stat(target_path).st_mode) == 0o644
+        check(
+            "W2_hook_trace_symlink_is_rejected_without_touching_target",
+            int(not (symlink_rc == 2 and target_unchanged and target_mode_unchanged)),
+            0,
+            _symlink_err,
+        )
+
+        hard_target_path = os.path.join(directory, "hard-target.txt")
+        hardlink_path = os.path.join(directory, "trace-hardlink.jsonl")
+        with open(hard_target_path, "w", encoding="utf-8") as handle:
+            handle.write("hardlink-unchanged")
+        os.chmod(hard_target_path, 0o644)
+        os.link(hard_target_path, hardlink_path)
+        os.environ["EXPDESIGN_HOOK_LOG"] = hardlink_path
+        hardlink_rc, hardlink_err = run_hook([], {
+            "session_id": "session-hardlink",
+            "prompt_id": "prompt-hardlink",
+            "hook_event_name": "Stop",
+            "last_assistant_message": (
+                'CLARIFICATION_REQUEST {"fields":["endpoint_type"]}'
+            ),
+        })
+        with open(hard_target_path, encoding="utf-8") as handle:
+            hard_target_unchanged = handle.read() == "hardlink-unchanged"
+        hard_target_mode_unchanged = (
+            stat.S_IMODE(os.stat(hard_target_path).st_mode) == 0o644
+        )
+        check(
+            "W3_hook_trace_hardlink_is_rejected_without_touching_target",
+            int(not (
+                hardlink_rc == 2
+                and hard_target_unchanged
+                and hard_target_mode_unchanged
+            )),
+            0,
+            hardlink_err,
+        )
+    finally:
+        os.environ.pop("EXPDESIGN_HOOK_LOG_REQUIRED", None)
+        if previous_log is None:
+            os.environ.pop("EXPDESIGN_HOOK_LOG", None)
+        else:
+            os.environ["EXPDESIGN_HOOK_LOG"] = previous_log
+
+# X — the Python policy applies the same strict principal semantics as the
+# launcher and ledger.  Only SubagentStop accepts a concrete subagent id;
+# Stop accepts absent/null as the main principal and rejects every present id.
+elicitation = [{"message": {"role": "assistant", "content": [{
+    "type": "text",
+    "text": 'CLARIFICATION_REQUEST {"fields":["endpoint_type"]}',
+}]}}]
+rc, err = run_hook(elicitation, {
+    "hook_event_name": "SubagentStop",
+    "agent_id": "domain-worker-1",
+})
+check("X_valid_subagent_stop_identity_allows", rc, 0, err)
+
+for label, invalid_id in (
+    ("missing", "__missing__"),
+    ("null", None),
+    ("empty", ""),
+    ("zero", 0),
+    ("false", False),
+    ("list", []),
+    ("object", {}),
+    ("nul", "domain-worker\0other"),
+):
+    identity = {"hook_event_name": "SubagentStop"}
+    if invalid_id != "__missing__":
+        identity["agent_id"] = invalid_id
+    rc, err = run_hook(elicitation, identity)
+    check(f"X_subagent_stop_rejects_{label}_agent_id", rc, 2, err)
+
+rc, err = run_hook(elicitation, {
+    "hook_event_name": "Stop",
+    "agent_id": "domain-worker-1",
+})
+check("X_stop_rejects_subagent_identity", rc, 2, err)
+
+rc, err = run_hook(elicitation, {
+    "hook_event_name": "Stop",
+    "agent_id": None,
+})
+check("X_stop_explicit_null_is_main", rc, 0, err)
+
+for label, invalid_type in (
+    ("empty", ""),
+    ("zero", 0),
+    ("false", False),
+    ("list", []),
+    ("object", {}),
+    ("nul", "experiment-designer\0other"),
+):
+    rc, err = run_hook(elicitation, {"agent_type": invalid_type})
+    check(f"X_rejects_{label}_agent_type", rc, 2, err)
+
+rc, err = run_hook(elicitation, {"hook_event_name": "PreToolUse"})
+check("X_policy_rejects_nonterminal_event", rc, 2, err)
 
 print(f"\n--- Results: {passed} passed, {failed} failed ---")
 sys.exit(1 if failed else 0)

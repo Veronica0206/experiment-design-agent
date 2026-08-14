@@ -1,2 +1,5 @@
-anthropic>=0.52.0
-streamlit>=1.45.0
+# Direct dependencies pinned to the versions exercised by the release matrix.
+# `requirements.lock` contains the fully resolved, hash-locked environment.
+anthropic==0.116.0
+pyyaml==6.0.3
+streamlit==1.50.0

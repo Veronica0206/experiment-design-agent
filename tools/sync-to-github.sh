@@ -103,6 +103,11 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-git commit -q -m "${MSG:-Sync from working tree}"
-git push -q origin main
+git -c core.hooksPath=/dev/null commit -q -m "${MSG:-Sync from working tree}"
+commit_sha="$(git rev-parse HEAD)"
+# Validate the immutable commit object, not merely the index that existed
+# before commit. Commit hooks are disabled above, and the exact validated
+# object ID is pushed below with push hooks disabled as well.
+python3 "$SRC/tools/check_publish_source.py" --tree-ish "$commit_sha" "$CLONE"
+git -c core.hooksPath=/dev/null push -q origin "$commit_sha:refs/heads/main"
 echo "== pushed to https://github.com/$REPO =="

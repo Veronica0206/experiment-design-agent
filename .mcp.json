@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "experiment-design": {
-      "command": "node",
+      "command": "/bin/sh",
       "args": [
-        "${CLAUDE_PROJECT_DIR:-.}/mcp-server/dist/index.js"
+        "${CLAUDE_PROJECT_DIR:-.}/mcp-server/launch-server.sh"
       ]
     }
   }

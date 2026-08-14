@@ -12,11 +12,16 @@ and an audit log for every decision.
 from __future__ import annotations
 
 import json
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generator
+
+SUITE_ROOT = Path(__file__).resolve().parent.parent
+if str(SUITE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUITE_ROOT))
 
 import anthropic
 
@@ -32,12 +37,14 @@ from gates import (
 from verification import (
     VerificationLedger,
     PublicVerificationIdentity,
+    content_hash,
     envelope_from_verdict,
     public_check_summary,
     public_envelope_matches_call,
     public_limitation_codes,
     public_note_codes,
 )
+from governance.registry import RegistryError, get_agent
 
 MODEL = "claude-sonnet-5"
 MAX_TOKENS = 8192
@@ -45,6 +52,41 @@ MAX_TOOL_ROUNDS = 20
 VERIFY_RETRIES = 1          # how many times a failed gate may ask the agent to fix
 REPRO_MAX_SIMS = 1000       # skip the same-seed reproducibility re-run above this
 SAFE_FAILURE_MESSAGE = "Verification failed; results withheld as not trustworthy."
+
+TOOL_PURPOSES = {
+    "validate_config": "validate one single-endpoint configuration",
+    "sample_size": "size one single-endpoint design",
+    "simulate_design": "simulate one single-endpoint design",
+    "master_simulate": "simulate one basket, umbrella, or platform design",
+    "indirect_compare": "run one Bucher batch or one MAIC analysis",
+    "meta_analyze": "pool compatible study effects",
+    "ab_test": "size a two-arm A/B experiment",
+    "factorial_design": "construct a factorial experiment",
+    "rsm_design": "construct a response-surface experiment",
+    "randomize": "create a seeded assignment plan",
+    "run_tests": "run the fixed regression attestation",
+}
+
+DOMAIN_GUIDANCE = {
+    "single_endpoint": (
+        "Resolve endpoint direction explicitly. TTE requires alt < null; binary and "
+        "continuous require alt > null; incidence supports either protective alt < null "
+        "or harm-detection alt > null. Validate before expensive simulation."
+    ),
+    "master_protocol": (
+        "Handle only basket, umbrella, platform, multi-arm, or multi-stage protocols."
+    ),
+    "doe": "Handle only A/B sizing, factorial screening, and response-surface construction.",
+    "randomization": (
+        "Handle only seeded assignment. Participant-level assignments remain private artifacts."
+    ),
+    "indirect_comparison": (
+        "Handle one independent Bucher batch or one MAIC analysis; do not chain a network."
+    ),
+    "meta_analysis": (
+        "Handle only fixed- or random-effects pooling on a common, validated effect scale."
+    ),
+}
 
 # Verification is OPT-OUT: every MCP analysis tool that returns a numeric/design
 # result must pass the gate. Only the pre-check (validate_config) and the gate
@@ -58,8 +100,6 @@ PUBLIC_MANUAL_CHECKS = frozenset(public_limitation_codes(MANUAL_CHECKS))
 def _is_gated(tool_name: str) -> bool:
     return tool_name not in UNGATED_TOOLS
 
-
-SUITE_ROOT = Path(__file__).resolve().parent.parent
 
 SYSTEM_PROMPT = """\
 You are an experiment design agent. You help researchers plan quantitative \
@@ -94,10 +134,9 @@ the next turn with full history.
 structured clarification action. Do not invent an efficiency ranking or numeric \
 trade-off outside a verified tool result, and never silently substitute a different \
 model for an unsupported endpoint.
-3. CONFIGURE: Build a valid config. Call validate_config to check it, then STATE \
-the resolved defaults you are about to run with (alpha/power presets, go_target, \
-prior, seed, sidedness) in one short line BEFORE the expensive simulation — a wrong \
-default caught here costs nothing; caught after the run it costs a re-run.
+3. CONFIGURE: Build a valid config and call validate_config before an expensive \
+simulation. The runtime returns a canonical `configuration_report`; do not restate \
+or reconstruct its resolved defaults in free-form prose.
 4. EXECUTE: Run the appropriate analysis tool. Never choose a verification_id;
 the runtime issues and binds it, including for corrections.
 5. VERIFY: The harness runs an automated gate (regression suite + config \
@@ -162,6 +201,11 @@ class RunResult:
     audit_file: str = ""
     stopped: str = "end_turn"
     private_resources: list[dict[str, Any]] = field(default_factory=list)
+    agent_name: str = "experiment-designer"
+    domain: str = "all"
+    verification_records: list[dict[str, Any]] = field(default_factory=list)
+    validated_configuration_reports: list[str] = field(default_factory=list)
+    canonical_report_bindings: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _build_tools(mcp_tools: list[dict]) -> list[dict]:
@@ -179,14 +223,33 @@ class ExperimentDesignHarness:
         log_dir: Path | None = None,
         model: str = MODEL,
         seed: int = 42,
+        agent_name: str = "experiment-designer",
+        system_prompt: str | None = None,
+        mcp_client: MCPClient | None = None,
     ):
         self.client = anthropic_client or anthropic.Anthropic()
         self.model = model
         self.seed = seed
+        try:
+            self.agent_spec = get_agent(agent_name)
+        except RegistryError as exc:
+            raise ValueError(f"invalid governed agent selection: {exc}") from exc
+        if self.agent_spec["role"] == "coordinator":
+            raise ValueError(
+                "the coordinator cannot run inside the MCP executor harness; "
+                "use MultiAgentExperimentDesignHarness"
+            )
+        self.agent_name = agent_name
+        self.domain = str(self.agent_spec["domain"])
+        self.system_prompt = system_prompt or self._system_prompt_for_agent()
         self.log_dir = log_dir or SUITE_ROOT / "agent-harness" / "runs"
-        self.mcp = MCPClient()
+        self.mcp = mcp_client or MCPClient()
         self.messages: list[dict] = []      # persists across run() calls (multi-turn)
         self._tools: list[dict] = []
+        configured_tools = self._allowed_mcp_tools()
+        self._allowed_tool_names: set[str] = (
+            set(TOOL_PURPOSES) if configured_tools is None else set(configured_tools)
+        )
         self.run_id = f"run-{uuid.uuid4().hex[:8]}"
         self.audit: AuditLog | None = None
         self._pending_retry_lineages_by_tool: dict[str, list[str]] = {}
@@ -194,15 +257,101 @@ class ExperimentDesignHarness:
         self._lineage_by_call: dict[str, str] = {}
         self._lineage_by_analysis: dict[str, str] = {}
 
+    def _system_prompt_for_agent(self) -> str:
+        """Return the shared governed contract with a role-specific boundary."""
+        if self.agent_spec["role"] in {"legacy_executor", "reexecutor"}:
+            return SYSTEM_PROMPT
+        allowed = [
+            name.removeprefix("mcp__experiment-design__")
+            for name in self.agent_spec["tools"]
+        ]
+        descriptions = "\n".join(
+            f"- {name}: {TOOL_PURPOSES[name]}" for name in allowed
+        )
+        guidance = DOMAIN_GUIDANCE.get(self.domain, "Stay inside the registered domain.")
+        return f"""\
+You are the governed {self.agent_name} domain executor for {self.domain}.
+You have exactly these tools and no others:
+{descriptions}
+
+{guidance}
+
+Workflow:
+1. If the request is outside this domain or lacks required inputs, return only
+   CLARIFICATION_REQUEST {{"fields":["analysis_method"]}}.
+2. Call only an available domain tool. The host runs the regression attestation
+   for every analysis and withholds any failed payload.
+3. After a presentable result, return only its exact canonical verification
+   report. Never calculate, reconstruct, paraphrase, or add numeric prose.
+
+Rules:
+- Never write statistics code or invent a value; all values come from the R tools.
+- Never choose or alter verification_id. Never expose identifiers, raw IPD,
+  sensitive labels or strata, host paths, or private artifact metadata.
+- A partial result must retain every host-supplied limitation.
+- On terminal verification failure return exactly: {SAFE_FAILURE_MESSAGE}
+"""
+
+    def _allowed_mcp_tools(self) -> set[str] | None:
+        grants = set(self.agent_spec["tools"])
+        if "mcp__experiment-design__*" in grants:
+            return None
+        prefix = "mcp__experiment-design__"
+        return {
+            grant[len(prefix):]
+            for grant in grants
+            if grant.startswith(prefix)
+        }
+
     def start(self):
-        self.mcp.start()
-        self._tools = _build_tools(self.mcp.list_tools())
-        self.audit = AuditLog(self.log_dir, self.run_id)
+        try:
+            self.mcp.start()
+            available = self.mcp.list_tools()
+            allowed = self._allowed_mcp_tools()
+            if allowed is not None:
+                by_name = {
+                    str(item.get("name")): item
+                    for item in available
+                    if isinstance(item, dict) and isinstance(item.get("name"), str)
+                }
+                missing = sorted(allowed - set(by_name))
+                if missing:
+                    raise RuntimeError(
+                        "governed agent tool grant is unavailable: " + ", ".join(missing)
+                    )
+                available = [by_name[name] for name in sorted(allowed)]
+            self._tools = _build_tools(available)
+            self._allowed_tool_names = {str(item["name"]) for item in self._tools}
+            self.audit = AuditLog(self.log_dir, self.run_id)
+        except BaseException as startup_error:
+            # start() may fail after the MCP client has spawned a process but
+            # before its initialize handshake returns. stop() is idempotent, so
+            # always attempt cleanup even when mcp.start() itself raised.
+            try:
+                self.mcp.stop()
+            except Exception:
+                raise RuntimeError(
+                    "experiment-design runtime startup cleanup did not complete"
+                ) from startup_error
+            raise
 
     def stop(self):
-        self.mcp.stop()
-        if self.audit is not None:
-            self.audit.close()
+        try:
+            self.mcp.stop()
+        finally:
+            if self.audit is not None:
+                self.audit.close()
+
+    def conversation_checkpoint(self) -> int:
+        """Return an opaque rollback point for one coordinator child turn."""
+        return len(self.messages)
+
+    def rollback_conversation(self, checkpoint: int) -> None:
+        """Discard every conversation block written after ``checkpoint``."""
+        if (not isinstance(checkpoint, int) or isinstance(checkpoint, bool)
+                or checkpoint < 0 or checkpoint > len(self.messages)):
+            raise ValueError("invalid conversation checkpoint")
+        del self.messages[checkpoint:]
 
     # ── seed injection (A-6): default the seed when the model omits one ──
     # NOTE: setdefault means a model-supplied seed WINS — the harness seed is a
@@ -277,7 +426,9 @@ class ExperimentDesignHarness:
         gate_verdicts: list[str] = []
         ledger = VerificationLedger()
         reports_by_lineage: dict[str, str] = {}
+        report_bindings_by_lineage: dict[str, dict[str, Any]] = {}
         resources_by_lineage: dict[str, list[dict[str, Any]]] = {}
+        configuration_reports: list[str] = []
         max_gate_fails = VERIFY_RETRIES + 1
 
         def failure_result(reason: str, stopped: str = "verify_failed") -> RunResult:
@@ -295,11 +446,14 @@ class ExperimentDesignHarness:
                         "Its payload was discarded and must not be reconstructed.",
             }]})
             return RunResult(
-                self.run_id,
-                SAFE_FAILURE_MESSAGE,
-                gate_verdicts,
-                str(audit.log_file),
-                stopped,
+                run_id=self.run_id,
+                final_answer=SAFE_FAILURE_MESSAGE,
+                gate_verdicts=gate_verdicts,
+                audit_file=str(audit.log_file),
+                stopped=stopped,
+                agent_name=self.agent_name,
+                domain=self.domain,
+                verification_records=[item.to_dict() for item in ledger.all()],
             )
 
         try:
@@ -307,7 +461,7 @@ class ExperimentDesignHarness:
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
+                    system=self.system_prompt,
                     tools=self._tools,
                     messages=self.messages,
                 )
@@ -322,6 +476,10 @@ class ExperimentDesignHarness:
                         round_text.append(block.text)
                         assistant_content.append({"type": "text", "text": block.text})
                     elif block.type == "tool_use":
+                        if block.name not in self._allowed_tool_names:
+                            raise ValueError(
+                                "model requested a tool outside the governed allowlist"
+                            )
                         args = self._prepare_args(block.name, block.input, block.id)
                         assistant_content.append({
                             "type": "tool_use", "id": block.id,
@@ -353,15 +511,21 @@ class ExperimentDesignHarness:
                         return failure_result("FAILED")
                     latest = ledger.latest()
                     latest_reports = []
+                    latest_report_bindings: list[dict[str, Any]] = []
                     latest_resources: list[dict[str, Any]] = []
                     for item in latest:
                         lineage = self._lineage_by_analysis.get(item.identity.analysis_id)
                         if item.presentable and lineage in reports_by_lineage:
                             latest_reports.append(reports_by_lineage[lineage])
+                            binding = report_bindings_by_lineage.get(lineage)
+                            if binding is not None:
+                                latest_report_bindings.append(binding)
                             latest_resources.extend(resources_by_lineage.get(lineage, []))
                     candidate = "\n".join(round_text).strip()
                     if latest_reports:
                         final = join_reports(latest_reports)
+                    elif configuration_reports:
+                        final = "\n\n---\n\n".join(configuration_reports)
                     elif not is_elicitation_message(candidate):
                         yield {"event": "done"}
                         return failure_result("UNBOUND_FREE_TEXT")
@@ -380,9 +544,19 @@ class ExperimentDesignHarness:
                         "verification": [e.to_dict() for e in ledger.all()],
                     })
                     yield {"event": "done"}
-                    return RunResult(self.run_id, final, gate_verdicts,
-                                     str(audit.log_file), response.stop_reason or "end_turn",
-                                     latest_resources)
+                    return RunResult(
+                        run_id=self.run_id,
+                        final_answer=final,
+                        gate_verdicts=gate_verdicts,
+                        audit_file=str(audit.log_file),
+                        stopped=response.stop_reason or "end_turn",
+                        private_resources=latest_resources,
+                        agent_name=self.agent_name,
+                        domain=self.domain,
+                        verification_records=[item.to_dict() for item in ledger.all()],
+                        validated_configuration_reports=list(configuration_reports),
+                        canonical_report_bindings=latest_report_bindings,
+                    )
 
                 if refused_more_analysis:
                     yield {"event": "done"}
@@ -405,15 +579,59 @@ class ExperimentDesignHarness:
 
                 for name, args, result, tid in tool_calls:
                     if not _is_gated(name):
-                        safe_results[tid] = result
-                        yield {"event": "tool_result", "tool": name, "result": result}
+                        if name == "validate_config" and isinstance(result, dict):
+                            report = result.get("configuration_report")
+                            if (result.get("valid") is True and isinstance(report, str)
+                                    and report.strip() and len(report) <= 64 * 1024):
+                                configuration_reports.append(report)
+                                safe_results[tid] = {"configuration_report": report}
+                            else:
+                                safe_results[tid] = result
+                        else:
+                            safe_results[tid] = result
+                        yield {"event": "tool_result", "tool": name,
+                               "result": safe_results[tid]}
                         continue
 
                     gate = yield from self._verify(name, args, result, audit, test_result)
-                    server_envelope = result.get("_verification") or {}
-                    identity = PublicVerificationIdentity.from_dict(
-                        server_envelope["identity"]
+                    server_envelope = (
+                        result.get("_verification") or {}
+                        if isinstance(result, dict) else {}
                     )
+                    try:
+                        identity_data = server_envelope.get("identity")
+                        if not isinstance(identity_data, dict):
+                            raise ValueError("verification identity is missing")
+                        identity = PublicVerificationIdentity.from_dict(identity_data)
+                    except (KeyError, TypeError, ValueError):
+                        # A malformed server envelope cannot be assigned a
+                        # trustworthy lineage, so do not enter the retry ledger
+                        # or expose any part of the payload. End this turn with
+                        # the same exact value-free failure contract used by all
+                        # other fail-closed paths.
+                        gate_verdicts.append("INTERNAL_ERROR")
+                        audit.log_gate(
+                            "Verify", "INTERNAL_ERROR",
+                            metadata={"reason": "malformed_server_verification_envelope"},
+                        )
+                        yield {
+                            "event": "gate", "tool": name,
+                            "verification_id": None,
+                            "verdict": "INTERNAL_ERROR", "checks": {},
+                            "failures": ["verification_failed"],
+                            "blocked": [], "notes": [],
+                        }
+                        yield {
+                            "event": "tool_result_withheld", "tool": name,
+                            "verification": {
+                                "status": "INTERNAL_ERROR",
+                                "presentable": False,
+                                "failures": ["verification_failed"],
+                                "blocked": [], "notes": [],
+                            },
+                        }
+                        yield {"event": "done"}
+                        return failure_result("INTERNAL_ERROR")
                     provenance = dict(result.get("_provenance") or {})
                     private_provenance = dict(result.get("_private_provenance") or {})
                     lineage_id = self._lineage_by_call.get(tid, identity.analysis_id)
@@ -456,6 +674,13 @@ class ExperimentDesignHarness:
                             server_envelope, provenance,
                         )
                         reports_by_lineage[lineage_id] = report
+                        report_bindings_by_lineage[lineage_id] = {
+                            "analysis_id": identity.analysis_id,
+                            "status": envelope.status.value,
+                            "report": report,
+                            "report_hash": content_hash(report),
+                            "blocked": list(envelope.blocked),
+                        }
                         resources_by_lineage[lineage_id] = [
                             {
                                 "resource": dict(resource),
@@ -533,13 +758,30 @@ class ExperimentDesignHarness:
             yield {"event": "done"}
             return failure_result("INTERNAL_ERROR", "max_rounds")
 
+        except GeneratorExit:
+            # A caller may cancel after any yielded progress event. GeneratorExit
+            # is not an Exception, so handle it explicitly and restore the exact
+            # pre-turn conversation before propagating cancellation without a
+            # user-visible result.
+            del self.messages[snapshot:]
+            audit.log("turn_cancelled")
+            raise
         except Exception as e:  # noqa: BLE001 - keep the conversation recoverable
             # Roll back this turn's messages so the next turn sends a valid
             # sequence (no dangling/duplicate user message) — W-3.
             del self.messages[snapshot:]
             audit.log_error(f"run failed: {e}")
             yield {"event": "error", "message": str(e)}
-            return RunResult(self.run_id, "", gate_verdicts, str(audit.log_file), "error")
+            return RunResult(
+                run_id=self.run_id,
+                final_answer="",
+                gate_verdicts=gate_verdicts,
+                audit_file=str(audit.log_file),
+                stopped="error",
+                agent_name=self.agent_name,
+                domain=self.domain,
+                verification_records=[item.to_dict() for item in ledger.all()],
+            )
 
     def _verify(
         self, tool_name: str, args: dict, result: dict, audit: AuditLog,

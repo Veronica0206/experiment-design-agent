@@ -15,24 +15,54 @@ npm ci
 npm run build      # compiles src/ -> dist/ (dist is gitignored)
 ```
 
-Requires `Rscript` on PATH (the tools shell out to the skill R code under the
-suite root). The Claude agent path additionally requires Claude Code 2.1.197+
-for agent-scoped hooks, `prompt_id` ledger binding, and the configured Claude
-Sonnet 5 model.
+This package is intentionally non-publishable: `private: true` and a local
+`prepublishOnly` guard make an accidental `npm publish` fail closed.
+
+The setup commands above require Node/npm on the operator's `PATH`. At runtime,
+the MCP server never resolves Rscript or Python from ambient `PATH`: it uses a
+closed list of absolute installation candidates and prefers
+`../agent-harness/.venv/bin/python`. For nonstandard installations, set reviewed
+absolute `EXPDESIGN_RSCRIPT` and `EXPDESIGN_PYTHON` paths; relative overrides
+are rejected. R profile and library environment variables are cleared, so the
+governed runtime uses only the selected R installation's default libraries;
+project-local `renv` libraries are not implicitly activated. R must provide
+`jsonlite`, `mvtnorm`, and `survival`; the release gate also validates their
+applicable transitive lock closure and every installed `renv.lock` record. The
+release gate separately compares bounded, no-follow SHA-256 hashes of every
+applicable installed R package tree with the reviewed exact-version/platform
+profile. That profile detects post-review installed-byte drift; it does not
+authenticate package archives and must be generated only after an independently
+clean, lock-restored review. The Claude agent path additionally requires a
+canonical Claude Code product identity and version 2.1.197+ for agent-scoped hooks,
+`prompt_id` ledger binding, and the configured Claude Sonnet 5 model. The
+release gate checks that installed version without requiring login;
+`make check-claude-live` is the optional authenticated-session check.
+That readiness check uses only standard absolute installation candidates or a
+reviewed absolute `EXPDESIGN_CLAUDE` override, not ambient `PATH`. Its strict
+product/version line prevents accidental tool confusion; it is not a
+cryptographic attestation against a deliberately impersonating same-user binary.
 
 ## Use as a Claude Code agent
 
 `../.mcp.json` registers this server as `experiment-design`. Open Claude Code in
-the suite directory and invoke the **experiment-designer** subagent (or launch
-it with `claude --agent experiment-designer`)
-(`.claude/agents/experiment-designer.md`) — it drives these tools, runs the
-verification gate, and interprets the results. `design-verifier` is an optional
-fresh re-execution surface governed by the same engine and fail-closed policy;
-it is not an independent methodology audit.
+the suite directory and launch the recommended routing-only coordinator with
+`claude --agent experiment-design-coordinator`. It delegates to the smallest
+approved specialist set and combines only verified canonical reports. The
+legacy **experiment-designer** remains available as an all-domain compatibility
+surface. `design-verifier` is an optional fresh re-execution surface governed
+by the same engine and fail-closed policy; it is not an independent methodology
+audit.
 
 ## Use from Python (Streamlit harness)
 
-`../agent-harness/` drives the same tools; see its `streamlit_app.py`.
+`../agent-harness/` drives the same tools. From the suite root, launch its UI
+through the reviewed pre-site boundary with
+`tools/run-reviewed-python.sh -m streamlit run agent-harness/streamlit_app.py
+--server.headless true --server.address 127.0.0.1 --server.port 8501`. The UI is
+unauthenticated, so it must stay bound to the loopback interface.
+That boundary verifies the exact venv distribution/file surface before it adds
+the validated package paths; it never processes `.pth` startup code and rejects
+executable bytecode caches before the UI starts.
 
 ## Schema contract (truth at the tool boundary)
 
@@ -85,8 +115,12 @@ requested label. The server closes that class of bug three ways:
     returned in `ignored_params` instead of being dropped silently (e.g.
     `levels` on a fractional design, `alpha`/`fraction` on a Box-Behnken).
 
-`indirect_compare` runs single Bucher comparisons (no chaining) or MAIC; the
-MAIC path accepts `covariates` (default: all target-CSV columns) and
+At the orchestration layer, the least-privilege indirect-comparison agent is
+deliberately restricted to one Bucher comparison or one MAIC analysis per
+delegated task. The lower-level MCP `indirect_compare` tool accepts a batch of
+1–1000 independent Bucher comparison objects in `comparisons`; that batching is
+not a multi-edge Bucher chain or network meta-analysis workflow. The MAIC path
+accepts `covariates` (default: all target-CSV columns) and
 `tte_method` (`cox` default, or `exponential`). Non-Cox source-effect inference
 uses a stratified nonparametric bootstrap that refits the MAIC weights; its
 replicate count and seed are explicit and echoed. Row-level MAIC weights remain in
@@ -121,8 +155,12 @@ ABA races that could otherwise permit concurrent retention mutations.
 Before a gated result reaches model context, the server runs the shared Python
 design checks, the cached full regression suite for the active engine
 fingerprint, and required same-seed replay. The fingerprint is recomputed from
-pinned, PATH-resolved R and Python executables, the underlying R engine/shared
-runtime, resolved library/package paths, installed package-tree bytes,
+pinned R and Python executables resolved only from reviewed absolute overrides
+or closed installation-location lists, the underlying R engine/shared
+runtime, resolved library/package paths, and the complete installed Node
+production dependency closure resolved from `package-lock.json` (including
+flattened transitive packages). That startup traversal fails closed above
+20,000 files or 256 MiB. The fingerprint also covers
 R/Python gate sources, and every executed R regression script. Regression
 children run with `--vanilla`, so untracked R profiles cannot alter the
 attestation; a runtime or package change cannot reuse an older cached result.
@@ -130,7 +168,10 @@ Per-request cancellation stops only that caller's wait and cannot cancel
 another caller's shared regression run. Failed payloads are replaced by a
 safe, value-free envelope. Accepted model-visible results are privacy-safe
 views bound to the server's exact canonical report. `_verification` carries the
-runtime-issued identity and public-result/report commitments. Model-visible
+runtime-issued identity, public-result/report commitments, and a commitment to
+only the allowlisted public argument projection. Raw argument and result hashes
+remain verifier-internal so private paths, labels, rows, and strata do not
+become offline equality oracles. Model-visible
 `_provenance` carries runtime and package identity plus boolean/count summaries;
 it deliberately omits the canonical config digest and raw input/artifact
 digests, which would otherwise act as offline equality oracles. Those digests
@@ -151,6 +192,12 @@ process running as the same operating-system user and replacing an authorized
 input parent before inspection or an entire managed output directory. Allowed
 input roots, their parents, and the configured run root must remain private and
 trusted.
+
+Client cancellation also terminates a running Python verifier process group.
+On `SIGINT`, `SIGTERM`, or stdio EOF/close, the executable server cancels and
+awaits every registered R analysis, Python verifier, and R/Python runtime-
+fingerprint probe process group before closing; imported modules do not install
+process-global handlers.
 
 ## Architecture
 

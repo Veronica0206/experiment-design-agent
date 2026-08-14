@@ -6,10 +6,17 @@ Manages the node subprocess lifecycle and JSON-RPC communication over stdio.
 from __future__ import annotations
 
 import atexit
+import hmac
 import json
+import os
 import queue
 import re
+import secrets
+import signal
+import stat
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -19,6 +26,7 @@ from urllib.parse import unquote, urlparse
 
 MCP_SERVER_DIR = Path(__file__).resolve().parent.parent / "mcp-server"
 SERVER_ENTRY = MCP_SERVER_DIR / "dist" / "index.js"
+SERVER_LAUNCHER = MCP_SERVER_DIR / "launch-server.sh"
 
 CONTROL_TIMEOUT_S = 30
 # A valid stochastic tool can consume three independent 120-second R budgets
@@ -36,10 +44,416 @@ _ARTIFACT_HANDLE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_RUNTIME_ENTRY = re.compile(
+    r"^runtime-([1-9][0-9]*)-([0-9a-f]{32})\.json$",
+)
+_RUNTIME_REGISTRY_MAX_BYTES = 4096
+_RUNTIME_REGISTRY_WAIT_S = 5
+_RUNTIME_STOP_PAYLOAD = b"stop\n"
 
 
 class MCPToolError(RuntimeError):
     """Raised when a tool call fails (server-side error or bad output)."""
+
+
+class _RuntimeGroupRegistry:
+    """Private, authenticated leases for runtime groups outside Node's group.
+
+    R, verifier, and fingerprint supervisors create one lease before they spawn
+    a detached runtime group. The Python host retains a descriptor for the
+    private registry and can therefore stop those groups even if Node is frozen
+    and cannot run its cooperative shutdown handlers.
+    """
+
+    def __init__(self) -> None:
+        if os.name != "posix" or not (
+            sys.platform == "darwin" or sys.platform.startswith("linux")
+        ):
+            raise RuntimeError(
+                "secure MCP runtime-group supervision is unavailable on this platform"
+            )
+        if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY")):
+            raise RuntimeError("secure MCP runtime registry primitives are unavailable")
+        self.path = Path(tempfile.mkdtemp(prefix="expdesign-runtime-groups-"))
+        os.chmod(self.path, 0o700)
+        self.fd = os.open(
+            self.path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        self.token = secrets.token_hex(32)
+        self.server_pid: int | None = None
+        self._closed = False
+        self._check_directory()
+
+    def _check_directory(self) -> os.stat_result:
+        metadata = os.fstat(self.fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError("MCP runtime registry is not a private owned directory")
+        return metadata
+
+    def environment(self) -> dict[str, str]:
+        directory = self._check_directory()
+        return {
+            "EXPDESIGN_RUNTIME_REGISTRY_DIR": str(self.path),
+            "EXPDESIGN_RUNTIME_REGISTRY_TOKEN": self.token,
+            "EXPDESIGN_RUNTIME_REGISTRY_DEV": str(directory.st_dev),
+            "EXPDESIGN_RUNTIME_REGISTRY_INO": str(directory.st_ino),
+        }
+
+    def bind_server(self, pid: Any) -> None:
+        if not isinstance(pid, int) or pid <= 0:
+            raise OSError("MCP server did not publish a valid process identity")
+        self.server_pid = pid
+
+    def stop_accepting(self) -> None:
+        """Atomically publish a private stop latch before signalling Node."""
+        if self._closed:
+            return
+        self._check_directory()
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            fd = os.open(".stop", flags, 0o600, dir_fd=self.fd)
+        except FileExistsError:
+            fd = os.open(
+                ".stop", os.O_RDONLY | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=self.fd,
+            )
+            try:
+                self._validate_stop_file(fd)
+            finally:
+                os.close(fd)
+            return
+        try:
+            self._write_all(fd, _RUNTIME_STOP_PAYLOAD)
+            os.fsync(fd)
+            self._check_private_regular(fd, "runtime stop latch")
+            self._check_named_fd(".stop", fd, "runtime stop latch")
+            os.fsync(self.fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("short MCP runtime registry write")
+            remaining = remaining[written:]
+
+    @staticmethod
+    def _check_private_regular(fd: int, label: str) -> os.stat_result:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise OSError(f"{label} is not a private singly-linked owned file")
+        return metadata
+
+    def _check_named_fd(self, name: str, fd: int, label: str) -> None:
+        named = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise OSError(f"{label} directory entry changed")
+
+    def _validate_stop_file(self, fd: int) -> os.stat_result:
+        before = self._check_private_regular(fd, "runtime stop latch")
+        self._check_named_fd(".stop", fd, "runtime stop latch")
+        if before.st_size != len(_RUNTIME_STOP_PAYLOAD):
+            raise OSError("runtime stop latch is malformed")
+        payload = os.read(fd, len(_RUNTIME_STOP_PAYLOAD) + 1)
+        after = self._check_private_regular(fd, "runtime stop latch")
+        self._check_named_fd(".stop", fd, "runtime stop latch")
+        if (
+            payload != _RUNTIME_STOP_PAYLOAD
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise OSError("runtime stop latch changed or is malformed")
+        return after
+
+    def _read_entry(self, name: str) -> tuple[dict[str, Any], os.stat_result]:
+        match = _RUNTIME_ENTRY.fullmatch(name)
+        if match is None:
+            raise OSError("runtime registry contains an unknown entry")
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=self.fd,
+        )
+        try:
+            before = self._check_private_regular(fd, "runtime group lease")
+            self._check_named_fd(name, fd, "runtime group lease")
+            if before.st_size > _RUNTIME_REGISTRY_MAX_BYTES:
+                raise OSError("runtime group lease is oversized")
+            payload = bytearray()
+            while len(payload) <= _RUNTIME_REGISTRY_MAX_BYTES:
+                chunk = os.read(fd, _RUNTIME_REGISTRY_MAX_BYTES + 1 - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > _RUNTIME_REGISTRY_MAX_BYTES:
+                raise OSError("runtime group lease is oversized")
+            after = self._check_private_regular(fd, "runtime group lease")
+            self._check_named_fd(name, fd, "runtime group lease")
+            if (
+                (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise OSError("runtime group lease changed while it was read")
+            parsed = json.loads(payload.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise OSError("runtime group lease is malformed")
+            return parsed, after
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise OSError("runtime group lease is malformed") from exc
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _process_identity(pid: int) -> tuple[str, int, int] | None:
+        """Return (start identity, process group, uid), or None after exit."""
+        if sys.platform.startswith("linux"):
+            try:
+                raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+                suffix = raw[raw.rfind(")") + 2:].split()
+                group = int(suffix[2])       # proc(5) field 5
+                start = suffix[19]           # proc(5) field 22
+                status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+                uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+                uid = int(uid_line.split()[1])
+                return f"linux:{start}", group, uid
+            except (FileNotFoundError, ProcessLookupError):
+                return None
+            except (IndexError, StopIteration, ValueError) as exc:
+                raise OSError("runtime supervisor identity is unreadable") from exc
+        if sys.platform == "darwin":
+            clean_env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+            try:
+                started = subprocess.run(
+                    ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=2, env=clean_env, check=False,
+                )
+                details = subprocess.run(
+                    ["/bin/ps", "-o", "pgid=", "-o", "uid=", "-p", str(pid)],
+                    capture_output=True, text=True, timeout=2, env=clean_env, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise OSError("runtime supervisor identity probe timed out") from exc
+            start_text = " ".join(started.stdout.split())
+            fields = details.stdout.split()
+            if started.returncode != 0 or details.returncode != 0 or not start_text:
+                return None
+            if len(fields) != 2:
+                raise OSError("runtime supervisor identity is unreadable")
+            try:
+                return f"darwin:{start_text}", int(fields[0]), int(fields[1])
+            except ValueError as exc:
+                raise OSError("runtime supervisor identity is unreadable") from exc
+        raise OSError("runtime supervisor identity is unsupported")
+
+    def _entry_authentication(self, parsed: dict[str, Any]) -> str:
+        payload = json.dumps(
+            [
+                parsed["version"], parsed["server_pid"], parsed["pid"],
+                parsed["nonce"], parsed["start_identity"],
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hmac.new(self.token.encode("ascii"), payload, "sha256").hexdigest()
+
+    def _authenticate_entry(
+        self, name: str, parsed: dict[str, Any], metadata: os.stat_result,
+    ) -> tuple[int, str, os.stat_result]:
+        match = _RUNTIME_ENTRY.fullmatch(name)
+        assert match is not None
+        expected_keys = {
+            "version", "server_pid", "pid", "nonce", "start_identity", "auth",
+        }
+        if set(parsed) != expected_keys:
+            raise OSError("runtime group lease has unexpected fields")
+        pid = parsed.get("pid")
+        nonce = parsed.get("nonce")
+        start_identity = parsed.get("start_identity")
+        auth = parsed.get("auth")
+        if (
+            type(parsed.get("version")) is not int or parsed["version"] != 1
+            or type(parsed.get("server_pid")) is not int
+            or parsed["server_pid"] != self.server_pid
+            or type(pid) is not int or pid <= 0 or str(pid) != match.group(1)
+            or not isinstance(nonce, str) or nonce != match.group(2)
+            or not isinstance(start_identity, str) or not start_identity
+            or len(start_identity) > 256
+            or not isinstance(auth, str) or not _SHA256.fullmatch(auth)
+            or not hmac.compare_digest(auth, self._entry_authentication(parsed))
+        ):
+            raise OSError("runtime group lease failed authentication")
+        return pid, start_identity, metadata
+
+    def _validated_entry(
+        self, name: str,
+    ) -> tuple[int, str, os.stat_result] | None:
+        parsed, metadata = self._read_entry(name)
+        pid, expected_identity, metadata = self._authenticate_entry(
+            name, parsed, metadata,
+        )
+        identity = self._process_identity(pid)
+        if identity is None:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise OSError(
+                    "runtime supervisor exited but its group cannot be inspected"
+                ) from exc
+            else:
+                # Without the leader's start identity, killing a still-live
+                # numeric PGID could target a reused group. Retain the lease and
+                # fail closed instead of making an unauthenticated kill.
+                raise OSError(
+                    "runtime supervisor exited while its process group remains live"
+                )
+            self._unlink_same(name, metadata)
+            return None
+        start_identity, group, uid = identity
+        if (
+            start_identity != expected_identity
+            or group != pid
+            or (hasattr(os, "getuid") and uid != os.getuid())
+        ):
+            raise OSError("runtime group lease does not identify its live supervisor")
+        return pid, start_identity, metadata
+
+    def _unlink_same(self, name: str, expected: os.stat_result) -> None:
+        current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        if (
+            stat.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+        ):
+            os.unlink(name, dir_fd=self.fd)
+
+    def _runtime_names(self) -> list[str]:
+        self._check_directory()
+        names = sorted(os.listdir(self.fd))
+        unknown = [name for name in names if name != ".stop" and not _RUNTIME_ENTRY.fullmatch(name)]
+        if unknown:
+            raise OSError("runtime registry contains unrecognized state")
+        return [name for name in names if _RUNTIME_ENTRY.fullmatch(name)]
+
+    def terminate_registered_groups(self) -> None:
+        """Stop, revalidate, then kill each authenticated runtime process group."""
+        if self._closed:
+            return
+        for name in self._runtime_names():
+            entry = self._validated_entry(name)
+            if entry is None:
+                continue
+            pid, start_identity, _metadata = entry
+            try:
+                os.killpg(pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                continue
+            stopped_identity = self._process_identity(pid)
+            if stopped_identity is None:
+                try:
+                    os.killpg(pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+                raise OSError("runtime supervisor exited before kill revalidation")
+            if stopped_identity[:2] != (start_identity, pid):
+                # Never kill a process group after identity drift. Resume any
+                # group stopped by the conservative guard and fail closed.
+                try:
+                    os.killpg(pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+                raise OSError("runtime supervisor identity changed before termination")
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except BaseException:
+                try:
+                    os.killpg(pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+                raise
+
+    def _entry_identity_is_live(self, name: str) -> bool:
+        entry = self._validated_entry(name)
+        return entry is not None
+
+    def finish(self) -> None:
+        """Drain authenticated leases, remove private state, and close the fd."""
+        if self._closed:
+            return
+        deadline = time.monotonic() + _RUNTIME_REGISTRY_WAIT_S
+        while True:
+            self.terminate_registered_groups()
+            live = []
+            for name in self._runtime_names():
+                if self._entry_identity_is_live(name):
+                    live.append(name)
+            if not live:
+                break
+            if time.monotonic() >= deadline:
+                raise OSError("runtime process groups did not terminate")
+            time.sleep(0.025)
+
+        for name in self._runtime_names():
+            parsed, metadata = self._read_entry(name)
+            # A now-dead entry must still authenticate before host cleanup.
+            self._authenticate_entry(name, parsed, metadata)
+            self._unlink_same(name, metadata)
+        try:
+            stop_metadata = os.stat(".stop", dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            stop_metadata = None
+        if stop_metadata is not None:
+            stop_fd = os.open(
+                ".stop", os.O_RDONLY | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=self.fd,
+            )
+            try:
+                stop_metadata = self._validate_stop_file(stop_fd)
+            finally:
+                os.close(stop_fd)
+            self._unlink_same(".stop", stop_metadata)
+        if os.listdir(self.fd):
+            raise OSError("runtime registry did not drain completely")
+        directory = self._check_directory()
+        named = os.stat(self.path, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (directory.st_dev, directory.st_ino):
+            raise OSError("runtime registry path changed before cleanup")
+        try:
+            os.rmdir(self.path)
+        except BaseException:
+            # Keep the pinned descriptor and registry object available so a
+            # later stop() can retry cleanup or an operator can inspect state.
+            raise
+        os.close(self.fd)
+        self._closed = True
 
 
 class MCPClient:
@@ -54,14 +468,15 @@ class MCPClient:
         self._write_lock = threading.Lock()
         self._closed = False
         self._generation = 0
+        self._runtime_registry: _RuntimeGroupRegistry | None = None
 
     def start(self) -> dict:
-        if not SERVER_ENTRY.exists():
+        if not SERVER_ENTRY.is_file() or not SERVER_LAUNCHER.is_file():
             raise FileNotFoundError(
-                f"MCP server not built. Run 'npm run build' in {MCP_SERVER_DIR}"
+                f"MCP server or launcher is unavailable. Run 'npm run build' in {MCP_SERVER_DIR}"
             )
         # Fully retire a prior generation before publishing new shared state.
-        if self._proc is not None or any(
+        if self._proc is not None or self._runtime_registry is not None or any(
             thread is not None and thread.is_alive()
             for thread in (self._stdout_thread, self._stderr_thread)
         ):
@@ -73,61 +488,149 @@ class MCPClient:
         # previous stdout thread, which would fail the first _send immediately.
         self._closed = False
         self._waiters = {}
-        self._proc = subprocess.Popen(
-            ["node", str(SERVER_ENTRY)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        proc = self._proc
-        # Drain stderr continuously in a background thread so a chatty server
-        # can never deadlock by filling its stderr pipe (B-8).
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, args=(proc, generation), daemon=True,
-        )
-        self._stderr_thread.start()
-        # Read stdout in a thread (blocking readline on the raw stream) and feed
-        # parsed messages into a queue — avoids select() on a buffered text
-        # stream, where buffered bytes are invisible to select (V-1).
-        self._stdout_thread = threading.Thread(
-            target=self._read_stdout, args=(proc, generation), daemon=True,
-        )
-        self._stdout_thread.start()
-        # Ensure the child is reaped even on an abnormal interpreter exit (B-10).
-        atexit.register(self.stop)
+        try:
+            registry = _RuntimeGroupRegistry()
+            self._runtime_registry = registry
+            server_env = dict(os.environ)
+            # Absolute interpreter selection is handled by the audited launcher.
+            # Do not let Node preload code or search caller-controlled module roots.
+            server_env.pop("NODE_OPTIONS", None)
+            server_env.pop("NODE_PATH", None)
+            for name in (
+                "EXPDESIGN_RUNTIME_REGISTRY_DIR",
+                "EXPDESIGN_RUNTIME_REGISTRY_TOKEN",
+                "EXPDESIGN_RUNTIME_REGISTRY_DEV",
+                "EXPDESIGN_RUNTIME_REGISTRY_INO",
+                "EXPDESIGN_RUNTIME_SERVER_PID",
+                "EXPDESIGN_RUNTIME_NONCE",
+                "EXPDESIGN_RUNTIME_TARGET_CWD",
+            ):
+                server_env.pop(name, None)
+            server_env.update(registry.environment())
+            self._proc = subprocess.Popen(
+                ["/bin/sh", str(SERVER_LAUNCHER)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=str(MCP_SERVER_DIR),
+                env=server_env,
+                start_new_session=True,
+            )
+            proc = self._proc
+            registry.bind_server(proc.pid)
+            # Drain stderr continuously in a background thread so a chatty server
+            # can never deadlock by filling its stderr pipe (B-8).
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr, args=(proc, generation), daemon=True,
+            )
+            self._stderr_thread.start()
+            # Read stdout in a thread (blocking readline on the raw stream) and feed
+            # parsed messages into a queue — avoids select() on a buffered text
+            # stream, where buffered bytes are invisible to select (V-1).
+            self._stdout_thread = threading.Thread(
+                target=self._read_stdout, args=(proc, generation), daemon=True,
+            )
+            self._stdout_thread.start()
+            # Ensure the child is reaped even on an abnormal interpreter exit (B-10).
+            atexit.register(self.stop)
 
-        resp = self._call("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "experiment-design-harness", "version": "1.1.0"},
-        })
-        self._notify("notifications/initialized")
-        return resp
+            resp = self._call("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "experiment-design-harness", "version": "1.1.0"},
+            })
+            self._notify("notifications/initialized")
+            return resp
+        except BaseException as startup_error:
+            # Popen succeeds before initialize/notifications can fail. Retire
+            # that partial generation here so direct MCPClient users cannot
+            # orphan Node or its reader threads when start() itself raises.
+            try:
+                self.stop()
+            except Exception:
+                raise RuntimeError(
+                    "MCP server startup failed and cleanup did not complete"
+                ) from startup_error
+            raise
 
     def stop(self):
-        proc, self._proc = self._proc, None
-        try:
-            if proc is not None and proc.poll() is None:
+        """Stop Node and every registered runtime group, retaining failed state."""
+        proc = self._proc
+        registry = self._runtime_registry
+        cleanup_failed = False
+        if registry is not None:
+            try:
+                # Prevent new wrappers before asking Node to shut down. Every
+                # wrapper checks the latch before registration and target spawn.
+                registry.stop_accepting()
+            except Exception:
+                cleanup_failed = True
+        if proc is not None and proc.poll() is None:
+            try:
                 proc.terminate()
+            except Exception:
+                cleanup_failed = True
+            try:
+                proc.wait(timeout=STOP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                cleanup_failed = True
+            if proc.poll() is None:
+                if registry is not None:
+                    try:
+                        registry.terminate_registered_groups()
+                    except Exception:
+                        cleanup_failed = True
+                try:
+                    if (
+                        os.name == "posix" and isinstance(proc.pid, int)
+                        and proc.pid > 0
+                    ):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    cleanup_failed = True
                 try:
                     proc.wait(timeout=STOP_GRACE_S)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=STOP_GRACE_S)
-                    except subprocess.TimeoutExpired:
-                        pass
-        except Exception:
-            pass
+                except Exception:
+                    cleanup_failed = True
+        # Even a cooperative Node exit must not leave a wrapper group behind.
+        # This second pass catches groups whose lease appeared during shutdown.
+        if registry is not None:
+            try:
+                registry.terminate_registered_groups()
+            except Exception:
+                cleanup_failed = True
         current = threading.current_thread()
         for thread in (self._stdout_thread, self._stderr_thread):
             if thread is not None and thread is not current:
                 thread.join(timeout=STOP_GRACE_S)
-        self._stdout_thread = None
-        self._stderr_thread = None
+        process_live = proc is not None and proc.poll() is None
+        stdout_live = self._stdout_thread is not None and self._stdout_thread.is_alive()
+        stderr_live = self._stderr_thread is not None and self._stderr_thread.is_alive()
+        if not process_live:
+            self._proc = None
+        if not stdout_live:
+            self._stdout_thread = None
+        if not stderr_live:
+            self._stderr_thread = None
+        if not process_live and registry is not None:
+            try:
+                registry.finish()
+            except Exception:
+                cleanup_failed = True
+            else:
+                self._runtime_registry = None
         self._closed = True
+        registry_live = self._runtime_registry is not None
+        if cleanup_failed or process_live or stdout_live or stderr_live or registry_live:
+            raise RuntimeError("MCP server process could not be fully stopped")
 
     def list_tools(self) -> list[dict]:
         resp = self._call("tools/list", {})

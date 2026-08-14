@@ -10,6 +10,7 @@ from gates import (GateVerdict, MANUAL_CHECKS, check_regression_tests, check_rep
                    combined_gate, design_checks_for)
 from final_report import canonical_report, privacy_safe_view
 from verification import (VerificationIdentity, content_hash,
+                          public_arguments_hash,
                           public_check_summary, public_failure_codes,
                           public_limitation_codes, public_note_codes)
 
@@ -86,7 +87,11 @@ def main() -> int:
             "analysis_id": identity.analysis_id,
             "call_id": identity.call_id,
             "tool": identity.tool,
-            "args_hash": identity.args_hash,
+            # The raw argument commitment remains inside this verifier.  Its
+            # public replacement covers only the allowlisted argument DTO, so
+            # private paths, labels, study rows, and strata do not become an
+            # offline equality oracle.
+            "public_args_hash": public_arguments_hash(tool, args),
             "result_hash": identity.result_hash,
             "provenance_hash": identity.provenance_hash,
         },
@@ -100,14 +105,29 @@ def main() -> int:
         "notes": public_note_codes(verdict.notes) if verdict.passed else [],
     }
     if response["presentable"]:
+        # Canonical rendering must verify the complete, verifier-local binding
+        # before any private commitment is removed from the response DTO.
+        # Never pass the public identity into this check: it intentionally does
+        # not contain the raw argument or result commitments.
+        private_rendering_envelope = {
+            **response,
+            "identity": {
+                "analysis_id": identity.analysis_id,
+                "call_id": identity.call_id,
+                "tool": identity.tool,
+                "args_hash": identity.args_hash,
+                "result_hash": identity.result_hash,
+                "provenance_hash": identity.provenance_hash,
+            },
+        }
         response["report"] = canonical_report(
-            tool, args, result, response, public_provenance,
+            tool, args, result, private_rendering_envelope, public_provenance,
         )
         response["public_result"] = privacy_safe_view(tool, result)
         response["public_result_hash"] = content_hash(response["public_result"])
         response["report_hash"] = content_hash(response["report"])
-    # Keep the raw result commitment inside this verifier process.  The public
-    # DTO has its own commitment above; exposing the raw hash would turn every
+    # Keep both raw commitments inside this verifier process. The public DTO
+    # has its own commitments above; exposing either raw hash would turn every
     # dropped private value into an offline equality oracle.
     response["identity"].pop("result_hash", None)
     json.dump(response, sys.stdout, allow_nan=False, separators=(",", ":"))

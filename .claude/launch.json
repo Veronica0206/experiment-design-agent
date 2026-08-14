@@ -3,9 +3,15 @@
   "configurations": [
     {
       "name": "experiment-design-ui",
-      "runtimeExecutable": "streamlit",
-      "runtimeArgs": ["run", "agent-harness/streamlit_app.py", "--server.headless", "true"],
-      "port": 8501
+      "runtimeExecutable": "tools/run-reviewed-python.sh",
+      "runtimeArgs": [
+        "-m", "streamlit", "run", "agent-harness/streamlit_app.py",
+        "--server.headless", "true",
+        "--server.address", "127.0.0.1",
+        "--server.port", "8501"
+      ],
+      "port": 8501,
+      "autoPort": false
     }
   ]
 }

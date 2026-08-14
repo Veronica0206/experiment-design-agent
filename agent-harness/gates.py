@@ -18,8 +18,10 @@ import io
 import math
 import os
 import stat
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +52,30 @@ class GateVerdict:
         if self.blocked:
             return VerificationStatus.PASS_PARTIAL.value
         return VerificationStatus.VERIFIED.value
+
+
+# ── R payload shapes ───────────────────────────────────────────────
+
+def _r_vector(payload: Any, key: str) -> Any:
+    """Read one R vector field, restoring an array jsonlite auto-unboxed.
+
+    The dispatcher serializes with `auto_unbox = TRUE`, so a length-1 vector
+    (one defining word, a one-stage boundary, a single analysis method) arrives
+    as a bare scalar, and a length-1 NA arrives as `null`. Treat exactly that
+    shape as the one-element array it represents. Data frames are unaffected:
+    jsonlite always emits them as arrays of row objects, even for one row.
+
+    An absent key stays absent so a missing field still fails its own contract,
+    and any other value is returned unchanged so a malformed payload does too.
+    """
+    if not isinstance(payload, dict) or key not in payload:
+        return None
+    value = payload[key]
+    if isinstance(value, list):
+        return value
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return [value]
+    return value
 
 
 # ── #3 Regression suite ────────────────────────────────────────────
@@ -228,6 +254,48 @@ def check_single_endpoint(result: dict, config: dict) -> GateVerdict:
 
     # #1 Direction + #2 Power separation from the OC curve.
     rows = _oc_rows(result.get("oc"))
+
+    # Any engine-generated OC payload that declares its simulation budget must
+    # also carry uncertainty. Low precision is a transparent partial result,
+    # not a numerically false failure of the underlying design.
+    b_used = result.get("B_used")
+    if _num(b_used):
+        uncertainty_fields = (
+            "p_go_mcse", "p_go_mc_lower", "p_go_mc_upper",
+            "mc_replicates", "mc_worst_case_se", "mc_precision_ok",
+        )
+        uncertainty_complete = bool(rows) and all(
+            all(field in row for field in uncertainty_fields) for row in rows
+        )
+        checks["oc_mc_uncertainty_present"] = uncertainty_complete
+        if not uncertainty_complete:
+            failures.append("OC simulation output is missing Monte Carlo uncertainty fields")
+        else:
+            budget_matches = all(row.get("mc_replicates") == b_used for row in rows)
+            checks["oc_mc_budget_matches"] = budget_matches
+            if not budget_matches:
+                failures.append("OC Monte Carlo replicate counts do not match B_used")
+            if any(row.get("mc_precision_ok") is not True for row in rows):
+                blocked.append(
+                    "OC Monte Carlo precision target was not met; increase B_oc "
+                    "before using probability estimates for high-stakes decisions"
+                )
+
+    ppos = result.get("ppos")
+    if isinstance(ppos, dict) and ppos.get("ppos") is not None:
+        ppos_fields = {
+            "n_mc", "ppos_mcse", "ppos_mc_lower", "ppos_mc_upper",
+            "mc_worst_case_se", "mc_precision_ok",
+        }
+        ppos_uncertainty = ppos_fields.issubset(ppos)
+        checks["ppos_mc_uncertainty_present"] = ppos_uncertainty
+        if not ppos_uncertainty:
+            failures.append("PPOS simulation output is missing Monte Carlo uncertainty fields")
+        elif ppos.get("mc_precision_ok") is not True:
+            blocked.append(
+                "PPOS Monte Carlo precision target was not met; increase n_mc "
+                "before high-stakes use"
+            )
     null_p = config.get("null_param")
     alt_p = config.get("alt_param")
     row_null = _nearest_row(rows, null_p)
@@ -664,7 +732,9 @@ def _validate_master_csv(
 def check_master_result(result: dict, config: dict | None = None) -> GateVerdict:
     checks: dict[str, bool] = {}
     failures: list[str] = []
+    blocked: list[str] = []
     oc: Any = None
+    family = (config or {}).get("master_design_type")
     if result.get("error"):
         failures.append(f"tool returned error: {result['error']}")
     inner = result.get("result") if isinstance(result, dict) else None
@@ -676,6 +746,223 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
         checks["oc_table_present"] = isinstance(oc, list) and bool(oc)
         if not checks["oc_table_present"]:
             failures.append("master_simulate result has no non-empty oc_table")
+        else:
+            # Every master engine reports simulated rejection/power
+            # probabilities. Require family-specific MCSEs, Wilson intervals,
+            # and a precision flag before those percentages can pass as a
+            # scientifically interpretable result.
+            mc_specs = {
+                "basket": ("oc_table", "reject_rate", "reject_mcse_pct",
+                           "reject_ci_lower_pct", "reject_ci_upper_pct",
+                           "reject_precision_met"),
+                "umbrella": ("oc_table", "per_arm_power", "power_mcse_pct",
+                             "power_ci_lower_pct", "power_ci_upper_pct",
+                             "power_precision_met"),
+                "platform": ("arm_results", "reject_rate", "reject_mcse_pct",
+                             "reject_ci_lower_pct", "reject_ci_upper_pct",
+                             "reject_precision_met"),
+            }
+            spec = mc_specs.get(family)
+            if spec is not None:
+                table_name, estimate_key, se_key, lower_key, upper_key, precision_key = spec
+                rows = inner.get(table_name)
+                mc_contract = isinstance(rows, list) and bool(rows)
+                low_precision = False
+                if mc_contract:
+                    for index, row in enumerate(rows):
+                        values = [row.get(estimate_key), row.get(se_key),
+                                  row.get(lower_key), row.get(upper_key)] \
+                            if isinstance(row, dict) else []
+                        if (len(values) != 4 or not all(_num(value) for value in values)
+                                or not isinstance(row.get(precision_key), bool)):
+                            mc_contract = False
+                            failures.append(
+                                f"{table_name} row {index + 1} is missing numeric "
+                                "Monte Carlo SE/CI fields or a boolean precision flag"
+                            )
+                            continue
+                        estimate, se, lower, upper = values
+                        row_ok = (
+                            0 <= estimate <= 100 and se >= 0
+                            and 0 <= lower <= upper <= 100
+                            and lower - 0.11 <= estimate <= upper + 0.11
+                        )
+                        if not row_ok:
+                            mc_contract = False
+                            failures.append(
+                                f"{table_name} row {index + 1} has an invalid "
+                                f"Monte Carlo interval [{lower}, {upper}] for {estimate_key}={estimate}"
+                            )
+                        low_precision = low_precision or row.get(precision_key) is False
+                checks["master_mc_uncertainty_valid"] = mc_contract
+                if not mc_contract and not any("Monte Carlo" in item for item in failures):
+                    failures.append(
+                        f"master {family} result lacks a valid Monte Carlo uncertainty contract"
+                    )
+                if low_precision:
+                    blocked.append(
+                        "master simulation did not meet its Monte Carlo precision target; "
+                        "increase n_sims before high-stakes use"
+                    )
+
+            target = inner.get("mc_precision_target_probability_half_width")
+            target_ok = _num(target) and 0 < target < 0.5
+            checks["master_mc_precision_target_declared"] = target_ok
+            if not target_ok:
+                failures.append(
+                    "master result must declare a probability half-width precision target"
+                )
+
+            # Only the MAMS engine calibrates efficacy boundaries, and it must
+            # always declare them: treating an absent or null boundary_source as
+            # "nothing to check" would let a silent contract change skip the
+            # whole validation. Other umbrella methods are still validated
+            # whenever they do report a boundary source.
+            umbrella_method = (config or {}).get("umbrella_method") or "mams"
+            if family == "umbrella" and (
+                umbrella_method == "mams" or inner.get("boundary_source") is not None
+            ):
+                source = inner.get("boundary_source")
+                approximation = inner.get("boundary_approximation")
+                bounds = inner.get("boundaries")
+                # A single-stage design reports one boundary per vector, which
+                # the dispatcher unboxes to a scalar (or to null when efficacy
+                # stopping is disabled at that stage).
+                effect_bounds = _r_vector(bounds, "effect")
+                efficacy_enabled = _r_vector(bounds, "efficacy_enabled_by_stage")
+                # Equal-length vectors are not enough: both must cover exactly
+                # the stages the design actually runs, or a design could report
+                # one boundary for a multi-stage plan.
+                requested_stages = (config or {}).get("n_stages", 2)
+                expected_stages = (
+                    int(requested_stages)
+                    if _num(requested_stages) and int(requested_stages) == requested_stages
+                    and requested_stages >= 1 else None
+                )
+                fallback_reason = inner.get("boundary_fallback_reason")
+                has_user_boundaries = (
+                    (config or {}).get("futility_boundaries") is not None
+                )
+                package_flags = (
+                    [True] * expected_stages if expected_stages is not None else None
+                )
+                fallback_flags = (
+                    [False] * (expected_stages - 1) + [True]
+                    if expected_stages is not None else None
+                )
+                fallback_declared = (
+                    isinstance(fallback_reason, str)
+                    and bool(fallback_reason.strip())
+                )
+                source_contract = (
+                    (
+                        source == "MAMS_package"
+                        and approximation is False
+                        and not has_user_boundaries
+                        and efficacy_enabled == package_flags
+                        and fallback_reason is None
+                    )
+                    or (
+                        source == "approximation"
+                        and approximation is True
+                        and not has_user_boundaries
+                        and efficacy_enabled == fallback_flags
+                        and fallback_declared
+                    )
+                    or (
+                        source == "user_supplied"
+                        and approximation is True
+                        and has_user_boundaries
+                        and efficacy_enabled == fallback_flags
+                        and fallback_declared
+                    )
+                )
+                boundary_contract = (
+                    source_contract
+                    and isinstance(inner.get("decision_rule"), str)
+                    and bool(inner.get("decision_rule"))
+                    and isinstance(bounds, dict)
+                    and isinstance(effect_bounds, list)
+                    and isinstance(efficacy_enabled, list)
+                    and len(effect_bounds) == len(efficacy_enabled)
+                    and expected_stages is not None
+                    and len(effect_bounds) == expected_stages
+                    and all(isinstance(flag, bool) for flag in efficacy_enabled)
+                    and all(
+                        (_num(bound) if enabled else bound is None)
+                        for bound, enabled in zip(effect_bounds, efficacy_enabled)
+                    )
+                )
+                checks["mams_boundary_contract"] = boundary_contract
+                if not boundary_contract:
+                    failures.append(
+                        "MAMS result does not distinguish package calibration from "
+                        "approximation or reports inconsistent efficacy boundaries"
+                    )
+
+            if family == "platform":
+                # A run that uses one analysis method reports a length-1 vector,
+                # which the dispatcher unboxes to a bare string.
+                actual_methods = _r_vector(inner, "actual_analysis_methods")
+                # Only hashable strings enter the set: a malformed payload such
+                # as [{}] must fail the contract below, not raise before this
+                # check can return a verdict.
+                actual_methods_valid = (
+                    isinstance(actual_methods, list) and bool(actual_methods)
+                    and all(isinstance(method, str) and bool(method.strip())
+                            for method in actual_methods)
+                )
+                declared_methods = (
+                    set(actual_methods) if actual_methods_valid else set()
+                )
+                actual_methods_valid = (
+                    actual_methods_valid
+                    and len(declared_methods) == len(actual_methods)
+                )
+                # Each arm reports the ";"-joined set of methods it actually
+                # used, and the declared list is the union of those sets over
+                # every arm and period. Requiring exact set equality rejects both
+                # a declared method no arm ran and an arm method never declared.
+                arm_rows = inner.get("arm_results")
+                per_arm_methods = (
+                    [row.get("actual_analysis_method") for row in arm_rows
+                     if isinstance(row, dict)]
+                    if isinstance(arm_rows, list) else []
+                )
+                arm_tokens: set[str] = set()
+                arm_labels_valid = bool(per_arm_methods)
+                for method in per_arm_methods:
+                    if not isinstance(method, str) or not method.strip():
+                        arm_labels_valid = False
+                        continue
+                    tokens = method.split(";")
+                    if (not all(token.strip() == token and token for token in tokens)
+                            or len(set(tokens)) != len(tokens)):
+                        arm_labels_valid = False
+                        continue
+                    arm_tokens.update(tokens)
+                methods_reconciled = arm_labels_valid and arm_tokens == declared_methods
+                platform_contract = (
+                    isinstance(inner.get("interim_futility_enabled"), bool)
+                    and inner.get("interim_efficacy_enabled") is False
+                    and inner.get("interim_stopping_applied")
+                    == inner.get("interim_futility_enabled")
+                    and isinstance(inner.get("interim_stopping_reason"), str)
+                    and bool(inner.get("interim_stopping_reason"))
+                    and actual_methods_valid
+                    and methods_reconciled
+                )
+                requested = (config or {}).get("ncc_method")
+                if requested is not None:
+                    platform_contract = platform_contract and inner.get(
+                        "requested_ncc_method"
+                    ) == requested
+                checks["platform_actual_behavior_declared"] = platform_contract
+                if not platform_contract:
+                    failures.append(
+                        "platform result does not accurately declare enabled interim "
+                        "behavior and actual analysis methods"
+                    )
     output_dir = result.get("output_dir") if isinstance(result, dict) else None
     output_path = Path(output_dir) if isinstance(output_dir, str) and output_dir else None
     directory_fd: int | None = None
@@ -688,7 +975,6 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
     if not checks["output_dir_persists"]:
         failures.append("master_simulate output_dir is missing or does not persist")
     else:
-        family = (config or {}).get("master_design_type")
         expected_by_family = {
             "basket": ["basket_oc_table.csv", "basket_fwer.csv",
                        "basket_subgroup_decisions.csv", "basket_oc_curves.pdf"],
@@ -702,12 +988,22 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
             failures.append(f"unknown or missing master_design_type: {family!r}")
             expected = []
         required_headers = {
-            "basket_oc_table.csv": {"subgroup", "null_param", "alt_param", "reject_rate"},
-            "basket_fwer.csv": {"scenario", "fwer"},
+            "basket_oc_table.csv": {"subgroup", "null_param", "alt_param", "reject_rate",
+                                    "reject_mcse_pct", "reject_ci_lower_pct",
+                                    "reject_ci_upper_pct", "reject_precision_met"},
+            "basket_fwer.csv": {"scenario", "fwer", "fwer_mcse_pct",
+                                "fwer_ci_lower_pct", "fwer_ci_upper_pct",
+                                "precision_met", "n_simulations"},
             "basket_subgroup_decisions.csv": {"subgroup", "decision"},
-            "umbrella_power_table.csv": {"arm", "per_arm_power"},
-            "platform_arm_results.csv": {"arm", "reject_rate", "mean_n"},
-            "platform_oc_table.csv": {"metric", "value"},
+            "umbrella_power_table.csv": {"arm", "per_arm_power", "power_mcse_pct",
+                                         "power_ci_lower_pct", "power_ci_upper_pct",
+                                         "power_precision_met"},
+            "platform_arm_results.csv": {"arm", "reject_rate", "mean_n",
+                                         "requested_ncc_method", "actual_analysis_method",
+                                         "reject_mcse_pct", "reject_ci_lower_pct",
+                                         "reject_ci_upper_pct", "reject_precision_met"},
+            "platform_oc_table.csv": {"metric", "value", "mcse", "ci_lower",
+                                      "ci_upper", "precision_met", "n_simulations"},
         }
         result_table_by_file = {
             "basket_oc_table.csv": "oc_table",
@@ -762,7 +1058,8 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
                             )
         finally:
             os.close(directory_fd)
-    return GateVerdict(passed=not failures, checks=checks, failures=failures)
+    return GateVerdict(passed=not failures, checks=checks, failures=failures,
+                       blocked=blocked)
 
 
 def _csv_row_matches_result(csv_row: dict[str, str], result_row: Any) -> bool:
@@ -820,6 +1117,25 @@ def check_master_config_reserved(config: dict) -> GateVerdict:
         checks["overdispersion_supported"] = False
         failures.append("overdispersion is reserved (future negbin) and read by "
                         "no engine — omit it")
+    if config.get("effect_threshold") is not None:
+        checks["effect_threshold_supported"] = False
+        failures.append(
+            "effect_threshold is not implemented — platform interim efficacy "
+            "stopping is disabled until a calibrated multiplicity procedure exists"
+        )
+    if config.get("master_design_type") == "platform":
+        endpoint = config.get("endpoint_type")
+        ncc_method = config.get("ncc_method", "regression")
+        interim_supported = endpoint in {"binary", "continuous"} and ncc_method == "none"
+        if not interim_supported and any(
+            config.get(key) is not None
+            for key in ("interim_frequency", "futility_threshold")
+        ):
+            checks["platform_interim_settings_supported"] = False
+            failures.append(
+                "interim_frequency/futility_threshold are unavailable for this "
+                "endpoint and NCC method because no consistent interim model is implemented"
+            )
     endpoint = config.get("endpoint_type")
     nulls = config.get("null_params")
     alts = config.get("alt_params")
@@ -1051,6 +1367,47 @@ def check_meta(result: dict, args: dict) -> GateVerdict:
         return GateVerdict(passed=False, checks={"no_tool_error": False},
                            failures=[f"tool returned error: {result['error']}"])
 
+    effect_measure = result.get("effect_measure")
+    measure_present = isinstance(effect_measure, str) and bool(effect_measure.strip())
+    checks["effect_measure_present"] = measure_present
+    if not measure_present:
+        failures.append("meta output missing the common effect_measure")
+
+    study_measures = result.get("study_effect_measures")
+    if isinstance(study_measures, list):
+        used_measures = {m for m in study_measures
+                         if isinstance(m, str) and m.strip()}
+        common_scale = len(used_measures) == 1 and effect_measure in used_measures
+        checks["study_measures_commensurate"] = common_scale
+        if not common_scale:
+            failures.append(
+                "per-study effect measures are mixed or disagree with effect_measure: "
+                + ", ".join(sorted(used_measures))
+            )
+
+    requested_studies = (args or {}).get("studies")
+    if isinstance(requested_studies, list):
+        requested_measures = {
+            row.get("measure") for row in requested_studies
+            if isinstance(row, dict) and isinstance(row.get("measure"), str)
+            and row.get("measure").strip()
+        }
+        if len(requested_measures) > 1:
+            checks["requested_measures_commensurate"] = False
+            failures.append(
+                "request contains mixed per-study effect measures: "
+                + ", ".join(sorted(requested_measures))
+            )
+        elif len(requested_measures) == 1 and measure_present:
+            expected = next(iter(requested_measures))
+            agrees = effect_measure == expected
+            checks["effect_measure_matches_request"] = agrees
+            if not agrees:
+                failures.append(
+                    f"reported effect_measure={effect_measure!r} does not match "
+                    f"requested measure={expected!r}"
+                )
+
     est, se = result.get("estimate"), result.get("se")
     lo, hi = result.get("lower"), result.get("upper")
     if all(_num(v) for v in (est, se, lo, hi)):
@@ -1189,7 +1546,9 @@ def _factor_columns(rows: list[dict]) -> list[str]:
     if not rows:
         return []
     return [k for k in rows[0]
-            if k not in ("point_type", "run", "std_order") and _num(rows[0].get(k))]
+            if isinstance(k, str)
+            and k not in ("point_type", "run", "std_order")
+            and _num(rows[0].get(k))]
 
 
 def check_factorial(result: dict, args: dict) -> GateVerdict:
@@ -1204,37 +1563,246 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
     if result.get("error"):
         return GateVerdict(passed=False, checks={"no_tool_error": False},
                            failures=[f"tool returned error: {result['error']}"])
-    rows = _design_rows(result.get("design"))
+    raw_design = result.get("design")
+    design_rows_valid = (
+        isinstance(raw_design, list) and bool(raw_design)
+        and all(isinstance(row, dict) for row in raw_design)
+    )
+    checks["design_rows_are_objects"] = design_rows_valid
+    if not design_rows_valid:
+        failures.append("factorial design must be a nonempty list of row objects")
+    rows = _design_rows(raw_design)
     n_runs = result.get("n_runs")
-    checks["design_present"] = bool(rows) and _num(n_runs)
+    n_runs_valid = (
+        _num(n_runs) and int(n_runs) == n_runs and n_runs >= 1
+    )
+    checks["design_present"] = design_rows_valid and n_runs_valid
     if not checks["design_present"]:
         failures.append("factorial design matrix or n_runs is missing")
-    if _num(n_runs) and rows:
-        checks["n_runs_matches_design"] = len(rows) == n_runs
-        if len(rows) != n_runs:
-            failures.append(f"n_runs={n_runs} but design has {len(rows)} rows")
+    if n_runs_valid and isinstance(raw_design, list):
+        checks["n_runs_matches_design"] = len(raw_design) == n_runs
+        if len(raw_design) != n_runs:
+            failures.append(f"n_runs={n_runs} but design has {len(raw_design)} rows")
+    design_type = result.get("type")
+    supported_type = design_type in {"full_factorial", "fractional_factorial"}
+    checks["factorial_type_supported"] = supported_type
+    if not supported_type:
+        failures.append(f"factorial output has unsupported or missing type={design_type!r}")
+
     cols = _factor_columns(rows)
-    if result.get("type") == "full_factorial" and rows and cols:
-        levels = result.get("levels")
-        if not (isinstance(levels, list) and len(levels) == len(cols)
-                and all(_num(value) and int(value) == value and value >= 2 for value in levels)):
+    raw_n_factors = result.get("n_factors")
+    n_factors_valid = (
+        _num(raw_n_factors) and int(raw_n_factors) == raw_n_factors
+        and raw_n_factors >= 1 and int(raw_n_factors) == len(cols)
+    )
+    checks["factor_columns_match_n_factors"] = n_factors_valid
+    if not n_factors_valid:
+        failures.append("factorial output has invalid or inconsistent factor columns")
+
+    raw_requested_n_factors = (args or {}).get("n_factors")
+    requested_n_factors = (
+        int(raw_requested_n_factors)
+        if _num(raw_requested_n_factors)
+        and int(raw_requested_n_factors) == raw_requested_n_factors
+        and raw_requested_n_factors >= 1 else None
+    )
+    n_factors_match_request = (
+        n_factors_valid and requested_n_factors is not None
+        and int(raw_n_factors) == requested_n_factors
+    )
+    checks["factorial_n_factors_matches_request"] = n_factors_match_request
+    if not n_factors_match_request:
+        failures.append(
+            "factorial output n_factors does not match the requested n_factors"
+        )
+
+    raw_requested_levels = (args or {}).get("levels", 2)
+    requested_levels: list[int] | None = None
+    if requested_n_factors is not None:
+        if (_num(raw_requested_levels)
+                and int(raw_requested_levels) == raw_requested_levels
+                and raw_requested_levels >= 2):
+            requested_levels = [int(raw_requested_levels)] * requested_n_factors
+        elif (isinstance(raw_requested_levels, list)
+              and len(raw_requested_levels) in {1, requested_n_factors}
+              and all(_num(value) and int(value) == value and value >= 2
+                      for value in raw_requested_levels)):
+            normalized = (
+                raw_requested_levels * requested_n_factors
+                if len(raw_requested_levels) == 1 else raw_requested_levels
+            )
+            requested_levels = [int(value) for value in normalized]
+
+    raw_requested_replicates = (args or {}).get("replicates", 1)
+    requested_replicates = (
+        int(raw_requested_replicates)
+        if _num(raw_requested_replicates)
+        and int(raw_requested_replicates) == raw_requested_replicates
+        and raw_requested_replicates >= 1 else None
+    )
+
+    metadata_columns = {"point_type", "run", "std_order"}
+    factor_shape_valid = design_rows_valid and bool(cols) and all(
+        all(isinstance(key, str) for key in row)
+        and
+        {
+            key for key in row
+            if isinstance(key, str) and key not in metadata_columns
+        } == set(cols)
+        and all(_num(row.get(column)) for column in cols)
+        for row in rows
+    )
+    checks["factor_matrix_numeric_and_rectangular"] = factor_shape_valid
+    if not factor_shape_valid:
+        failures.append(
+            "factorial design matrix has missing, extra, or nonnumeric factor values"
+        )
+
+    if design_type == "full_factorial" and rows and n_factors_valid and factor_shape_valid:
+        raw_levels = result.get("levels")
+        # jsonlite auto-unboxes the one-factor R vector. Scalar output is valid
+        # only for that exact shape; every multi-factor result must retain one
+        # level count per discovered factor column.
+        levels = [raw_levels] if len(cols) == 1 and _num(raw_levels) else raw_levels
+        levels_valid = (
+            isinstance(levels, list) and len(levels) == len(cols)
+            and all(_num(value) and int(value) == value and value >= 2
+                    for value in levels)
+        )
+        checks["full_factorial_levels_valid"] = levels_valid
+        if not levels_valid:
             failures.append("full factorial output has invalid level counts")
         else:
-            centers = int((args or {}).get("center_points") or 0)
-            replicates = int(result.get("replicates") or 1)
-            base_rows = rows[:-centers] if centers else rows
-            expected_base = math.prod(int(value) for value in levels) * replicates
-            checks["full_factorial_run_count"] = len(base_rows) == expected_base
-            if len(base_rows) != expected_base:
-                failures.append(f"full factorial has {len(base_rows)} base rows; expected {expected_base}")
-            distinct_ok = all(
-                len({row.get(column) for row in base_rows}) == int(levels[index])
-                for index, column in enumerate(cols)
+            level_counts = [int(value) for value in levels]
+            levels_match_request = (
+                requested_levels is not None
+                and level_counts == requested_levels
             )
-            checks["factor_level_counts_match"] = distinct_ok
-            if not distinct_ok:
-                failures.append("factor columns do not contain the declared number of levels")
-    two_level = rows and cols and all(
+            checks["full_factorial_levels_match_request"] = levels_match_request
+            if not levels_match_request:
+                failures.append(
+                    "full factorial output levels do not match the effective "
+                    "requested levels"
+                )
+            raw_centers = (args or {}).get("center_points", 0)
+            raw_replicates = result.get("replicates")
+            centers_valid = (
+                _num(raw_centers) and int(raw_centers) == raw_centers
+                and raw_centers >= 0
+            )
+            replicates_valid = (
+                _num(raw_replicates) and int(raw_replicates) == raw_replicates
+                and raw_replicates >= 1
+            )
+            replicates_match_request = (
+                replicates_valid and requested_replicates is not None
+                and int(raw_replicates) == requested_replicates
+            )
+            checks["center_count_valid"] = centers_valid
+            checks["replicates_valid"] = replicates_valid
+            checks["full_factorial_replicates_match_request"] = (
+                replicates_match_request
+            )
+            if not centers_valid:
+                failures.append("center_points must be a nonnegative integer")
+            if not replicates_valid:
+                failures.append("full factorial output has invalid replicates")
+            elif not replicates_match_request:
+                failures.append(
+                    "full factorial output replicates do not match the effective "
+                    "requested replicates"
+                )
+
+            if centers_valid and replicates_valid:
+                centers = int(raw_centers)
+                replicates = int(raw_replicates)
+                # The engine appends centers and may then shuffle every run. Find
+                # them by coordinates, never position. For an odd-level grid the
+                # same midpoint legitimately occurs once per replicate, so remove
+                # exactly the requested number of indistinguishable added rows
+                # while retaining those base-grid occurrences.
+                center_vector = (
+                    [0] * len(cols) if all(value == 2 for value in level_counts)
+                    else [(value + 1) / 2 for value in level_counts]
+                )
+
+                def is_center(row: dict) -> bool:
+                    return all(
+                        _num(row.get(column))
+                        and _numbers_close(row[column], center_vector[index], 0)
+                        for index, column in enumerate(cols)
+                    )
+
+                center_matches = sum(is_center(row) for row in rows)
+                natural_midpoints = (
+                    replicates if all(value % 2 == 1 for value in level_counts)
+                    else 0
+                )
+                centers_match = center_matches == centers + natural_midpoints
+                checks["center_rows_match_request"] = centers_match
+                if not centers_match:
+                    failures.append(
+                        "factorial design does not contain exactly the requested "
+                        "number of center rows"
+                    )
+
+                remaining_centers = centers
+                base_rows: list[dict] = []
+                for row in rows:
+                    if remaining_centers and is_center(row):
+                        remaining_centers -= 1
+                    else:
+                        base_rows.append(row)
+
+                expected_base = math.prod(level_counts) * replicates
+                run_count_ok = (
+                    remaining_centers == 0 and len(base_rows) == expected_base
+                )
+                checks["full_factorial_run_count"] = run_count_ok
+                if not run_count_ok:
+                    failures.append(
+                        f"full factorial has {len(base_rows)} base rows; "
+                        f"expected {expected_base}"
+                    )
+
+                numeric_rows = all(
+                    all(_num(row.get(column)) for column in cols)
+                    for row in base_rows
+                )
+                distinct_ok = numeric_rows and all(
+                    len({row[column] for row in base_rows}) == level_counts[index]
+                    for index, column in enumerate(cols)
+                )
+                checks["factor_level_counts_match"] = distinct_ok
+                if not distinct_ok:
+                    failures.append(
+                        "factor columns do not contain the declared number of levels"
+                    )
+
+                # Validate the complete replicated grid, not only its marginal
+                # level counts. This also catches a forged extra midpoint paired
+                # with a missing non-center run.
+                if all(value == 2 for value in level_counts):
+                    expected_values = [(-1, 1) for _ in level_counts]
+                else:
+                    expected_values = [range(1, value + 1) for value in level_counts]
+                if run_count_ok and numeric_rows:
+                    expected_grid = Counter({
+                        tuple(combination): replicates
+                        for combination in product(*expected_values)
+                    })
+                    actual_grid = Counter(
+                        tuple(row[column] for column in cols) for row in base_rows
+                    )
+                    grid_complete = actual_grid == expected_grid
+                else:
+                    grid_complete = False
+                checks["full_factorial_grid_complete"] = grid_complete
+                if not grid_complete:
+                    failures.append(
+                        "factorial rows do not form the declared replicated full grid"
+                    )
+    two_level = factor_shape_valid and all(
         r.get(c) in (-1, 0, 1) for r in rows for c in cols)
     if two_level and len(cols) >= 2:
         ortho = True
@@ -1249,17 +1817,197 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
     elif rows:
         blocked.append("orthogonality not checked (not a ±1-coded 2-level design)")
     res = result.get("resolution")
-    words = result.get("defining_relation")
-    if _num(res) and isinstance(words, list) and words:
-        min_word = min(len(str(w)) for w in words)
-        checks["resolution_matches_relation"] = min_word == res
-        if min_word != res:
-            failures.append(f"resolution {res} != shortest defining word length "
-                            f"{min_word}")
-    if (int((args or {}).get("fraction") or 0) > 0 or
-            result.get("type") == "fractional_factorial") and not (
-            _num(res) and isinstance(words, list) and words):
-        failures.append("fractional factorial output missing resolution/defining_relation")
+    raw_fraction = (args or {}).get("fraction")
+    requested_fraction = (
+        int(raw_fraction)
+        if _num(raw_fraction) and int(raw_fraction) == raw_fraction
+        and raw_fraction > 0 else None
+    )
+    is_fractional = (
+        design_type == "fractional_factorial" or requested_fraction is not None
+    )
+
+    # A half fraction (p=1) has exactly one defining word, which the dispatcher
+    # unboxes to a bare string. Every word must still be a real relation over
+    # this design's own factor letters: comparing len(str(value)) alone would
+    # accept null, true, or 1000 as a four-character "word".
+    words = _r_vector(result, "defining_relation")
+    factor_letters = set(cols)
+    words_well_formed = isinstance(words, list) and bool(words) and all(
+        isinstance(word, str) and word == word.strip() and len(word) >= 2
+        and len(set(word)) == len(word)
+        and set(word) <= factor_letters
+        for word in words
+    )
+    word_sets = (
+        [frozenset(word) for word in words] if words_well_formed else []
+    )
+    words_well_formed = (
+        words_well_formed and len(set(word_sets)) == len(word_sets)
+    )
+
+    if is_fractional:
+        fraction_valid = (
+            design_type == "fractional_factorial"
+            and n_factors_match_request
+            and requested_fraction is not None
+            and requested_fraction < len(cols)
+        )
+        checks["fractional_fraction_valid"] = fraction_valid
+        if not fraction_valid:
+            failures.append(
+                "fractional factorial output requires an exact requested fraction "
+                "p with 1 <= p < n_factors"
+            )
+
+        fractional_levels_match = (
+            requested_levels is not None
+            and len(requested_levels) == len(cols)
+            and all(value == 2 for value in requested_levels)
+        )
+        checks["fractional_levels_match_request"] = fractional_levels_match
+        if not fractional_levels_match:
+            failures.append(
+                "fractional factorial requires exactly two requested levels per factor"
+            )
+
+        raw_result_replicates = result.get("replicates")
+        result_replicates = (
+            int(raw_result_replicates)
+            if _num(raw_result_replicates)
+            and int(raw_result_replicates) == raw_result_replicates
+            and raw_result_replicates >= 1 else None
+        )
+        fractional_replicates_match = (
+            result_replicates is not None and requested_replicates is not None
+            and result_replicates == requested_replicates
+        )
+        checks["fractional_replicates_match_request"] = (
+            fractional_replicates_match
+        )
+        if not fractional_replicates_match:
+            failures.append(
+                "fractional factorial output replicates do not match the effective "
+                "requested replicates"
+            )
+
+        raw_centers = (args or {}).get("center_points", 0)
+        centers_valid = (
+            _num(raw_centers) and int(raw_centers) == raw_centers
+            and raw_centers >= 0
+        )
+        checks["fractional_center_count_valid"] = centers_valid
+        if not centers_valid:
+            failures.append("fractional center_points must be a nonnegative integer")
+
+        # A regular fractional design contains only ±1 base runs plus the exact
+        # number of all-zero center rows requested by the caller. Mixed zero/±1
+        # rows are neither and must not disappear from the count.
+        fractional_rows_coded = factor_shape_valid and all(
+            all(row[column] in (-1, 1) for column in cols)
+            or all(row[column] == 0 for column in cols)
+            for row in rows
+        )
+        checks["fractional_rows_are_base_or_center"] = fractional_rows_coded
+        if not fractional_rows_coded:
+            failures.append(
+                "fractional factorial rows must be all ±1 base runs or all-zero centers"
+            )
+        base_rows = [
+            row for row in rows
+            if all(row.get(column) in (-1, 1) for column in cols)
+        ] if fractional_rows_coded else []
+        center_rows = [
+            row for row in rows
+            if all(row.get(column) == 0 for column in cols)
+        ] if fractional_rows_coded else []
+
+        runs_match = False
+        centers_match = False
+        if (fraction_valid and centers_valid and fractional_rows_coded
+                and fractional_levels_match and fractional_replicates_match):
+            expected_unique_runs = 2 ** (len(cols) - requested_fraction)
+            base_run_counts = Counter(
+                tuple(row[column] for column in cols) for row in base_rows
+            )
+            runs_match = (
+                len(base_run_counts) == expected_unique_runs
+                and len(base_rows) == expected_unique_runs * requested_replicates
+                and all(count == requested_replicates
+                        for count in base_run_counts.values())
+            )
+            centers_match = len(center_rows) == int(raw_centers)
+        checks["fractional_run_count_matches_fraction"] = runs_match
+        checks["fractional_center_rows_match_request"] = centers_match
+        if not runs_match:
+            failures.append(
+                "fractional factorial does not contain the exact 2^(k-p) base-run "
+                "set with the requested replicate multiplicity"
+            )
+        if not centers_match:
+            failures.append(
+                "fractional factorial does not contain exactly the requested "
+                "number of all-zero center rows"
+            )
+
+        checks["defining_relation_well_formed"] = words_well_formed
+        if not words_well_formed:
+            failures.append(
+                "fractional factorial defining relation must list unique, "
+                "non-repeating words of two or more of this design's factor letters"
+            )
+
+        expected_words = (
+            2 ** requested_fraction - 1 if fraction_valid else None
+        )
+        cardinality_ok = (
+            words_well_formed and expected_words is not None
+            and len(word_sets) == expected_words
+        )
+        checks["defining_relation_cardinality"] = cardinality_ok
+        if not cardinality_ok:
+            failures.append(
+                "fractional factorial defining relation must list exactly "
+                "2^p - 1 non-identity words"
+            )
+
+        relation_with_identity = set(word_sets) | {frozenset()}
+        group_closed = cardinality_ok and all(
+            left.symmetric_difference(right) in relation_with_identity
+            for left in relation_with_identity for right in relation_with_identity
+        )
+        checks["defining_relation_group_closed"] = group_closed
+        if not group_closed:
+            failures.append(
+                "fractional factorial defining relation is not closed under "
+                "symmetric difference"
+            )
+
+        # Well-formed names and closure prove nothing about this matrix. Every
+        # reported relation word must multiply to +1 on every non-center run.
+        relation_holds = (
+            words_well_formed and runs_match and bool(base_rows)
+            and all(
+                math.prod(row[letter] for letter in word) == 1
+                for word in words for row in base_rows
+            )
+        )
+        checks["defining_relation_holds_in_design"] = relation_holds
+        if not relation_holds:
+            failures.append(
+                "defining relation does not hold in the design matrix: a "
+                "reported word's column product is not +1 on every base run"
+            )
+
+        resolution_valid = _num(res) and words_well_formed
+        checks["resolution_matches_relation"] = bool(
+            resolution_valid and min(len(word) for word in words) == res
+        )
+        if not checks["resolution_matches_relation"]:
+            failures.append(
+                "fractional factorial resolution is missing or does not equal "
+                "the shortest defining word"
+            )
     return GateVerdict(passed=not failures, checks=checks, failures=failures,
                        blocked=blocked)
 
@@ -1342,11 +2090,11 @@ def check_rsm(result: dict, args: dict) -> GateVerdict:
 def design_checks_for(tool_name: str, args: dict, result: dict) -> list[GateVerdict]:
     """Cheap, deterministic per-tool design checks — no run_tests, no re-run.
 
-    SINGLE SOURCE of the tool→check mapping, shared by the Python harness
-    (harness._design_checks), the SubagentStop hook, and the Streamlit direct
-    form — so no runtime silently applies weaker checks than another.
-    Expensive checks (regression suite, same-seed reproducibility) are layered
-    on top by the harness only."""
+    This is the single raw-result tool→check mapping used by the private server
+    verifier. Other surfaces intentionally cannot see the raw payload: they
+    validate the server-bound public projection and check attestation, then add
+    fresh regression evidence before presenting a result.
+    """
     args = args or {}
     verdicts = [check_output_contract(result if isinstance(result, dict) else {})]
     if tool_name == "simulate_design":

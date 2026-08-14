@@ -17,7 +17,8 @@ from gates import (GateVerdict, MANUAL_CHECKS, check_regression_tests,
                    combined_gate, design_checks_for)  # noqa: E402
 from harness import ExperimentDesignHarness, SAFE_FAILURE_MESSAGE  # noqa: E402
 from verification import (VerificationIdentity, content_hash,
-                          envelope_from_verdict, public_failure_codes)  # noqa: E402
+                          envelope_from_verdict, public_arguments_hash,
+                          public_failure_codes)  # noqa: E402
 
 
 RT_OK = {
@@ -73,6 +74,8 @@ class FakeMCP:
         if name in {"run_tests", "validate_config"}:
             return result
         raw = dict(result)
+        if raw.pop("_test_passthrough", False):
+            return raw
         private_resources = list(raw.pop("_test_private_resources", []))
         artifact_hashes = dict(raw.pop("_test_artifact_hashes", {}))
         public_provenance = {
@@ -112,7 +115,16 @@ class FakeMCP:
             envelope_data["blocked"] = []
             envelope_data["notes"] = []
             payload = {"error": "Result withheld because server-side verification failed."}
-        envelope_data["identity"].pop("result_hash", None)
+        # Match the real server boundary: canonical rendering uses the private
+        # identity above, while only an allowlisted argument commitment crosses
+        # into the model-visible response.
+        envelope_data["identity"] = {
+            "analysis_id": identity.analysis_id,
+            "call_id": identity.call_id,
+            "tool": identity.tool,
+            "public_args_hash": public_arguments_hash(name, arguments),
+            "provenance_hash": identity.provenance_hash,
+        }
         payload["_verification"] = envelope_data
         payload["_provenance"] = public_provenance
         payload["_private_provenance"] = {
@@ -191,6 +203,22 @@ check("structured_clarification_is_allowed",
       result.final_answer.startswith("CLARIFICATION_REQUEST") and not calls,
       result.final_answer)
 
+configuration_report = "# Resolved configuration\n\n- alpha convention: one-sided"
+events, result, calls = run_case(
+    [response(tool("validate", "validate_config", GOOD_ARGS)),
+     response(text("I would otherwise restate the defaults here."))],
+    {"validate_config": {
+        "valid": True,
+        "resolved_config": {"alpha": 0.05},
+        "configuration_report": configuration_report,
+    }},
+)
+check("validate_only_turn_returns_exact_configuration_report",
+      result.final_answer == configuration_report
+      and result.stopped == "end_turn"
+      and not result.gate_verdicts,
+      result)
+
 for label, unsafe_question in (
     ("numeric_question", "What does n_total=30 mean?"),
     ("identifier_question", "Which arm should unit 1 at SITE-ALPHA receive?"),
@@ -239,13 +267,34 @@ check("failure_answer_is_exact_value_free_contract",
 
 
 events, result, calls = run_case(
+    [response(tool("malformed", "sample_size", GOOD_ARGS))],
+    {"sample_size": {
+        "_test_passthrough": True,
+        "secret_result": 999,
+        "_verification": {"presentable": True, "identity": "not-an-object"},
+    }, "run_tests": RT_OK},
+)
+check("malformed_server_envelope_returns_exact_safe_failure",
+      result.final_answer == SAFE_FAILURE_MESSAGE
+      and result.stopped == "verify_failed"
+      and not any(event.get("event") == "error" for event in events),
+      (events, result))
+check("malformed_server_envelope_payload_is_never_emitted",
+      "999" not in str(events)
+      and any(event.get("event") == "tool_result_withheld" for event in events)
+      and any(event.get("event") == "gate"
+              and event.get("verdict") == "INTERNAL_ERROR" for event in events),
+      events)
+
+
+events, result, calls = run_case(
     [response(tool("bad", "sample_size", BAD_ARGS)),
      response(tool("good", "sample_size", GOOD_ARGS)),
      response(text("Verified answer is ready."))],
     {"sample_size": SS_RESULT, "run_tests": RT_OK},
 )
 check("same_analysis_correction_clears_failure",
-      result.stopped == "end_turn" and "# Verified experiment-design result" in result.final_answer
+      result.stopped == "end_turn" and "# Partially verified experiment-design result" in result.final_answer
       and "Verified answer is ready." not in result.final_answer,
       result)
 check("only_corrected_result_is_presentable",
@@ -350,7 +399,7 @@ with tempfile.TemporaryDirectory() as directory:
     executed = [name for name, _args in harness.mcp.calls if name == "sample_size"]
     check("new_turn_does_not_inherit_unrelated_retry_lineage",
           first.final_answer == SAFE_FAILURE_MESSAGE
-          and "# Verified experiment-design result" in second.final_answer
+          and "# Partially verified experiment-design result" in second.final_answer
           and len(executed) == 3,
           (first, second, harness.mcp.calls))
 
@@ -367,7 +416,7 @@ with tempfile.TemporaryDirectory() as directory:
     first = finish(harness.run("first turn"))
     second = finish(harness.run("summarize the result"))
     check("cross_turn_numeric_prose_is_withheld",
-          "# Verified experiment-design result" in first.final_answer
+          "# Partially verified experiment-design result" in first.final_answer
           and second.final_answer == SAFE_FAILURE_MESSAGE
           and "999" not in second.final_answer,
           (first, second))

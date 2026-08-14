@@ -1,13 +1,16 @@
 {
   "name": "experiment-design-mcp",
   "version": "1.1.0",
+  "private": true,
   "description": "MCP server wrapping the Experiment Design R framework",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test:lifecycle": "npm run build && node tests/lifecycle.mjs"
+    "prepublishOnly": "node scripts/block-publish.mjs",
+    "test:private": "node tests/private-package.mjs",
+    "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

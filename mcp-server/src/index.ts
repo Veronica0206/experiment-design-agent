@@ -2,25 +2,36 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import {
+  constants as fsConstants,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { callR } from "./r-bridge.js";
+import { callR, shutdownActiveRProcesses } from "./r-bridge.js";
 import {
   hashArtifactsForProvenance,
   publishVerifiedArtifacts,
 } from "./artifact-publication.js";
 import { readBoundedFile } from "./bounded-read.js";
-import { preverify, type VerificationEnvelope } from "./verifier.js";
+import {
+  preverify,
+  shutdownActiveVerifierProcesses,
+  type VerificationEnvelope,
+} from "./verifier.js";
 import { publicRegressionStatus, publicValidatedConfig } from "./public-projection.js";
 import {
   currentPythonRuntimeSnapshot,
   currentRRuntimeSnapshot,
   FingerprintPromiseCache,
+  fingerprintMutableEngineRuntime,
   hashFramedFields,
-  mutableEngineFiles,
+  shutdownActiveRuntimeProbeProcesses,
   waitForSharedPromise,
   type PythonRuntimeSnapshot,
   type RRuntimeSnapshot,
@@ -31,12 +42,16 @@ import {
   createManagedArtifactDir,
   releaseManagedArtifactDir,
 } from "./artifacts.js";
+import { PINNED_RUNTIME_SUPERVISOR_COMMITMENT } from "./runtime-supervisor.js";
 
 const SERVER_VERSION = "1.1.0";
 const PRIVATE_PROVENANCE_META_KEY = "experiment-design/private-provenance";
 const PRIVATE_ARTIFACT_META_KEY = "experiment-design/private-artifact";
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const SUITE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+const MCP_ROOT = join(SUITE_ROOT, "mcp-server");
+const MAX_STARTUP_DEPENDENCY_FILES = 20_000;
+const MAX_STARTUP_DEPENDENCY_BYTES = 256 * 1024 * 1024;
 const READ_ROOTS = (process.env.EXPDESIGN_ALLOWED_READ_ROOTS ?? SUITE_ROOT)
   .split(delimiter)
   .filter(Boolean)
@@ -59,24 +74,142 @@ function flatFiles(root: string, suffix: string): string[] {
   }
 }
 
+type FingerprintBudget = {
+  files: number;
+  bytes: number;
+  maxFiles: number;
+  maxBytes: number;
+};
+
+function regularTreeFiles(
+  root: string,
+  seen = new Set<string>(),
+  budget?: FingerprintBudget,
+): string[] {
+  const canonical = realpathSync(root);
+  if (seen.has(canonical)) return [];
+  const info = statSync(canonical);
+  seen.add(canonical);
+  if (info.isFile()) {
+    if (budget) {
+      budget.files += 1;
+      budget.bytes += info.size;
+      if (budget.files > budget.maxFiles || budget.bytes > budget.maxBytes) {
+        throw new Error("installed production dependency closure exceeds fingerprint limits");
+      }
+    }
+    return [canonical];
+  }
+  if (!info.isDirectory()) return [];
+  return readdirSync(canonical).flatMap((name) =>
+    regularTreeFiles(join(canonical, name), seen, budget));
+}
+
+/** Resolve every installed, non-dev package represented in an npm v3 lock. */
+export function installedProductionDependencyRoots(
+  packageRoot: string,
+  lockPath = join(packageRoot, "package-lock.json"),
+): string[] {
+  const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+    packages?: Record<string, { dev?: boolean; optional?: boolean }>;
+  };
+  if (!lock.packages || typeof lock.packages !== "object") {
+    throw new Error("package-lock.json lacks an installed package graph");
+  }
+  const modulesRoot = resolve(packageRoot, "node_modules");
+  const roots: string[] = [];
+  for (const [lockedPath, metadata] of Object.entries(lock.packages).sort()) {
+    if (!lockedPath.startsWith("node_modules/") || metadata?.dev === true) continue;
+    const candidate = resolve(packageRoot, lockedPath);
+    if (candidate !== modulesRoot && !candidate.startsWith(`${modulesRoot}${sep}`)) {
+      throw new Error("package-lock.json contains an invalid installed package path");
+    }
+    try {
+      roots.push(realpathSync(candidate));
+    } catch (error) {
+      if (metadata?.optional === true) continue;
+      throw new Error(`required production dependency is not installed: ${lockedPath}`, {
+        cause: error,
+      });
+    }
+  }
+  return [...new Set(roots)].sort();
+}
+
+export function fingerprintStartupRuntime(
+  nodeExecutable: string,
+  runtimeFiles: string[],
+  dependencyRoots: string[],
+  runtimeVersion = process.version,
+  limits: { maxFiles?: number; maxBytes?: number } = {},
+  pinnedRuntimeCommitments: readonly string[] = [],
+): string {
+  for (const commitment of pinnedRuntimeCommitments) {
+    if (!SHA256_HEX.test(commitment)) {
+      throw new Error("pinned startup runtime commitment is malformed");
+    }
+  }
+  const seen = new Set<string>();
+  const budget: FingerprintBudget = {
+    files: 0,
+    bytes: 0,
+    maxFiles: limits.maxFiles ?? MAX_STARTUP_DEPENDENCY_FILES,
+    maxBytes: limits.maxBytes ?? MAX_STARTUP_DEPENDENCY_BYTES,
+  };
+  const seed = hashFramedFields([
+    "experiment-design/startup-runtime-fingerprint/v2",
+    ...pinnedRuntimeCommitments.flatMap((commitment, index) => [
+      `pinned-runtime-${index}`,
+      commitment,
+    ]),
+  ], runtimeVersion);
+  return hashFiles([
+    realpathSync(nodeExecutable),
+    ...runtimeFiles,
+    ...dependencyRoots.flatMap((root) => regularTreeFiles(root, seen, budget)),
+  ], seed);
+}
+
 // JavaScript modules and dependency declarations are loaded at process start;
 // preserve the fingerprint of those exact startup bytes even if files change.
-const STARTUP_RUNTIME_FINGERPRINT = hashFiles([
-  ...flatFiles(join(SUITE_ROOT, "mcp-server", "dist"), ".js"),
-  join(SUITE_ROOT, "mcp-server", "package.json"),
-  join(SUITE_ROOT, "mcp-server", "package-lock.json"),
-]);
+// Bind the interpreter binary and complete installed production dependency
+// closure too: lockfiles describe intended dependencies, but only installed
+// bytes are executed. The bounded traversal covers npm's flattened transitives.
+if (PINNED_RUNTIME_SUPERVISOR_COMMITMENT === undefined) {
+  throw new Error("pinned runtime supervisor commitment is unavailable");
+}
+const runtimeSupervisorDistPath = resolve(MCP_ROOT, "dist", "runtime-supervisor.js");
+const startupJavaScriptFiles = flatFiles(join(MCP_ROOT, "dist"), ".js");
+if (!startupJavaScriptFiles.some((path) => resolve(path) === runtimeSupervisorDistPath)) {
+  throw new Error("compiled runtime supervisor is absent from the startup runtime");
+}
+export const STARTUP_RUNTIME_FINGERPRINT = fingerprintStartupRuntime(
+  process.execPath,
+  [
+    // runtime-supervisor.js was captured during dependency evaluation. Hashing
+    // its pathname here would bind a later reopen, not the program we execute.
+    ...startupJavaScriptFiles.filter(
+      (path) => resolve(path) !== runtimeSupervisorDistPath,
+    ),
+    join(MCP_ROOT, "package.json"),
+    join(MCP_ROOT, "package-lock.json"),
+  ],
+  installedProductionDependencyRoots(MCP_ROOT),
+  process.version,
+  {},
+  [PINNED_RUNTIME_SUPERVISOR_COMMITMENT],
+);
 
 type BoundRuntime = { r: RRuntimeSnapshot; python: PythonRuntimeSnapshot };
 const runtimeByEngineFingerprint = new Map<string, BoundRuntime>();
 
-function engineFingerprint(): string {
+async function engineFingerprint(signal?: AbortSignal): Promise<string> {
   // R and Python modules are loaded by a fresh child process for each call, so
   // recompute their hashes at provenance time rather than freezing startup state.
-  const rRuntime = currentRRuntimeSnapshot();
-  const pythonRuntime = currentPythonRuntimeSnapshot();
-  const fingerprint = hashFiles(
-    mutableEngineFiles(SUITE_ROOT),
+  const rRuntime = await currentRRuntimeSnapshot(signal);
+  const pythonRuntime = await currentPythonRuntimeSnapshot(signal);
+  const fingerprint = fingerprintMutableEngineRuntime(
+    SUITE_ROOT,
     `${STARTUP_RUNTIME_FINGERPRINT}:${rRuntime.fingerprint}:${pythonRuntime.fingerprint}`,
   );
   runtimeByEngineFingerprint.set(fingerprint, { r: rRuntime, python: pythonRuntime });
@@ -88,8 +221,12 @@ function engineFingerprint(): string {
   return fingerprint;
 }
 
-function assertEngineUnchanged(expected: string, phase: string): void {
-  if (engineFingerprint() !== expected) {
+async function assertEngineUnchanged(
+  expected: string,
+  phase: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (await engineFingerprint(signal) !== expected) {
     throw new Error(`engine sources changed while ${phase}`);
   }
 }
@@ -104,7 +241,7 @@ async function regressionAttestation(
     // The single-flight job is process-wide. Individual request cancellation
     // cancels only that request's wait, never another caller's attestation.
     const result = publicRegressionStatus(await callR("run_tests", {}));
-    assertEngineUnchanged(fingerprint, "regression attestation was running");
+    await assertEngineUnchanged(fingerprint, "regression attestation was running");
     return result;
   });
   return waitForSharedPromise(shared, signal);
@@ -115,6 +252,45 @@ const verificationMeta = {
     .describe("Deprecated caller hint; the runtime always replaces it with its own analysis identity."),
 };
 
+const MAX_GRID_VALUES = 64;
+const MAX_PRIOR_FIELDS = 16;
+const MAX_PRIOR_KEY_CHARS = 64;
+const MAX_LABEL_CHARS = 256;
+const MAX_COLUMN_NAME_CHARS = 128;
+const MAX_COVARIATES = 256;
+
+/**
+ * JSON.parse accepts exponent overflows such as 1e309 as Infinity. It also
+ * accepts integer tokens outside Number.MAX_SAFE_INTEGER, where the parsed
+ * Number may no longer equal the integer the caller supplied even when
+ * JSON.stringify happens to reproduce the same decimal spelling. Zod 3's
+ * unconstrained z.number() accepts both cases. Apply one recursive guard to
+ * every tool request after schema parsing and immediately before any handler
+ * can run, before either value can be laundered across another JSON boundary.
+ */
+export function assertFiniteNumericInputs(value: unknown): void {
+  const seen = new WeakSet<object>();
+  const visit = (item: unknown): void => {
+    if (typeof item === "number") {
+      if (!Number.isFinite(item)) throw new Error("All numeric inputs must be finite");
+      if (Number.isInteger(item) && !Number.isSafeInteger(item)) {
+        throw new Error(
+          "Integral numeric inputs must be within JavaScript's safe-integer range",
+        );
+      }
+      return;
+    }
+    if (!item || typeof item !== "object" || seen.has(item)) return;
+    seen.add(item);
+    if (Array.isArray(item)) {
+      for (const child of item) visit(child);
+      return;
+    }
+    for (const child of Object.values(item as Record<string, unknown>)) visit(child);
+  };
+  visit(value);
+}
+
 const registerStrictTool = (
   name: string,
   description: string,
@@ -123,7 +299,10 @@ const registerStrictTool = (
 ) => server.registerTool(name, {
   description,
   inputSchema: z.object(shape).strict(),
-}, (params, extra) => handler(params, extra.signal));
+}, (params, extra) => {
+  assertFiniteNumericInputs(params);
+  return handler(params, extra.signal);
+});
 
 function domainParams(params: Record<string, unknown>): Record<string, unknown> {
   const { verification_id: _verificationId, ...domain } = params;
@@ -144,8 +323,9 @@ function buildProvenance(
   result: unknown,
   params: Record<string, unknown>,
   boundInputHashes?: Record<string, string>,
-  executionFingerprint = engineFingerprint(),
+  executionFingerprint?: string,
 ) {
+  if (!executionFingerprint) throw new Error("bound runtime provenance is unavailable");
   const domain = domainParams(params);
   const runtime = runtimeByEngineFingerprint.get(executionFingerprint);
   if (!runtime) throw new Error("bound runtime provenance is unavailable");
@@ -265,10 +445,21 @@ function toolResponse(
       identity: rawIdentity,
       ...rest
     } = verification as VerificationEnvelope & {
-      identity?: VerificationEnvelope["identity"] & { result_hash?: unknown };
+      identity?: VerificationEnvelope["identity"] & {
+        args_hash?: unknown;
+        result_hash?: unknown;
+      };
     };
     if (!rawIdentity) return rest;
-    const { result_hash: _rawResultHash, ...publicIdentity } = rawIdentity;
+    const {
+      args_hash: _rawArgsHash,
+      result_hash: _rawResultHash,
+      ...publicIdentity
+    } = rawIdentity;
+    if (typeof publicIdentity.public_args_hash !== "string" ||
+        !publicIdentity.public_args_hash) {
+      throw new Error("verification is missing its public argument binding");
+    }
     return { ...rest, identity: publicIdentity };
   })() : undefined;
   if (verification && !verification.presentable) {
@@ -360,18 +551,18 @@ async function runTool(
   signal: AbortSignal,
 ) {
   const domain = domainParams(params);
-  const executionFingerprint = engineFingerprint();
+  const executionFingerprint = await engineFingerprint(signal);
   const regression = await regressionAttestation(executionFingerprint, signal);
   const result = await callR(tool, domain, signal);
   const stochastic = tool === "simulate_design" || tool === "randomize" ||
     ((tool === "factorial_design" || tool === "rsm_design") && domain.randomize === true);
   const replay = stochastic ? await callR(tool, domain, signal) : undefined;
-  assertEngineUnchanged(executionFingerprint, "the analysis was running");
+  await assertEngineUnchanged(executionFingerprint, "the analysis was running", signal);
   const provenance = buildProvenance(result, params, undefined, executionFingerprint);
   const verification = await preverify(
-    tool, domain, result, replay, stochastic, [], publicProvenance(provenance), regression,
+    tool, domain, result, replay, stochastic, [], publicProvenance(provenance), regression, signal,
   );
-  assertEngineUnchanged(executionFingerprint, "the verifier was running");
+  await assertEngineUnchanged(executionFingerprint, "the verifier was running", signal);
   return toolResponse(result, params, verification, provenance);
 }
 
@@ -380,7 +571,7 @@ async function runRandomizeTool(
   signal: AbortSignal,
 ) {
   const domain = domainParams(params);
-  const executionFingerprint = engineFingerprint();
+  const executionFingerprint = await engineFingerprint(signal);
   const regression = await regressionAttestation(executionFingerprint, signal);
   const managedOutput = await persistentOutputDir(undefined, "randomize-");
   let completed = false;
@@ -400,14 +591,15 @@ async function runRandomizeTool(
       private_assignment_artifact: assignmentPath,
     };
     const replay = await callR("randomize", domain, signal);
-    assertEngineUnchanged(executionFingerprint, "the analysis was running");
+    await assertEngineUnchanged(executionFingerprint, "the analysis was running", signal);
     const provenance = buildProvenance(
       result, params, undefined, executionFingerprint,
     );
     const verification = await preverify(
       "randomize", domain, result, replay, true, [], publicProvenance(provenance), regression,
+      signal,
     );
-    assertEngineUnchanged(executionFingerprint, "the verifier was running");
+    await assertEngineUnchanged(executionFingerprint, "the verifier was running", signal);
     const response = toolResponse(result, params, verification, provenance);
     completed = verification.presentable;
     return response;
@@ -424,7 +616,9 @@ async function runUngatedTool(
 ) {
   let result: Record<string, unknown>;
   if (tool === "run_tests") {
-    result = await regressionAttestation(engineFingerprint(), signal) as Record<string, unknown>;
+    result = await regressionAttestation(
+      await engineFingerprint(signal), signal,
+    ) as Record<string, unknown>;
   } else if (tool === "validate_config") {
     result = publicValidatedConfig(await callR(tool, domainParams(params), signal));
   } else {
@@ -478,7 +672,7 @@ export async function readAllowedFile(rawPath: string): Promise<Buffer> {
   }
 }
 
-function boundedCsvRows(bytes: Buffer, maximum: number, label: string): void {
+function boundedCsvRows(bytes: Buffer, maximum: number, label: string): number {
   // Counting physical lines is deliberately conservative for quoted multiline
   // cells: it may reject an unusually encoded file, but it never undercounts a
   // memory-amplifying input before the R CSV parser materializes it.
@@ -486,6 +680,7 @@ function boundedCsvRows(bytes: Buffer, maximum: number, label: string): void {
   for (const byte of bytes) if (byte === 0x0a) lines += 1;
   const dataRows = Math.max(0, lines - 1);
   if (dataRows > maximum) throw new Error(`${label} exceeds the ${maximum}-row limit`);
+  return dataRows;
 }
 
 async function persistentOutputDir(rawPath: string | undefined, prefix: string): Promise<string> {
@@ -510,7 +705,10 @@ const fwerControl = z.enum(["none"]).optional()
 // hyperparameter list (all-numeric values; required keys depend on endpoint).
 const priorSchema = z.union([
   z.enum(["jeffreys", "flat", "skeptical"]),
-  z.record(z.number()),
+  z.record(z.string().min(1).max(MAX_PRIOR_KEY_CHARS), z.number()).refine(
+    (value) => Object.keys(value).length <= MAX_PRIOR_FIELDS,
+    `custom priors may contain at most ${MAX_PRIOR_FIELDS} hyperparameters`,
+  ),
 ]).optional().describe(
   "Bayesian prior: 'jeffreys' | 'flat' | 'skeptical', or custom hyperparameters — " +
   "binary {a,b}; continuous {mu0,kappa0,alpha0,beta0}; tte/incidence_rate {shape,rate}"
@@ -528,8 +726,16 @@ const singleEndpointParams = {
   alt_param: z.number(),
   sd: z.number().optional(),
   alloc_ratio: z.number().optional(),
-  alphas: z.union([z.number().gt(0).lt(1), z.array(z.number().gt(0).lt(1))]).optional(),
-  powers: z.union([z.number().gt(0).lt(1), z.array(z.number().gt(0).lt(1))]).optional(),
+  alphas: z.union([
+    z.number().gt(0).lt(1),
+    z.array(z.number().gt(0).lt(1)).min(1).max(MAX_GRID_VALUES),
+  ]).optional().describe(
+    "One-sided alpha level(s); 0.025 one-sided corresponds to 0.05 two-sided",
+  ),
+  powers: z.union([
+    z.number().gt(0).lt(1),
+    z.array(z.number().gt(0).lt(1)).min(1).max(MAX_GRID_VALUES),
+  ]).optional(),
   prior: priorSchema,
   go_threshold: z.number().gt(0).lt(1).optional()
     .describe("Posterior probability threshold for Go (non-confirmatory decisions; default 0.90)"),
@@ -555,6 +761,7 @@ const MAX_SIMULATED_UNITS = 10_000_000;
 const MAX_INPUT_BYTES = 50 * 1024 * 1024;
 const MAX_IPD_ROWS = 1_000_000;
 const MAX_TARGET_ROWS = 10_000;
+const MAX_MAIC_BOOTSTRAP_ROW_OPERATIONS = 50_000_000;
 const strictPath = z.string().min(1).max(4096).refine(
   (value) => value === value.trim(),
   "paths may not contain leading or trailing whitespace",
@@ -637,8 +844,9 @@ registerStrictTool(
         .describe("Planned confirmatory-stage total sample size (PPOS)"),
       p3_alloc_ratio: z.number().gt(0).optional()
         .describe("Confirmatory-stage allocation ratio treatment:control for the two-arm PPOS (default: alloc_ratio)"),
-      p3_alpha: z.number().gt(0).lt(1).optional(),
-      label: z.string().optional().describe("Display label for the endpoint"),
+      p3_alpha: z.number().gt(0).lt(1).optional()
+        .describe("Confirmatory-stage one-sided alpha; 0.025 corresponds to 0.05 two-sided"),
+      label: z.string().max(MAX_LABEL_CHARS).optional().describe("Display label for the endpoint"),
     }).strict(),
     seed: z.number().int().min(0).max(2147483647).optional().describe("Integer RNG seed (default 42); echoed in the result"),
     n_oc: z.union([
@@ -700,13 +908,14 @@ registerStrictTool(
       master_design_type: z.enum(["basket", "umbrella", "platform"]),
       endpoint_type: z.enum(["binary", "continuous", "tte", "incidence_rate"]),
       n_subgroups: z.number().int().min(2).max(50),
-      null_params: z.union([z.number(), z.array(z.number())]),
-      alt_params: z.array(z.number()),
+      null_params: z.union([z.number(), z.array(z.number()).min(1).max(50)]),
+      alt_params: z.array(z.number()).min(1).max(50),
       n_per_subgroup: z.number().int().min(1).max(100000).optional(),
-      alpha: z.number().gt(0).lt(1).optional(),
+      alpha: z.number().gt(0).lt(1).optional()
+        .describe("One-sided significance level used by the selected master design"),
       n_sims: z.number().int().min(1).max(10000).optional(),
       seed: z.number().int().min(0).max(2147483647).optional().describe("Integer RNG seed (default 42); echoed in the result"),
-      label: z.string().optional()
+      label: z.string().max(MAX_LABEL_CHARS).optional()
         .describe("Run label used in output file names (default: design type + timestamp)"),
       // Basket-specific
       borrowing_method: z.enum([
@@ -737,22 +946,22 @@ registerStrictTool(
         .describe("Basket cbhm: calibration parameter a (default 0.5)"),
       cbhm_b: z.number().gt(0).optional()
         .describe("Basket cbhm: calibration parameter b (default 0.5)"),
-      soc_data: z.object({ means: z.array(z.number()) }).optional()
+      soc_data: z.object({ means: z.array(z.number()).min(1).max(50) }).strict().optional()
         .describe("Reserved for the disabled wathen_sti prototype; any supplied value is rejected"),
       ia_pruning_alpha: z.number().gt(0).lt(1).optional()
-        .describe("Basket chen_confirmatory: pruning threshold at interim (default 0.10)"),
+        .describe("Basket chen_confirmatory: one-sided interim pruning alpha (default 0.10)"),
       chen_strategy: z.enum(["d1", "d2", "d3"]).optional()
         .describe("Basket chen_confirmatory decision strategy: d1 survivors complete their planned per-basket maximum; d2 the planned pooled final total is redistributed over survivors; d3 the planned post-IA enrollment is redistributed over survivors (default d1)"),
       // Umbrella-specific
       umbrella_method: z.enum(["mams", "drop_the_losers", "bayesian_adaptive_randomization"]).optional()
         .describe("Umbrella only (rejected for basket/platform): design method (default mams)"),
-      n_arms: z.number().int().min(2).optional(),
+      n_arms: z.number().int().min(2).max(50).optional(),
       n_stages: z.number().int().min(1).max(20).optional(),
       n_per_arm_stage: z.number().int().min(2).max(100000).optional(),
       sd: z.number().optional(),
-      futility_boundaries: z.array(z.number()).optional()
+      futility_boundaries: z.array(z.number()).min(1).max(20).optional()
         .describe("Umbrella: stage-wise futility boundaries, length n_stages (default: calculated)"),
-      n_drop_per_stage: z.array(z.number().int().nonnegative()).optional()
+      n_drop_per_stage: z.array(z.number().int().nonnegative()).max(19).optional()
         .describe("Umbrella drop_the_losers: number of arms to drop per stage, length n_stages-1 (default: drop worst)"),
       rar_gamma: z.number().nonnegative().optional()
         .describe("Umbrella BAR: allocation-aggressiveness exponent, held CONSTANT across stages. The R default is the stage-increasing FUNCTION j/J, which cannot be expressed in JSON — omit this to keep it."),
@@ -764,9 +973,9 @@ registerStrictTool(
       n_periods: z.number().int().min(2).max(100).optional(),
       n_per_period: z.number().int().min(1).max(100000).optional(),
       arms_schedule: z.object({
-        enter: z.array(z.number().int()).describe("Period each arm enters (length = n_subgroups)"),
-        leave: z.array(z.number().int()).describe("Period each arm leaves (length = n_subgroups, each >= enter)"),
-      }).optional().describe("Platform designs only: when each arm is active. Required for master_design_type='platform'."),
+        enter: z.array(z.number().int()).min(2).max(50).describe("Period each arm enters (length = n_subgroups)"),
+        leave: z.array(z.number().int()).min(2).max(50).describe("Period each arm leaves (length = n_subgroups, each >= enter)"),
+      }).strict().optional().describe("Platform designs only: when each arm is active. Required for master_design_type='platform'."),
       shared_control: z.literal(true).optional()
         .describe("Platform simulations always share control (concurrency governed by ncc_method); only true is accepted — false is REJECTED by the R layer"),
       ncc_method: z.enum(["none", "pooled", "regression", "time_machine"]).optional()
@@ -875,7 +1084,7 @@ registerStrictTool(
     if (designType === "platform" && Number(cfgForBudget.futility_threshold ?? 0.05) >= Number(cfgForBudget.effect_threshold ?? 0.99)) {
       throw new Error("futility_threshold must be below effect_threshold");
     }
-    const executionFingerprint = engineFingerprint();
+    const executionFingerprint = await engineFingerprint(signal);
     const regression = await regressionAttestation(executionFingerprint, signal);
     const managedOutput = await persistentOutputDir(
       typeof identityDomain.output_dir === "string" ? identityDomain.output_dir : undefined,
@@ -900,16 +1109,16 @@ registerStrictTool(
           await rm(replayDir, { recursive: true, force: true });
         }
       }
-      assertEngineUnchanged(executionFingerprint, "the analysis was running");
+      await assertEngineUnchanged(executionFingerprint, "the analysis was running", signal);
       const provenance = buildProvenance(
         result, params, undefined, executionFingerprint,
       );
       const verification = await preverify(
         "master_simulate", identityDomain, result, replay, replayRequired,
         replayRequired ? [] : ["same-seed replay skipped above 1000 simulations"],
-        publicProvenance(provenance), regression,
+        publicProvenance(provenance), regression, signal,
       );
-      assertEngineUnchanged(executionFingerprint, "the verifier was running");
+      await assertEngineUnchanged(executionFingerprint, "the verifier was running", signal);
       const response = toolResponse(result, params, verification, provenance);
       completed = verification.presentable;
       return response;
@@ -933,30 +1142,32 @@ registerStrictTool(
       se_ab: z.number().positive(),
       estimate_cb: z.number(),
       se_cb: z.number().positive(),
-      treatment_a: z.string(),
-      treatment_c: z.string(),
-      common_comparator: z.string(),
-      effect_measure: z.string().optional(),
-      analysis_scale: z.string().optional(),
-      alpha: z.number().gt(0).lt(1).optional(),
+      treatment_a: z.string().max(MAX_LABEL_CHARS),
+      treatment_c: z.string().max(MAX_LABEL_CHARS),
+      common_comparator: z.string().max(MAX_LABEL_CHARS),
+      effect_measure: z.string().max(MAX_COLUMN_NAME_CHARS).optional(),
+      analysis_scale: z.string().max(MAX_COLUMN_NAME_CHARS).optional(),
+      alpha: z.number().gt(0).lt(1).optional()
+        .describe("Two-sided alpha for the confidence interval"),
     }).strict()).min(1).max(1000).optional(),
     ipd_file: strictPath.optional(),
     targets_file: strictPath.optional(),
     output_dir: strictPath.optional(),
-    treatment_arm: z.string().optional().describe("MAIC: active-arm label in the IPD arm column (required for method='maic')"),
-    comparator_arm: z.string().optional().describe("MAIC: comparator-arm label in the IPD; omit for unanchored"),
-    arm_col: z.string().optional().describe("MAIC: name of the arm/treatment column in the IPD CSV (default 'arm')"),
+    treatment_arm: z.string().max(MAX_LABEL_CHARS).optional().describe("MAIC: active-arm label in the IPD arm column (required for method='maic')"),
+    comparator_arm: z.string().max(MAX_LABEL_CHARS).optional().describe("MAIC: comparator-arm label in the IPD; omit for unanchored"),
+    arm_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: name of the arm/treatment column in the IPD CSV (default 'arm')"),
     maic_endpoint_type: z.enum(["binary", "continuous", "rate", "tte"]).optional().describe("MAIC: outcome type in the IPD (default 'binary')"),
-    outcome_col: z.string().optional().describe("MAIC: outcome column (binary/continuous) in the IPD CSV (default 'response')"),
-    event_col: z.string().optional().describe("MAIC: event-count column in the IPD CSV (required for maic_endpoint_type='rate')"),
-    time_col: z.string().optional().describe("MAIC: person-time/follow-up column in the IPD CSV (required for 'rate' and 'tte')"),
-    status_col: z.string().optional().describe("MAIC: event-status (0/1) column in the IPD CSV (required for maic_endpoint_type='tte')"),
-    covariates: z.array(z.string()).optional()
+    outcome_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: outcome column (binary/continuous) in the IPD CSV (default 'response')"),
+    event_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-count column in the IPD CSV (required for maic_endpoint_type='rate')"),
+    time_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: person-time/follow-up column in the IPD CSV (required for 'rate' and 'tte')"),
+    status_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-status (0/1) column in the IPD CSV (required for maic_endpoint_type='tte')"),
+    covariates: z.array(z.string().max(MAX_COLUMN_NAME_CHARS)).max(MAX_COVARIATES).optional()
       .describe("MAIC: covariate columns to weight on (default: every column in the targets CSV)"),
     tte_method: z.enum(["cox", "exponential"]).optional()
       .describe("MAIC tte analysis model: 'cox' (default, weighted Cox PH) or 'exponential' (base-R person-time proxy)"),
-    measure: z.string().optional().describe("MAIC: effect measure, e.g. log_odds_ratio / log_hazard_ratio / log_rate_ratio / mean_difference"),
-    alpha: z.number().gt(0).lt(1).optional(),
+    measure: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: effect measure, e.g. log_odds_ratio / log_hazard_ratio / log_rate_ratio / mean_difference"),
+    alpha: z.number().gt(0).lt(1).optional()
+      .describe("Two-sided alpha for the confidence interval"),
     bootstrap_replicates: z.number().int().min(50).max(5000).optional()
       .describe("MAIC non-Cox: stratified bootstrap replicates with weights refit (default 200)"),
     bootstrap_seed: z.number().int().min(0).max(2147483647).optional()
@@ -980,8 +1191,21 @@ registerStrictTool(
           readAllowedFile(domain.ipd_file),
           readAllowedFile(domain.targets_file),
         ]);
-        boundedCsvRows(ipdBytes, MAX_IPD_ROWS, "IPD CSV");
+        const ipdRows = boundedCsvRows(ipdBytes, MAX_IPD_ROWS, "IPD CSV");
         boundedCsvRows(targetsBytes, MAX_TARGET_ROWS, "target CSV");
+        const endpoint = String(domain.maic_endpoint_type ?? "binary");
+        const usesBootstrap = endpoint !== "tte" || domain.tte_method === "exponential";
+        if (usesBootstrap) {
+          const replicates = Number(domain.bootstrap_replicates ?? 200);
+          const workload = ipdRows * replicates;
+          if (workload > MAX_MAIC_BOOTSTRAP_ROW_OPERATIONS) {
+            throw new Error(
+              `requested MAIC bootstrap workload=${workload} row-replicates exceeds the ` +
+              `${MAX_MAIC_BOOTSTRAP_ROW_OPERATIONS} limit; reduce the IPD rows or ` +
+              "bootstrap_replicates",
+            );
+          }
+        }
 
         // Execute against immutable per-call snapshots, and bind provenance to
         // those same bytes. This closes the hash/use race if a caller edits a
@@ -1003,10 +1227,10 @@ registerStrictTool(
         );
         domain.output_dir = managedOutput;
       }
-      const executionFingerprint = engineFingerprint();
+      const executionFingerprint = await engineFingerprint(signal);
       const regression = await regressionAttestation(executionFingerprint, signal);
       const result = await callR("indirect_compare", domain, signal);
-      assertEngineUnchanged(executionFingerprint, "the analysis was running");
+      await assertEngineUnchanged(executionFingerprint, "the analysis was running", signal);
       const provenance = buildProvenance(
         result, params, boundInputHashes, executionFingerprint,
       );
@@ -1014,8 +1238,9 @@ registerStrictTool(
         "indirect_compare", identityDomain, result, undefined, false, [],
         publicProvenance(provenance),
         regression,
+        signal,
       );
-      assertEngineUnchanged(executionFingerprint, "the verifier was running");
+      await assertEngineUnchanged(executionFingerprint, "the verifier was running", signal);
       const response = toolResponse(result, params, verification, provenance);
       completed = verification.presentable;
       return response;
@@ -1061,7 +1286,8 @@ registerStrictTool(
       "incidence_single", "incidence_comparative",
     ]),
     studies: z.array(metaStudySchema).min(2).max(10000),
-    alpha: z.number().gt(0).lt(1).optional(),
+    alpha: z.number().gt(0).lt(1).optional()
+      .describe("Two-sided alpha for the pooled confidence interval"),
     random: z.boolean().optional(),
     inference_method: z.enum(["hksj", "dl_z"]).optional()
       .describe("Random-effects inference (default hksj; dl_z available for compatibility)"),
@@ -1081,9 +1307,11 @@ registerStrictTool(
     metric: z.enum(["proportion", "mean"]).optional(),
     effect_type: z.enum(["absolute", "relative"]).optional(),
     sd: z.number().optional().describe("Standard deviation (required for metric='mean')"),
-    alpha: z.number().gt(0).lt(1).optional(),
+    alpha: z.number().gt(0).lt(1).optional()
+      .describe("Total type-I error probability interpreted according to sided"),
     power: z.number().gt(0).lt(1).optional(),
-    sided: z.union([z.literal(1), z.literal(2)]).optional(),
+    sided: z.union([z.literal(1), z.literal(2)]).optional()
+      .describe("Test sidedness: 1 for one-sided, 2 for two-sided (default 2)"),
     ratio: z.number().positive().optional().describe("Allocation ratio n_treatment / n_control (default 1)"),
   },
   async (params, signal) => runTool("ab_test", params, signal)
@@ -1101,22 +1329,38 @@ registerStrictTool(
       z.number().int().min(2).max(20),
       z.array(z.number().int().min(2).max(20)).min(1).max(12),
     ]).optional().describe("Integer levels per factor (2-20; default 2). Fractional designs are 2-level only."),
-    fraction: z.number().int().min(0).optional().describe("0 = full factorial; p>0 = 2^(k-p) fractional"),
-    generators: z.array(z.array(z.number().int().min(1).max(12)).min(2)).optional().describe("For fractional: each added factor's unique basic-factor indices, e.g. [[1,2],[1,3]] for D=AB, E=AC"),
+    fraction: z.number().int().min(0).max(11).optional().describe("0 = full factorial; p>0 = 2^(k-p) fractional"),
+    generators: z.array(
+      z.array(z.number().int().min(1).max(12)).min(2).max(12),
+    ).max(11).optional().describe("For fractional: each added factor's unique basic-factor indices, e.g. [[1,2],[1,3]] for D=AB, E=AC"),
     center_points: z.number().int().min(0).max(1000).optional(),
     replicates: z.number().int().min(1).max(100).optional(),
     randomize: z.boolean().optional(),
     seed: z.number().int().min(0).max(2147483647).optional().describe("Integer RNG seed for run-order randomization (default 42); echoed in the result when randomize=true"),
   },
   async (params, signal) => {
-    if (Number(params.fraction ?? 0) === 0) {
-      const levels = Array.isArray(params.levels)
-        ? params.levels : Array(Number(params.n_factors)).fill(Number(params.levels ?? 2));
-      if (levels.length !== Number(params.n_factors)) throw new Error("levels must have length 1 or n_factors");
-      const runs = levels.reduce((product: number, value: number) => product * value, 1)
-        * Number(params.replicates ?? 1) + Number(params.center_points ?? 0);
-      if (!Number.isFinite(runs) || runs > 10000) throw new Error("factorial design exceeds the 10,000-run limit");
+    const fraction = Number(params.fraction ?? 0);
+    const nFactors = Number(params.n_factors);
+    if (fraction >= nFactors) throw new Error("fraction must be below n_factors");
+    const requestedLevels: number[] = Array.isArray(params.levels)
+      ? params.levels.map((value: unknown) => Number(value))
+      : [Number(params.levels ?? 2)];
+    const levels: number[] = requestedLevels.length === 1
+      ? Array<number>(nFactors).fill(requestedLevels[0]) : requestedLevels;
+    if (levels.length !== nFactors) {
+      throw new Error("levels must have length 1 or n_factors");
     }
+    let baseRuns: number;
+    if (fraction === 0) {
+      baseRuns = levels.reduce((product: number, value: number) => product * value, 1);
+    } else {
+      if (levels.some((value) => value !== 2)) {
+        throw new Error("fractional factorial designs require two levels per factor");
+      }
+      baseRuns = 2 ** (nFactors - fraction);
+    }
+    const runs = baseRuns * Number(params.replicates ?? 1) + Number(params.center_points ?? 0);
+    if (!Number.isFinite(runs) || runs > 10000) throw new Error("factorial design exceeds the 10,000-run limit");
     return runTool("factorial_design", params, signal);
   }
 );
@@ -1147,12 +1391,15 @@ registerStrictTool(
   {
     ...verificationMeta,
     n: z.number().int().min(1).max(10000),
-    arms: z.union([z.number().int().min(2).max(100), z.array(z.string()).min(2).max(100)]).optional().describe("Number of arms, or explicit arm names"),
+    arms: z.union([
+      z.number().int().min(2).max(100),
+      z.array(z.string().max(MAX_LABEL_CHARS)).min(2).max(100),
+    ]).optional().describe("Number of arms, or explicit arm names"),
     method: z.enum(["simple", "block", "stratified"]).optional(),
     block_size: z.number().int().min(1).max(10000).optional()
       .describe("Block/stratified only. Honored only when it is a whole multiple of the smallest exact integer allocation implied by the ratio; otherwise that exact base block is used. The effective size is echoed as block_size_used."),
-    strata: z.array(z.union([z.string(), z.number()])).optional().describe("Per-unit stratum labels (length n), required for method='stratified'"),
-    ratio: z.array(z.number().positive()).optional().describe("Positive allocation weights, one per arm"),
+    strata: z.array(z.union([z.string().max(MAX_LABEL_CHARS), z.number()])).max(10000).optional().describe("Per-unit stratum labels (length n), required for method='stratified'"),
+    ratio: z.array(z.number().positive()).min(2).max(100).optional().describe("Positive allocation weights, one per arm"),
     seed: z.number().int().min(0).max(2147483647).optional(),
   },
   async (params, signal) => runRandomizeTool(params, signal)
@@ -1172,9 +1419,59 @@ async function main() {
   await server.connect(transport);
 }
 
+let shutdownHandlersInstalled = false;
+let shutdownPromise: Promise<void> | undefined;
+
+/** Install process handlers only for the executable server, never on import. */
+export function installServerShutdownHandlers(
+  closeServer: () => Promise<void> | void = () => server.close(),
+): void {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+
+  const shutdown = (): Promise<void> => {
+    shutdownPromise ??= (async () => {
+      // Invoke every terminal latch before the first await so no new child of
+      // any runtime can cross the shutdown boundary.
+      await Promise.all([
+        shutdownActiveRProcesses(),
+        shutdownActiveVerifierProcesses(),
+        shutdownActiveRuntimeProbeProcesses(),
+      ]);
+      await closeServer();
+    })();
+    return shutdownPromise;
+  };
+  const shutdownAndExit = (exitCode: number) => {
+    void shutdown().then(
+      () => process.exit(exitCode),
+      (error) => {
+        console.error(error);
+        process.exit(1);
+      },
+    );
+  };
+
+  process.once("SIGINT", () => shutdownAndExit(130));
+  process.once("SIGTERM", () => shutdownAndExit(143));
+  process.stdin.once("end", () => { void shutdown().catch(console.error); });
+  process.stdin.once("close", () => { void shutdown().catch(console.error); });
+}
+
 let invokedAsEntrypoint = false;
 try {
   invokedAsEntrypoint = Boolean(process.argv[1]) &&
     realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
 } catch { /* imported modules and invalid argv never start a stdio server */ }
-if (invokedAsEntrypoint) main().catch(console.error);
+if (invokedAsEntrypoint) {
+  installServerShutdownHandlers();
+  main().catch(async (error) => {
+    console.error(error);
+    await Promise.all([
+      shutdownActiveRProcesses(),
+      shutdownActiveVerifierProcesses(),
+      shutdownActiveRuntimeProbeProcesses(),
+    ]);
+    process.exitCode = 1;
+  });
+}

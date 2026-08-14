@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, createHmac } from "node:crypto";
 import fs from "node:fs";
 import {
   appendFileSync,
@@ -10,6 +10,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
   symlinkSync,
   truncateSync,
@@ -19,7 +20,7 @@ import {
 import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 import {
   hashArtifactsForProvenance,
@@ -28,18 +29,57 @@ import {
 } from "../dist/artifact-publication.js";
 import {
   currentPythonRuntimeSnapshot,
+  currentRRuntimeSnapshot,
+  ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES,
   FingerprintPromiseCache,
+  fingerprintMutableEngineRuntime,
   hashFramedFields,
+  mutableEngineFiles,
   PYTHON_EXECUTABLE,
+  REGRESSION_SKILLS,
   RSCRIPT_EXECUTABLE,
+  sanitizedPythonChildEnvironment,
+  sanitizedRChildEnvironment,
   waitForSharedPromise,
 } from "../dist/integrity.js";
-import { callR, runRscript } from "../dist/r-bridge.js";
+import {
+  callR,
+  readRResultFile,
+  runRscript,
+} from "../dist/r-bridge.js";
+import {
+  assertFiniteNumericInputs,
+  fingerprintStartupRuntime,
+  installedProductionDependencyRoots,
+  STARTUP_RUNTIME_FINGERPRINT,
+} from "../dist/index.js";
 import { publicRegressionStatus } from "../dist/public-projection.js";
+import { runVerifierRequest } from "../dist/verifier.js";
+import {
+  killRuntimeProcessTree,
+  PINNED_RUNTIME_SUPERVISOR_COMMITMENT,
+  runtimeSupervisorProgramCommitment,
+  spawnRuntimeProcess,
+} from "../dist/runtime-supervisor.js";
 
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const pidAlive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+};
+const waitForFiles = async (...paths) => {
+  for (let attempt = 0; attempt < 200 && !paths.every(existsSync); attempt += 1) {
+    await pause(25);
+  }
+  assert.equal(paths.every(existsSync), true, `timed out waiting for ${paths.join(", ")}`);
+};
+const waitForPidsToExit = async (...pids) => {
+  for (let attempt = 0; attempt < 200 && pids.some(pidAlive); attempt += 1) {
+    await pause(25);
+  }
+  for (const pid of pids) assert.equal(pidAlive(pid), false, `process ${pid} survived cancellation`);
+};
 const assertRejectsBeforeRead = (action, expected) => {
   const originalReadSync = fs.readSync;
   let readCalls = 0;
@@ -59,6 +99,348 @@ const assertRejectsBeforeRead = (action, expected) => {
 const workspace = await mkdtemp(join(tmpdir(), "expdesign-lifecycle-test-"));
 
 try {
+  const overflow = JSON.parse('{"go_target":1e309,"nested":[{"value":-1e309}]}');
+  assert.equal(overflow.go_target, Infinity);
+  assert.throws(() => assertFiniteNumericInputs(overflow), /must be finite/);
+  console.log("TEST raw_json_exponent_overflow_is_rejected_recursively : PASS");
+
+  // This decimal spelling survives stringify even though V8 has already
+  // rounded its numeric value. Text equality therefore cannot detect the
+  // corruption; the governed boundary must reject the unsafe Number itself.
+  const unsafePositive = JSON.parse('{"value":1000000000000000100}');
+  const unsafeNegative = JSON.parse('{"value":-1000000000000000100}');
+  const unsafeNested = JSON.parse('{"outer":[{"value":-1000000000000000100}]}');
+  assert.equal(Number.isSafeInteger(unsafePositive.value), false);
+  assert.equal(BigInt(unsafePositive.value), 1000000000000000128n);
+  assert.notEqual(BigInt(unsafePositive.value), 1000000000000000100n);
+  assert.equal(JSON.stringify(unsafePositive), '{"value":1000000000000000100}');
+  assert.equal(JSON.stringify(unsafeNegative), '{"value":-1000000000000000100}');
+  assert.equal(
+    JSON.stringify(unsafeNested),
+    '{"outer":[{"value":-1000000000000000100}]}',
+  );
+  for (const unsafe of [unsafePositive, unsafeNegative, unsafeNested]) {
+    assert.throws(
+      () => assertFiniteNumericInputs(unsafe),
+      /safe-integer range/,
+    );
+  }
+  assert.doesNotThrow(() => assertFiniteNumericInputs({
+    lower: Number.MIN_SAFE_INTEGER,
+    upper: Number.MAX_SAFE_INTEGER,
+    fractional: 1.0000000000000002,
+  }));
+  console.log("TEST unsafe_integral_json_numbers_are_rejected_recursively : PASS");
+
+  const dependencyRoot = join(workspace, "installed-sdk");
+  mkdirSync(dependencyRoot, { mode: 0o700 });
+  const dependencyProbe = join(dependencyRoot, "runtime.js");
+  writeFileSync(dependencyProbe, "export const version = 1;\n", { mode: 0o600 });
+  const dependencyFingerprint = fingerprintStartupRuntime(
+    process.execPath, [], [dependencyRoot],
+  );
+  appendFileSync(dependencyProbe, "export const changed = true;\n");
+  assert.notEqual(
+    fingerprintStartupRuntime(process.execPath, [], [dependencyRoot]),
+    dependencyFingerprint,
+  );
+  console.log("TEST installed_dependency_byte_change_alters_startup_fingerprint : PASS");
+
+  const pythonVerifierRoot = join(workspace, "python-verifier-runtime");
+  mkdirSync(pythonVerifierRoot, { mode: 0o700 });
+  const pythonVerifierDependency = join(
+    pythonVerifierRoot, "fingerprint_fixture_dependency.py",
+  );
+  const syntheticPythonVerifier = join(pythonVerifierRoot, "synthetic_verifier.py");
+  writeFileSync(pythonVerifierDependency, "VALUE = 1\n", { mode: 0o600 });
+  writeFileSync(
+    syntheticPythonVerifier,
+    "import fingerprint_fixture_dependency\nimport hashlib\n",
+    { mode: 0o600 },
+  );
+  const pythonVerifierFingerprint = await currentPythonRuntimeSnapshot(
+    undefined, syntheticPythonVerifier,
+  );
+  assert.equal(
+    (await currentPythonRuntimeSnapshot(undefined, syntheticPythonVerifier)).fingerprint,
+    pythonVerifierFingerprint.fingerprint,
+  );
+  writeFileSync(pythonVerifierDependency, "VALUE = 2\n", { mode: 0o600 });
+  assert.notEqual(
+    (await currentPythonRuntimeSnapshot(undefined, syntheticPythonVerifier)).fingerprint,
+    pythonVerifierFingerprint.fingerprint,
+  );
+  console.log("TEST imported_python_module_byte_change_alters_runtime_fingerprint : PASS");
+
+  const fakeInstall = join(workspace, "flattened-production-install");
+  const fakeSdk = join(fakeInstall, "node_modules", "@modelcontextprotocol", "sdk");
+  const fakeTransitive = join(fakeInstall, "node_modules", "transitive-runtime");
+  const fakeDev = join(fakeInstall, "node_modules", "dev-only");
+  mkdirSync(fakeSdk, { recursive: true, mode: 0o700 });
+  mkdirSync(fakeTransitive, { recursive: true, mode: 0o700 });
+  mkdirSync(fakeDev, { recursive: true, mode: 0o700 });
+  writeFileSync(join(fakeSdk, "index.js"), "export const sdk = 1;\n");
+  const transitiveRuntime = join(fakeTransitive, "index.js");
+  writeFileSync(transitiveRuntime, "export const transitive = 1;\n");
+  writeFileSync(join(fakeDev, "index.js"), "export const dev = 1;\n");
+  const fakeLock = join(fakeInstall, "package-lock.json");
+  writeFileSync(fakeLock, JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      "": { dependencies: { "@modelcontextprotocol/sdk": "1" } },
+      "node_modules/@modelcontextprotocol/sdk": { version: "1" },
+      "node_modules/transitive-runtime": { version: "1" },
+      "node_modules/dev-only": { version: "1", dev: true },
+    },
+  }));
+  const productionRoots = installedProductionDependencyRoots(fakeInstall, fakeLock);
+  assert.deepEqual(productionRoots, [realpathSync(fakeSdk), realpathSync(fakeTransitive)].sort());
+  const flattenedFingerprint = fingerprintStartupRuntime(
+    process.execPath, [fakeLock], productionRoots,
+  );
+  appendFileSync(transitiveRuntime, "export const tampered = true;\n");
+  assert.notEqual(
+    fingerprintStartupRuntime(process.execPath, [fakeLock], productionRoots),
+    flattenedFingerprint,
+  );
+  assert.throws(
+    () => fingerprintStartupRuntime(
+      process.execPath, [fakeLock], productionRoots, process.version,
+      { maxFiles: 1, maxBytes: 1024 * 1024 },
+    ),
+    /dependency closure exceeds fingerprint limits/,
+  );
+  console.log("TEST flattened_production_transitive_bytes_are_bounded_and_fingerprinted : PASS");
+
+  const supervisorDist = join(process.cwd(), "dist", "runtime-supervisor.js");
+  const capturedSupervisorProgram = readFileSync(supervisorDist, "utf8");
+  assert.equal(
+    PINNED_RUNTIME_SUPERVISOR_COMMITMENT,
+    runtimeSupervisorProgramCommitment(capturedSupervisorProgram),
+  );
+  const mutatedSupervisorProgram = `${capturedSupervisorProgram}\n` +
+    "// deterministic post-capture mutation\n";
+  const startupFilesWithoutSupervisor = fs.readdirSync(join(process.cwd(), "dist"))
+    .filter((name) => name.endsWith(".js") && name !== "runtime-supervisor.js")
+    .map((name) => join(process.cwd(), "dist", name));
+  let fingerprintWhileSupervisorPathWasMutated;
+  let mutatedSupervisorBaseline;
+  try {
+    writeFileSync(supervisorDist, mutatedSupervisorProgram);
+    fingerprintWhileSupervisorPathWasMutated = fingerprintStartupRuntime(
+      process.execPath,
+      [
+        ...startupFilesWithoutSupervisor,
+        join(process.cwd(), "package.json"),
+        join(process.cwd(), "package-lock.json"),
+      ],
+      installedProductionDependencyRoots(process.cwd()),
+      process.version,
+      {},
+      [PINNED_RUNTIME_SUPERVISOR_COMMITMENT],
+    );
+    mutatedSupervisorBaseline = fingerprintStartupRuntime(
+      process.execPath,
+      [
+        ...startupFilesWithoutSupervisor,
+        join(process.cwd(), "package.json"),
+        join(process.cwd(), "package-lock.json"),
+      ],
+      installedProductionDependencyRoots(process.cwd()),
+      process.version,
+      {},
+      [runtimeSupervisorProgramCommitment(mutatedSupervisorProgram)],
+    );
+  } finally {
+    writeFileSync(supervisorDist, capturedSupervisorProgram);
+  }
+  assert.equal(
+    fingerprintWhileSupervisorPathWasMutated,
+    STARTUP_RUNTIME_FINGERPRINT,
+    "startup fingerprint followed a post-capture supervisor pathname mutation",
+  );
+  assert.notEqual(mutatedSupervisorBaseline, STARTUP_RUNTIME_FINGERPRINT);
+  console.log("TEST startup_fingerprint_binds_pinned_supervisor_eval_bytes : PASS");
+
+  const engineRoot = join(workspace, "engine-runtime-manifest");
+  const maintainedEngineFiles = Object.values(ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES)
+    .flatMap((category) => category);
+  const syntheticEngineFiles = [
+    ...maintainedEngineFiles,
+    ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/tests/run_tests.R`),
+  ];
+  for (const relativePath of syntheticEngineFiles) {
+    const path = join(engineRoot, ...relativePath.split("/"));
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, `runtime source: ${relativePath}\n`, { mode: 0o600 });
+  }
+  const listedEngineFiles = new Set(mutableEngineFiles(engineRoot));
+  for (const relativePath of maintainedEngineFiles) {
+    assert.equal(
+      listedEngineFiles.has(join(engineRoot, ...relativePath.split("/"))),
+      true,
+      `${relativePath} is absent from the engine runtime manifest`,
+    );
+  }
+  let engineFingerprint = fingerprintMutableEngineRuntime(engineRoot, "runtime-seed");
+  for (const relativePath of maintainedEngineFiles) {
+    const path = join(engineRoot, ...relativePath.split("/"));
+    appendFileSync(path, `mutation: ${relativePath}\n`);
+    const mutatedFingerprint = fingerprintMutableEngineRuntime(engineRoot, "runtime-seed");
+    assert.notEqual(
+      mutatedFingerprint,
+      engineFingerprint,
+      `${relativePath} mutation did not alter the engine fingerprint`,
+    );
+    engineFingerprint = mutatedFingerprint;
+  }
+  console.log("TEST governance_multi_agent_and_hook_sources_are_fingerprinted : PASS");
+
+  const importHandlerProbe = spawnSync(process.execPath, [
+    "--input-type=module", "-e", `
+      const before = {
+        sigint: process.listenerCount("SIGINT"),
+        sigterm: process.listenerCount("SIGTERM"),
+        stdinEnd: process.stdin.listenerCount("end"),
+        stdinClose: process.stdin.listenerCount("close"),
+      };
+      await import("./dist/index.js");
+      const after = {
+        sigint: process.listenerCount("SIGINT"),
+        sigterm: process.listenerCount("SIGTERM"),
+        stdinEnd: process.stdin.listenerCount("end"),
+        stdinClose: process.stdin.listenerCount("close"),
+      };
+      if (JSON.stringify(before) !== JSON.stringify(after)) process.exitCode = 2;
+    `,
+  ], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000 });
+  assert.equal(importHandlerProbe.status, 0, importHandlerProbe.stderr);
+  console.log("TEST importing_server_installs_no_process_handlers : PASS");
+
+  if (process.platform !== "win32") {
+    const rMarker = join(workspace, "unexpected-r-execution.txt");
+    const rShim = join(workspace, "forbidden-rscript.sh");
+    writeFileSync(
+      rShim,
+      `#!/bin/sh\necho executed > ${JSON.stringify(rMarker)}\nexit 99\n`,
+      { mode: 0o700 },
+    );
+    const child = spawn(process.execPath, ["dist/index.js"], {
+      cwd: process.cwd(),
+      env: { ...process.env, EXPDESIGN_RSCRIPT: rShim },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const childClosed = new Promise((resolve) => child.once("close", resolve));
+    let stdout = "";
+    let stderr = "";
+    const responses = new Map();
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        if (!line) continue;
+        const message = JSON.parse(line);
+        if (message.id !== undefined) responses.set(message.id, message);
+      }
+    });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const initialization = JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05", capabilities: {},
+        clientInfo: { name: "security-regression", version: "1" },
+      },
+    });
+    const common = '"endpoint_type":"binary","study_type":"poc",' +
+      '"design":"single_arm","null_param":0.2,"alt_param":0.4';
+    const alphaGrid = Array.from({ length: 65 }, () => 0.05);
+    const prior = Object.fromEntries(
+      Array.from({ length: 17 }, (_value, index) => [`field_${index}`, 1]),
+    );
+    child.stdin.write(initialization + "\n");
+    child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+    child.stdin.write(
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{' +
+      '"name":"validate_config","arguments":{' + common + ',"go_target":1e309}}}\n',
+    );
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "validate_config", arguments: {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, alphas: alphaGrid,
+      } },
+    }) + "\n");
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: { name: "validate_config", arguments: {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, prior,
+      } },
+    }) + "\n");
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 5, method: "tools/call",
+      params: { name: "simulate_design", arguments: { config: {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, label: "x".repeat(257),
+      } } },
+    }) + "\n");
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: { name: "factorial_design", arguments: {
+        n_factors: 12, replicates: 100,
+      } },
+    }) + "\n");
+    child.stdin.write(
+      '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{' +
+      '"name":"validate_config","arguments":{' +
+      '"endpoint_type":"continuous","study_type":"poc",' +
+      '"design":"single_arm","null_param":1000000000000000100,' +
+      '"alt_param":1000000000000000200,"sd":1}}}\n',
+    );
+    child.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id: 8, method: "tools/call",
+      params: { name: "factorial_design", arguments: {
+        n_factors: 5, fraction: 1, levels: 3,
+      } },
+    }) + "\n");
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline &&
+           ![2, 3, 4, 5, 6, 7, 8].every((id) => responses.has(id))) {
+      await pause(20);
+    }
+    child.kill("SIGTERM");
+    await childClosed;
+    assert.ok([2, 3, 4, 5, 6, 7, 8].every((id) => responses.has(id)), stderr);
+    for (const id of [2, 3, 4, 5, 6, 7, 8]) {
+      const message = responses.get(id);
+      assert.equal(message.result?.isError, true, JSON.stringify(message));
+    }
+    assert.equal(existsSync(rMarker), false, "an invalid request reached the R handler");
+    console.log("TEST raw_mcp_numeric_collection_string_and_workload_guards_fail_before_r : PASS");
+  } else {
+    console.log("TEST raw_mcp_numeric_collection_string_and_workload_guards_fail_before_r : SKIP");
+  }
+
+  const safeRResult = join(workspace, "safe-r-result.json");
+  writeFileSync(safeRResult, '{"ok":true}', { mode: 0o600 });
+  assert.equal(await readRResultFile(safeRResult), '{"ok":true}');
+  const oversizedRResult = join(workspace, "oversized-r-result.json");
+  writeFileSync(oversizedRResult, "x", { mode: 0o600 });
+  truncateSync(oversizedRResult, 5 * 1024 * 1024 + 1);
+  await assert.rejects(readRResultFile(oversizedRResult), /exceeded/);
+  if (process.platform !== "win32") {
+    const linkedRResult = join(workspace, "linked-r-result.json");
+    symlinkSync(safeRResult, linkedRResult);
+    await assert.rejects(readRResultFile(linkedRResult));
+    const fifoRResult = join(workspace, "fifo-r-result.json");
+    assert.equal(spawnSync("mkfifo", [fifoRResult]).status, 0);
+    await assert.rejects(readRResultFile(fifoRResult), /not a regular file/);
+  }
+  console.log("TEST r_result_reads_are_nofollow_regular_and_bounded : PASS");
+
   const forgedRegression = publicRegressionStatus({
     all_ok: true,
     skills: {
@@ -95,11 +477,11 @@ try {
   const exactRegression = publicRegressionStatus({
     all_ok: true,
     skills: {
-      "vera-experiment-designing": suiteRecord(26),
-      "vera-master-experiment-designing": suiteRecord(47),
+      "vera-experiment-designing": suiteRecord(31),
+      "vera-master-experiment-designing": suiteRecord(53),
       "vera-indirect-comparing": suiteRecord(15),
-      "vera-meta-analyzing": suiteRecord(12),
-      "vera-doe-designing": suiteRecord(13),
+      "vera-meta-analyzing": suiteRecord(14),
+      "vera-doe-designing": suiteRecord(14),
     },
   });
   assert.equal(exactRegression.all_ok, true);
@@ -277,6 +659,429 @@ try {
   assert.equal(alive(-blockedPid), false);
   console.log("TEST abort_signal_terminates_blocked_r_process_group : PASS");
 
+  if (process.platform !== "win32") {
+    for (const trigger of ["SIGINT", "SIGTERM", "stdio-close"]) {
+      const serverPidFile = join(workspace, `${trigger}-server-r.pid`);
+      const serverGrandchildPidFile = join(workspace, `${trigger}-server-grandchild.pid`);
+      const serverBlocker = join(workspace, `${trigger}-server-blocker.sh`);
+      const serverVerifierPidFile = join(workspace, `${trigger}-server-verifier.pid`);
+      const serverVerifierGrandchildPidFile = join(
+        workspace, `${trigger}-server-verifier-grandchild.pid`,
+      );
+      const serverVerifier = join(workspace, `${trigger}-server-verifier.py`);
+      const runtimeProbePidFile = join(workspace, `${trigger}-runtime-probe.pid`);
+      const runtimeProbeGrandchildPidFile = join(
+        workspace, `${trigger}-runtime-probe-grandchild.pid`,
+      );
+      const runtimeProbeBlocker = join(workspace, `${trigger}-runtime-probe-child.sh`);
+      const runtimeProbeExecutable = join(workspace, `${trigger}-python-probe.sh`);
+      writeFileSync(
+        serverBlocker,
+        `#!/bin/sh\necho $$ > ${JSON.stringify(serverGrandchildPidFile)}\nexec sleep 60\n`,
+        { mode: 0o700 },
+      );
+      writeFileSync(
+        serverVerifier,
+        "import os, subprocess, time\n" +
+          `open(${JSON.stringify(serverVerifierPidFile)}, 'w').write(str(os.getpid()))\n` +
+          "child = subprocess.Popen([\"/bin/sh\", \"-c\", " +
+          JSON.stringify(
+            `echo $$ > ${serverVerifierGrandchildPidFile}; exec sleep 60`,
+          ) + "])\n" +
+          "while True: time.sleep(60)\n",
+        { mode: 0o600 },
+      );
+      writeFileSync(
+        runtimeProbeBlocker,
+        `#!/bin/sh\necho $$ > ${JSON.stringify(runtimeProbeGrandchildPidFile)}\n` +
+          "exec /bin/sleep 60\n",
+        { mode: 0o700 },
+      );
+      writeFileSync(
+        runtimeProbeExecutable,
+        "#!/bin/sh\n" +
+          "if [ \"$4\" = \"-c\" ]; then\n" +
+          `  echo $$ > ${JSON.stringify(runtimeProbePidFile)}\n` +
+          `  ${JSON.stringify(runtimeProbeBlocker)} &\n` +
+          "  exec /bin/sleep 60\n" +
+          "fi\n" +
+          `exec ${JSON.stringify(PYTHON_EXECUTABLE)} \"$@\"\n`,
+        { mode: 0o700 },
+      );
+      const serverChild = spawn(process.execPath, [
+        "tests/server-shutdown-helper.mjs",
+        serverPidFile,
+        serverGrandchildPidFile,
+        serverBlocker,
+        serverVerifierPidFile,
+        serverVerifierGrandchildPidFile,
+        serverVerifier,
+      ], {
+        cwd: process.cwd(),
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, EXPDESIGN_PYTHON: runtimeProbeExecutable },
+      });
+      let serverStderr = "";
+      serverChild.stderr.on("data", (chunk) => { serverStderr += chunk.toString(); });
+      const serverClosed = new Promise((resolve) => serverChild.once(
+        "close", (code, signal) => resolve({ code, signal }),
+      ));
+      await waitForFiles(
+        serverPidFile,
+        serverGrandchildPidFile,
+        serverVerifierPidFile,
+        serverVerifierGrandchildPidFile,
+        runtimeProbePidFile,
+        runtimeProbeGrandchildPidFile,
+      );
+      if (trigger === "stdio-close") serverChild.stdin.end();
+      else serverChild.kill(trigger);
+      const closed = await Promise.race([
+        serverClosed,
+        pause(5_000).then(() => null),
+      ]);
+      if (closed === null) serverChild.kill("SIGKILL");
+      assert.notEqual(closed, null, `${trigger} shutdown timed out: ${serverStderr}`);
+      const expectedCode = trigger === "SIGINT" ? 130 : trigger === "SIGTERM" ? 143 : 0;
+      assert.equal(closed.code, expectedCode, serverStderr);
+      const serverR = Number(readFileSync(serverPidFile, "utf8").trim());
+      const serverGrandchild = Number(readFileSync(serverGrandchildPidFile, "utf8").trim());
+      const serverVerifierPid = Number(readFileSync(serverVerifierPidFile, "utf8").trim());
+      const serverVerifierGrandchild = Number(
+        readFileSync(serverVerifierGrandchildPidFile, "utf8").trim(),
+      );
+      const runtimeProbePid = Number(readFileSync(runtimeProbePidFile, "utf8").trim());
+      const runtimeProbeGrandchildPid = Number(
+        readFileSync(runtimeProbeGrandchildPidFile, "utf8").trim(),
+      );
+      await waitForPidsToExit(
+        serverR,
+        serverGrandchild,
+        serverVerifierPid,
+        serverVerifierGrandchild,
+        runtimeProbePid,
+        runtimeProbeGrandchildPid,
+      );
+    }
+    console.log("TEST server_shutdown_leaves_no_runtime_descendants : PASS");
+  } else {
+    console.log("TEST server_shutdown_leaves_no_runtime_descendants : SKIP");
+  }
+
+  if (process.platform !== "win32") {
+    for (const runtime of ["r", "python"]) {
+      const probePidFile = join(workspace, `${runtime}-cancelled-probe.pid`);
+      const probeGrandchildPidFile = join(
+        workspace, `${runtime}-cancelled-probe-grandchild.pid`,
+      );
+      const probeBlocker = join(workspace, `${runtime}-cancelled-probe-child.sh`);
+      const probeExecutable = join(workspace, `${runtime}-cancelled-probe.sh`);
+      writeFileSync(
+        probeBlocker,
+        `#!/bin/sh\necho $$ > ${JSON.stringify(probeGrandchildPidFile)}\n` +
+          "exec /bin/sleep 60\n",
+        { mode: 0o700 },
+      );
+      writeFileSync(
+        probeExecutable,
+        `#!/bin/sh\necho $$ > ${JSON.stringify(probePidFile)}\n` +
+          `${JSON.stringify(probeBlocker)} &\nexec /bin/sleep 60\n`,
+        { mode: 0o700 },
+      );
+      const override = runtime === "r" ? "EXPDESIGN_RSCRIPT" : "EXPDESIGN_PYTHON";
+      const previousOverride = process.env[override];
+      process.env[override] = probeExecutable;
+      let isolatedIntegrity;
+      try {
+        isolatedIntegrity = await import(
+          `../dist/integrity.js?runtime-probe-cancellation=${runtime}-${Date.now()}`
+        );
+      } finally {
+        if (previousOverride === undefined) delete process.env[override];
+        else process.env[override] = previousOverride;
+      }
+      const probeController = new AbortController();
+      const probePromise = runtime === "r"
+        ? isolatedIntegrity.currentRRuntimeSnapshot(probeController.signal)
+        : isolatedIntegrity.currentPythonRuntimeSnapshot(probeController.signal);
+      await waitForFiles(probePidFile, probeGrandchildPidFile);
+      const probePid = Number(readFileSync(probePidFile, "utf8").trim());
+      const probeGrandchildPid = Number(
+        readFileSync(probeGrandchildPidFile, "utf8").trim(),
+      );
+      probeController.abort();
+      await assert.rejects(probePromise, (error) => error?.name === "AbortError");
+      await waitForPidsToExit(probePid, probeGrandchildPid);
+      for (let attempt = 0;
+        attempt < 100 && isolatedIntegrity.activeRuntimeProbeProcessGroupCount() !== 0;
+        attempt += 1) {
+        await pause(10);
+      }
+      assert.equal(isolatedIntegrity.activeRuntimeProbeProcessGroupCount(), 0);
+    }
+    console.log("TEST abort_signal_terminates_r_and_python_runtime_probe_groups : PASS");
+  } else {
+    console.log("TEST abort_signal_terminates_r_and_python_runtime_probe_groups : SKIP");
+  }
+
+  if (process.platform !== "win32") {
+    const verifierPidFile = join(workspace, "blocked-verifier.pid");
+    const verifierChildPidFile = join(workspace, "blocked-verifier-child.pid");
+    const blockedVerifier = join(workspace, "blocked-verifier.py");
+    writeFileSync(
+      blockedVerifier,
+      "import os, subprocess, time\n" +
+        `open(${JSON.stringify(verifierPidFile)}, 'w').write(str(os.getpid()))\n` +
+        "child = subprocess.Popen([\"/bin/sh\", \"-c\", " +
+        JSON.stringify(`echo $$ > ${verifierChildPidFile}; exec sleep 60`) + "])\n" +
+        "while True: time.sleep(60)\n",
+      { mode: 0o600 },
+    );
+    const verifierController = new AbortController();
+    const blockedVerification = runVerifierRequest(
+      "{}", verifierController.signal, blockedVerifier,
+    );
+    await waitForFiles(verifierPidFile, verifierChildPidFile);
+    const verifierPid = Number(readFileSync(verifierPidFile, "utf8").trim());
+    const verifierChildPid = Number(readFileSync(verifierChildPidFile, "utf8").trim());
+    const verifierCancelledAt = Date.now();
+    verifierController.abort();
+    await assert.rejects(blockedVerification, (error) => error?.name === "AbortError");
+    assert.ok(Date.now() - verifierCancelledAt < 2_000);
+    await waitForPidsToExit(verifierPid, verifierChildPid);
+    console.log("TEST abort_signal_terminates_verifier_process_tree : PASS");
+  } else {
+    console.log("TEST abort_signal_terminates_verifier_process_tree : SKIP");
+  }
+
+  const darwinSupervisorProbe = process.platform === "darwin"
+    ? spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(process.pid)], {
+        encoding: "utf8",
+        env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+      })
+    : undefined;
+  const runtimeSupervisorTestable = process.platform === "linux" ||
+    (process.platform === "darwin" && darwinSupervisorProbe?.status === 0);
+  if (runtimeSupervisorTestable) {
+    const registryRoot = join(workspace, "runtime-group-registry");
+    mkdirSync(registryRoot, { mode: 0o700 });
+    chmodSync(registryRoot, 0o700);
+    const registryIdentity = statSync(registryRoot, { bigint: true });
+    const registryToken = "a".repeat(64);
+    const supervisorEnvironment = {
+      ...process.env,
+      EXPDESIGN_RUNTIME_REGISTRY_DIR: registryRoot,
+      EXPDESIGN_RUNTIME_REGISTRY_TOKEN: registryToken,
+      EXPDESIGN_RUNTIME_REGISTRY_DEV: String(registryIdentity.dev),
+      EXPDESIGN_RUNTIME_REGISTRY_INO: String(registryIdentity.ino),
+    };
+    const waitForRegistryEntry = async () => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const entries = fs.readdirSync(registryRoot)
+          .filter((name) => /^runtime-[1-9][0-9]*-[0-9a-f]{32}\.json$/.test(name));
+        if (entries.length === 1) return entries[0];
+        await pause(10);
+      }
+      throw new Error("timed out waiting for an authenticated runtime registry entry");
+    };
+
+    let supervised = spawnRuntimeProcess("/bin/sh", ["-c", [
+      "if [ \"${EXPDESIGN_RUNTIME_REGISTRY_TOKEN+x}\" = x ] ||",
+      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DIR+x}\" = x ] ||",
+      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DEV+x}\" = x ] ||",
+      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_INO+x}\" = x ] ||",
+      "   [ \"${EXPDESIGN_RUNTIME_TARGET_CWD+x}\" = x ]; then exit 91; fi",
+      "exec /bin/sleep 0.2",
+    ].join("\n")], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: supervisorEnvironment,
+    });
+    let supervisedStderr = "";
+    supervised.stderr.on("data", (chunk) => { supervisedStderr += chunk.toString(); });
+    let supervisedClosed = new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    const naturalEntryName = await waitForRegistryEntry();
+    const naturalEntryPath = join(registryRoot, naturalEntryName);
+    const naturalEntryRaw = readFileSync(naturalEntryPath, "utf8");
+    const naturalEntry = JSON.parse(naturalEntryRaw);
+    assert.deepEqual(Object.keys(naturalEntry).sort(), [
+      "auth", "nonce", "pid", "server_pid", "start_identity", "version",
+    ]);
+    assert.equal(naturalEntry.version, 1);
+    assert.equal(naturalEntry.server_pid, process.pid);
+    assert.equal(naturalEntry.pid, supervised.pid);
+    assert.match(naturalEntry.nonce, /^[0-9a-f]{32}$/);
+    assert.match(naturalEntry.start_identity, /^(linux:[0-9]+|darwin:.+)$/);
+    const expectedAuth = createHmac("sha256", registryToken).update(JSON.stringify([
+      1, naturalEntry.server_pid, naturalEntry.pid,
+      naturalEntry.nonce, naturalEntry.start_identity,
+    ])).digest("hex");
+    assert.equal(naturalEntry.auth, expectedAuth);
+    assert.equal(naturalEntryRaw.includes(registryToken), false);
+    assert.equal(statSync(naturalEntryPath).mode & 0o777, 0o600);
+    const naturalClose = await supervisedClosed;
+    assert.equal(naturalClose.code, 0, supervisedStderr);
+    assert.equal(existsSync(naturalEntryPath), false);
+
+    const backgroundPidFile = join(workspace, "supervised-background-child.pid");
+    supervised = spawnRuntimeProcess("/bin/sh", ["-c", [
+      "/bin/sleep 60 </dev/null >/dev/null 2>&1 &",
+      `printf '%s\\n' "$!" > ${JSON.stringify(backgroundPidFile)}`,
+      "exit 0",
+    ].join("\n")], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: supervisorEnvironment,
+    });
+    supervisedClosed = new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    const backgroundEntryPath = join(registryRoot, await waitForRegistryEntry());
+    await waitForFiles(backgroundPidFile);
+    const backgroundPid = Number(readFileSync(backgroundPidFile, "utf8").trim());
+    const backgroundGroup = supervised.pid;
+    const backgroundClose = await supervisedClosed;
+    assert.equal(backgroundClose.signal, "SIGKILL");
+    await waitForPidsToExit(backgroundPid);
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      try {
+        process.kill(-backgroundGroup, 0);
+      } catch {
+        break;
+      }
+      await pause(10);
+    }
+    assert.throws(() => process.kill(-backgroundGroup, 0));
+    assert.equal(
+      existsSync(backgroundEntryPath), true,
+      "descendant cleanup removed its lease before the host verified group death",
+    );
+    const backgroundEntry = JSON.parse(readFileSync(backgroundEntryPath, "utf8"));
+    const backgroundAuth = createHmac("sha256", registryToken).update(JSON.stringify([
+      1, backgroundEntry.server_pid, backgroundEntry.pid,
+      backgroundEntry.nonce, backgroundEntry.start_identity,
+    ])).digest("hex");
+    assert.equal(backgroundEntry.auth, backgroundAuth);
+    unlinkSync(backgroundEntryPath);
+
+    const replacedRegistry = join(workspace, "runtime-registry-replaced-before-spawn");
+    const movedRegistry = `${replacedRegistry}-original`;
+    mkdirSync(replacedRegistry, { mode: 0o700 });
+    chmodSync(replacedRegistry, 0o700);
+    const replacedIdentity = statSync(replacedRegistry, { bigint: true });
+    renameSync(replacedRegistry, movedRegistry);
+    mkdirSync(replacedRegistry, { mode: 0o700 });
+    chmodSync(replacedRegistry, 0o700);
+    const replacedTargetMarker = join(workspace, "replaced-registry-target-ran");
+    supervised = spawnRuntimeProcess("/usr/bin/touch", [replacedTargetMarker], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: {
+        ...process.env,
+        EXPDESIGN_RUNTIME_REGISTRY_DIR: replacedRegistry,
+        EXPDESIGN_RUNTIME_REGISTRY_TOKEN: registryToken,
+        EXPDESIGN_RUNTIME_REGISTRY_DEV: String(replacedIdentity.dev),
+        EXPDESIGN_RUNTIME_REGISTRY_INO: String(replacedIdentity.ino),
+      },
+    });
+    const replacedClose = await new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    assert.notEqual(replacedClose.code, 0);
+    assert.equal(existsSync(replacedTargetMarker), false);
+    assert.deepEqual(fs.readdirSync(replacedRegistry), []);
+    assert.deepEqual(fs.readdirSync(movedRegistry), []);
+
+    const liveRegistry = join(workspace, "runtime-registry-renamed-after-spawn");
+    const liveMovedRegistry = `${liveRegistry}-original`;
+    mkdirSync(liveRegistry, { mode: 0o700 });
+    chmodSync(liveRegistry, 0o700);
+    const liveIdentity = statSync(liveRegistry, { bigint: true });
+    const liveEnvironment = {
+      ...process.env,
+      EXPDESIGN_RUNTIME_REGISTRY_DIR: liveRegistry,
+      EXPDESIGN_RUNTIME_REGISTRY_TOKEN: registryToken,
+      EXPDESIGN_RUNTIME_REGISTRY_DEV: String(liveIdentity.dev),
+      EXPDESIGN_RUNTIME_REGISTRY_INO: String(liveIdentity.ino),
+    };
+    const liveTargetPidFile = join(workspace, "renamed-registry-target.pid");
+    supervised = spawnRuntimeProcess("/bin/sh", ["-c", [
+      `printf '%s\\n' "$$" > ${JSON.stringify(liveTargetPidFile)}`,
+      "exec /bin/sleep 30",
+    ].join("\n")], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: liveEnvironment,
+    });
+    let liveEntryName;
+    for (let attempt = 0; attempt < 200 && liveEntryName === undefined; attempt += 1) {
+      liveEntryName = fs.readdirSync(liveRegistry)
+        .find((name) => /^runtime-[1-9][0-9]*-[0-9a-f]{32}\.json$/.test(name));
+      if (liveEntryName === undefined) await pause(10);
+    }
+    assert.ok(liveEntryName);
+    await waitForFiles(liveTargetPidFile);
+    const liveTargetPid = Number(readFileSync(liveTargetPidFile, "utf8").trim());
+    renameSync(liveRegistry, liveMovedRegistry);
+    mkdirSync(liveRegistry, { mode: 0o700 });
+    chmodSync(liveRegistry, 0o700);
+    writeFileSync(join(liveMovedRegistry, ".stop"), "stop\n", { mode: 0o600 });
+    const liveClose = await new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    assert.equal(liveClose.signal, "SIGKILL");
+    await waitForPidsToExit(liveTargetPid);
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      try {
+        process.kill(-supervised.pid, 0);
+      } catch {
+        break;
+      }
+      await pause(10);
+    }
+    assert.throws(() => process.kill(-supervised.pid, 0));
+    assert.equal(existsSync(join(liveMovedRegistry, liveEntryName)), true);
+    assert.deepEqual(fs.readdirSync(liveRegistry), []);
+    unlinkSync(join(liveMovedRegistry, liveEntryName));
+    unlinkSync(join(liveMovedRegistry, ".stop"));
+
+    supervised = spawnRuntimeProcess("/bin/sleep", ["30"], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: supervisorEnvironment,
+    });
+    supervisedClosed = new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    const forcedEntryPath = join(registryRoot, await waitForRegistryEntry());
+    killRuntimeProcessTree(supervised, "SIGKILL");
+    await supervisedClosed;
+    assert.equal(
+      existsSync(forcedEntryPath), true,
+      "forced shutdown removed its lease before the host verified group death",
+    );
+    unlinkSync(forcedEntryPath);
+
+    const stoppedTargetMarker = join(registryRoot, "stopped-target-ran");
+    writeFileSync(join(registryRoot, ".stop"), "stop\n", { mode: 0o600 });
+    supervised = spawnRuntimeProcess("/usr/bin/touch", [stoppedTargetMarker], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: true,
+      env: supervisorEnvironment,
+    });
+    supervisedClosed = new Promise((resolve) => supervised.once(
+      "close", (code, signal) => resolve({ code, signal }),
+    ));
+    const stoppedClose = await supervisedClosed;
+    assert.notEqual(stoppedClose.code, 0);
+    assert.equal(existsSync(stoppedTargetMarker), false);
+    console.log("TEST authenticated_runtime_supervisor_lifecycle_is_fail_closed : PASS");
+  } else {
+    console.log("TEST authenticated_runtime_supervisor_lifecycle_is_fail_closed : SKIP");
+  }
+
   const subsequent = await runRscript(["--vanilla", "-e", "quit(status=0)"]);
   assert.equal(subsequent.code, 0);
   assert.equal(subsequent.aborted, false);
@@ -341,19 +1146,54 @@ try {
   );
   const oldPythonPath = process.env.PYTHONPATH;
   const oldPythonMarker = process.env.EXPDESIGN_PYTHON_MARKER;
+  const oldPyvenvLauncher = process.env.__PYVENV_LAUNCHER__;
   process.env.PYTHONPATH = pythonProfileRoot;
   process.env.EXPDESIGN_PYTHON_MARKER = pythonProfileMarker;
+  process.env.__PYVENV_LAUNCHER__ = "/hostile/python-launcher";
+  const hostileLoaderVariables = [
+    "LD_AUDIT", "LD_DEBUG", "LD_LIBRARY_PATH", "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+  ];
+  const oldLoaderValues = new Map(
+    hostileLoaderVariables.map((name) => [name, process.env[name]]),
+  );
+  for (const name of hostileLoaderVariables) process.env[name] = "/hostile/runtime-loader";
   try {
-    const snapshot = currentPythonRuntimeSnapshot();
+    const pythonEnvironment = sanitizedPythonChildEnvironment();
+    const rEnvironment = sanitizedRChildEnvironment();
+    assert.equal(
+      Object.keys(pythonEnvironment).some((name) => name.startsWith("PYTHON")), false,
+    );
+    assert.equal(pythonEnvironment.__PYVENV_LAUNCHER__, undefined);
+    for (const name of hostileLoaderVariables) {
+      assert.equal(pythonEnvironment[name], undefined);
+      assert.equal(rEnvironment[name], undefined);
+    }
+    const snapshot = await currentPythonRuntimeSnapshot();
     assert.equal(typeof snapshot.fingerprint, "string");
+    assert.equal(existsSync(pythonProfileMarker), false);
+    const cleanVerifier = join(workspace, "clean-environment-verifier.py");
+    writeFileSync(
+      cleanVerifier,
+      "import json\nprint(json.dumps({'status': 'VERIFIED', 'presentable': True}))\n",
+      { mode: 0o600 },
+    );
+    const verifierResult = await runVerifierRequest("{}", undefined, cleanVerifier);
+    assert.equal(verifierResult.presentable, true);
     assert.equal(existsSync(pythonProfileMarker), false);
   } finally {
     if (oldPythonPath === undefined) delete process.env.PYTHONPATH;
     else process.env.PYTHONPATH = oldPythonPath;
     if (oldPythonMarker === undefined) delete process.env.EXPDESIGN_PYTHON_MARKER;
     else process.env.EXPDESIGN_PYTHON_MARKER = oldPythonMarker;
+    if (oldPyvenvLauncher === undefined) delete process.env.__PYVENV_LAUNCHER__;
+    else process.env.__PYVENV_LAUNCHER__ = oldPyvenvLauncher;
+    for (const [name, value] of oldLoaderValues) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
-  console.log("TEST python_runtime_probe_ignores_hostile_sitecustomize : PASS");
+  console.log("TEST python_runtime_probe_and_verifier_ignore_hostile_python_environment : PASS");
 
   if (process.platform !== "win32") {
     const shimRoot = join(workspace, "runtime-shims");
@@ -374,34 +1214,119 @@ try {
     delete shimEnv.EXPDESIGN_PYTHON;
     const shimProbe = spawnSync(process.execPath, [
       "--input-type=module", "-e", `
-        import {appendFileSync, realpathSync} from "node:fs";
+        import {realpathSync} from "node:fs";
         import {
           currentPythonRuntimeSnapshot, currentRRuntimeSnapshot,
           PYTHON_EXECUTABLE, RSCRIPT_EXECUTABLE,
         } from "./dist/integrity.js";
-        const firstR = currentRRuntimeSnapshot();
-        appendFileSync(RSCRIPT_EXECUTABLE, "\\n# fingerprint mutation\\n");
-        const secondR = currentRRuntimeSnapshot();
-        const firstPython = currentPythonRuntimeSnapshot();
-        appendFileSync(PYTHON_EXECUTABLE, "\\n# fingerprint mutation\\n");
-        const secondPython = currentPythonRuntimeSnapshot();
+        const firstR = await currentRRuntimeSnapshot();
+        const secondR = await currentRRuntimeSnapshot();
+        const firstPython = await currentPythonRuntimeSnapshot();
+        const secondPython = await currentPythonRuntimeSnapshot();
         console.log(JSON.stringify({
-          rPinned: RSCRIPT_EXECUTABLE === realpathSync(${JSON.stringify(rShim)}),
-          pythonPinned: PYTHON_EXECUTABLE === realpathSync(${JSON.stringify(pythonShim)}),
-          rMutationDetected: firstR.fingerprint !== secondR.fingerprint,
-          pythonMutationDetected: firstPython.fingerprint !== secondPython.fingerprint,
+          rIgnored: RSCRIPT_EXECUTABLE !== realpathSync(${JSON.stringify(rShim)}),
+          pythonIgnored: PYTHON_EXECUTABLE !== realpathSync(${JSON.stringify(pythonShim)}),
+          rStable: firstR.fingerprint === secondR.fingerprint,
+          pythonStable: firstPython.fingerprint === secondPython.fingerprint,
         }));
       `,
     ], { cwd: process.cwd(), env: shimEnv, encoding: "utf8" });
     assert.equal(shimProbe.status, 0, shimProbe.stderr);
     assert.deepEqual(JSON.parse(shimProbe.stdout), {
-      rPinned: true,
-      pythonPinned: true,
-      rMutationDetected: true,
-      pythonMutationDetected: true,
+      rIgnored: true,
+      pythonIgnored: true,
+      rStable: true,
+      pythonStable: true,
     });
+
+    for (const [name, value] of [
+      ["EXPDESIGN_RSCRIPT", "Rscript"],
+      ["EXPDESIGN_PYTHON", "python3"],
+    ]) {
+      const relativeOverride = spawnSync(process.execPath, [
+        "--input-type=module", "-e", "await import('./dist/integrity.js')",
+      ], {
+        cwd: process.cwd(),
+        env: { ...process.env, [name]: value },
+        encoding: "utf8",
+      });
+      assert.notEqual(relativeOverride.status, 0);
+      assert.match(relativeOverride.stderr, /must be an absolute path/);
+    }
+
+    const preloadMarker = join(workspace, "hostile-node-preload-ran");
+    const preload = join(workspace, "hostile-node-preload.cjs");
+    writeFileSync(
+      preload,
+      `require('fs').writeFileSync(${JSON.stringify(preloadMarker)}, 'preloaded')\n`,
+      { mode: 0o600 },
+    );
+    const launcherProbe = spawnSync(
+      "/bin/sh", [join(process.cwd(), "launch-server.sh")], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--require=${preload}`,
+          NODE_PATH: shimRoot,
+        },
+        input: "",
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    assert.equal(launcherProbe.status, 0, launcherProbe.stderr);
+    assert.equal(existsSync(preloadMarker), false);
+
+    const hostileLibrary = join(workspace, "hostile-r-library");
+    const hostilePackage = join(workspace, "hostile-mvtnorm");
+    const hostilePackageR = join(hostilePackage, "R");
+    mkdirSync(hostileLibrary, { recursive: true, mode: 0o700 });
+    mkdirSync(hostilePackageR, { recursive: true, mode: 0o700 });
+    writeFileSync(join(hostilePackage, "DESCRIPTION"), [
+      "Package: mvtnorm",
+      "Type: Package",
+      "Title: Hostile lifecycle fixture",
+      "Version: 99.0.0",
+      "Authors@R: person('Test', 'Fixture', role=c('aut','cre'), email='test@example.invalid')",
+      "Description: A test-only package that records unexpected loading.",
+      "License: MIT",
+      "Encoding: UTF-8",
+      "LazyData: true",
+      "",
+    ].join("\n"));
+    writeFileSync(join(hostilePackage, "NAMESPACE"), "exportPattern('^[[:alpha:]]+')\n");
+    writeFileSync(join(hostilePackageR, "zzz.R"), [
+      ".onLoad <- function(libname, pkgname) {",
+      "  marker <- Sys.getenv('EXPDESIGN_R_LIBRARY_MARKER', unset='')",
+      "  if (nzchar(marker)) writeLines('loaded', marker)",
+      "}",
+      "fixture_value <- 1",
+      "",
+    ].join("\n"));
+    const rBinary = join(dirname(RSCRIPT_EXECUTABLE), "R");
+    const installFixture = spawnSync(
+      rBinary,
+      ["CMD", "INSTALL", `--library=${hostileLibrary}`, "--no-byte-compile", hostilePackage],
+      { encoding: "utf8", env: sanitizedRChildEnvironment() },
+    );
+    assert.equal(installFixture.status, 0, installFixture.stderr);
+    const hostileRMarker = join(workspace, "hostile-r-library-loaded");
+    const oldRLibsUser = process.env.R_LIBS_USER;
+    const oldRMarker = process.env.EXPDESIGN_R_LIBRARY_MARKER;
+    process.env.R_LIBS_USER = hostileLibrary;
+    process.env.EXPDESIGN_R_LIBRARY_MARKER = hostileRMarker;
+    try {
+      const safeSnapshot = await currentRRuntimeSnapshot();
+      assert.notEqual(safeSnapshot.packageVersions.mvtnorm, "99.0.0");
+      assert.equal(existsSync(hostileRMarker), false);
+    } finally {
+      if (oldRLibsUser === undefined) delete process.env.R_LIBS_USER;
+      else process.env.R_LIBS_USER = oldRLibsUser;
+      if (oldRMarker === undefined) delete process.env.EXPDESIGN_R_LIBRARY_MARKER;
+      else process.env.EXPDESIGN_R_LIBRARY_MARKER = oldRMarker;
+    }
   }
-  console.log("TEST path_runtime_shims_are_pinned_and_fingerprinted : PASS");
+  console.log("TEST ambient_runtime_shims_node_preloads_and_r_libraries_are_ignored : PASS");
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
