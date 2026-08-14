@@ -1,8 +1,8 @@
 {
   "authorization": {
-    "approved_at": "2026-08-14T20:55:33Z",
+    "approved_at": "2026-08-14T23:32:29Z",
     "approved_by": "Veronica0206 via Codex task",
-    "purpose": "Public portfolio update of the reviewed agent framework under MPL-2.0; proprietary statistical skill packages remain excluded"
+    "purpose": "Public portfolio clarification and captured canonical report examples from synthetic inputs; proprietary statistical skill packages remain excluded"
   },
   "files": {
     ".claude/agents/design-verifier.md": "97effe403ff5a09ec90c118c70c9dc885f32f7b239da9362c5e71ce6571f4129",
@@ -21,7 +21,7 @@
     "CHANGELOG.md": "f2aa4cfb75bb79810e70718b899e7dd42e754a64721313c69b2c8c7cfe8d5409",
     "LICENSE": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
     "Makefile": "b464aebb8b47e917cf01fc6a1d1c2f5fe3be91b0863d2f792f1adfee2f6793c4",
-    "README.md": "b786fc4fd68fee710901f9a111f6d2d3944f114cc700e99ea6f945976713f255",
+    "README.md": "54fce996115e3ca5e5f37840efc1c8a853f2497c1e1561ca4defd8dd1acb04d9",
     "agent-harness/.gitignore": "81e271d4422393e3d29464a347e947c574d2868f63a51389a969d69a611a01a9",
     "agent-harness/artifact_download.py": "4b147e91481dbe25feffe45047df3275af3e5451a24f9a7b04c6f928a4dc0676",
     "agent-harness/audit.py": "c399a26562135b8e4fa4bdcf3ce9f1b9748e4d34c02044c0cf33cb98fd780c6c",
@@ -46,6 +46,10 @@
     "agent-harness/tests/test_verification.py": "4f247cf40c2b874fe70c0a5681978a3e1e109037fd54a77efed7a7b3b536ec57",
     "agent-harness/verification.py": "619e6e512d57baa225c5ccf84de287fc1aab5a43a349e4cbb6a4b472e5bbe703",
     "docs/PUBLISHING.md": "6f38509022cd990a772d3ff04be1049b7c1333b00b99a1e622b97a090134277d",
+    "docs/examples/README.md": "d32cc9f4cfd7116a303437cd091ad558717636611803d455535c7ef2e7dfafb3",
+    "docs/examples/ab-test-report.md": "3682bffc37a3887fd88ace0295ed8a5b7bc5b1b30da3164ec32cda9498801214",
+    "docs/examples/fractional-factorial-report.md": "c673e9d6c1dd76ca643c2d96e2f71fce92be40c681e09ab8fb33bea475e94ea1",
+    "docs/examples/single-endpoint-sample-size-report.md": "9c20fa63a6d05812b64463dab8e5dfc548f440133b331375c687c678d1aec59c",
     "governance/__init__.py": "e1d0efff0c631d3adfadb5c85c92f96e86e53f8221685ed080595d69f4f05dff",
     "governance/agents.json": "036d34b18f8326065bbfbb9952b75dff95a1c1d4ddef94d5e3db898562c24589",
     "governance/r-package-integrity.json": "c86f9159f9ea43cef28b702a45e0b5a2863d4432d4a06e832409a6bf653089af",

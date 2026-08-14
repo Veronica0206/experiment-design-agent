@@ -1,11 +1,9 @@
 # Experiment Design Agent
 
-> **Public portfolio distribution:** This repository intentionally excludes the
-> required proprietary statistical engine packages. It documents the agent
-> experience and includes the public orchestration, governance, verification,
-> and interface code for review, but a fresh clone is not a standalone
-> executable agent. MCP analyses and the complete internal release checks
-> require an authorized, complete local installation.
+> **Public portfolio distribution:** This repository contains the public
+> multi-agent orchestration, verification, and interface layer. The proprietary
+> statistical engines required for numerical analyses are not distributed, so
+> the public clone is not an end-to-end runnable product.
 
 Experiment Design Agent is a coordinated team of statistical specialists that
 helps researchers plan studies, evaluate complex trial designs, construct
@@ -16,7 +14,25 @@ the request to the most relevant specialist and returns a structured report
 that separates assumptions, results, automated checks, reproducibility
 information where applicable, and remaining limitations.
 
+## How the complete system works
+
+In an authorized complete installation, a request follows this path:
+
+```mermaid
+flowchart LR
+    U["User"] --> C["Coordinator"]
+    C --> S["Six specialist sub-agents"]
+    S --> M["MCP tool interface"]
+    M --> E["Proprietary statistical engines<br/>(not distributed)"]
+    E --> G["Verification and privacy gates"]
+    G --> R["Canonical report<br/>with verification status"]
+```
+
 ## What it helps you do
+
+The following describes what the complete system does in an authorized
+installation; these capabilities are not executable from the public clone
+alone.
 
 - Plan single-endpoint studies and estimate the required sample size.
 - Simulate operating characteristics, power, and Go/Consider/No-Go behavior.
@@ -89,6 +105,10 @@ Depending on the question, the final report can include:
 - Private, opaque artifact handles for sensitive assignments or row-level
   outputs, rather than reproducing those records in conversational text.
 
+See the [captured canonical report examples](docs/examples/README.md) for
+illustrative outputs produced from synthetic inputs by an authorized complete
+installation.
+
 ## Result assurance and privacy
 
 - Reported values come from statistical analysis engines; the language model
@@ -134,10 +154,20 @@ or regulatory review.
 ## Availability
 
 This public repository supports portfolio and source review of the distributed
-agent surface. A successful build or public-tree check does not establish that
-the omitted statistical engines are installed, that analyses can run, or that
-the complete internal release suite has passed. Full execution is available
-only through an authorized local installation containing those engines.
+agent surface. At executable startup, the MCP server checks for the required
+private engine installation before connecting the MCP transport. If that
+installation is unavailable, the server exits with a fixed, path-free error:
+no MCP connection is established and no tools are advertised. A successful
+build or public-tree check therefore does not establish that analyses can run
+or that the complete internal release suite has passed. Full execution is
+available only through an authorized installation containing those engines.
+
+The public tree also includes the Python harness and
+`agent-harness/streamlit_app.py` for interface review. The Streamlit UI can be
+launched locally after its public dependencies are installed, but it is
+unauthenticated and must remain bound to `127.0.0.1`; it is not a publicly
+hosted demo. Analysis attempts from an incomplete public clone cannot complete
+because the MCP server refuses startup as described above.
 
 In a public clone, the intentionally limited check is:
 
