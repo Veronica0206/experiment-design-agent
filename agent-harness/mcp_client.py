@@ -37,6 +37,14 @@ STOP_GRACE_S = 5
 
 _EOF = object()  # sentinel: server closed stdout
 
+
+class _ReaderFailure:
+    """Fixed, value-free terminal error delivered to every pending waiter."""
+
+    def __init__(self, message: str):
+        self.message = message
+
+
 PRIVATE_PROVENANCE_META_KEY = "experiment-design/private-provenance"
 PRIVATE_ARTIFACT_META_KEY = "experiment-design/private-artifact"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -467,10 +475,18 @@ class MCPClient:
         self._waiters_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._closed = False
+        self._reader_error: str | None = None
+        self._protocol_shutdown_scheduled = False
         self._generation = 0
         self._runtime_registry: _RuntimeGroupRegistry | None = None
+        self._lifecycle_lock = threading.RLock()
 
     def start(self) -> dict:
+        """Start one generation while serializing it with every cleanup path."""
+        with self._lifecycle_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> dict:
         if not SERVER_ENTRY.is_file() or not SERVER_LAUNCHER.is_file():
             raise FileNotFoundError(
                 f"MCP server or launcher is unavailable. Run 'npm run build' in {MCP_SERVER_DIR}"
@@ -487,6 +503,8 @@ class MCPClient:
         # FRESH inbox — the old queue may hold a stale _EOF sentinel from the
         # previous stdout thread, which would fail the first _send immediately.
         self._closed = False
+        self._reader_error = None
+        self._protocol_shutdown_scheduled = False
         self._waiters = {}
         try:
             registry = _RuntimeGroupRegistry()
@@ -556,6 +574,11 @@ class MCPClient:
             raise
 
     def stop(self):
+        """Serialize Node and runtime-registry cleanup across all callers."""
+        with self._lifecycle_lock:
+            return self._stop_locked()
+
+    def _stop_locked(self):
         """Stop Node and every registered runtime group, retaining failed state."""
         proc = self._proc
         registry = self._runtime_registry
@@ -804,9 +827,113 @@ class MCPClient:
                 raise MCPToolError("Private artifact handles do not match returned resources")
         return result
 
+    @staticmethod
+    def _put_terminal_nowait(waiter: queue.Queue, terminal: object) -> None:
+        """Wake a waiter without ever blocking the sole protocol reader."""
+        try:
+            waiter.put_nowait(terminal)
+            return
+        except queue.Full:
+            pass
+        # A protocol failure supersedes an already queued response. For normal
+        # EOF, preserve that response so its consumer can still receive it.
+        if terminal is _EOF:
+            return
+        try:
+            waiter.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            waiter.put_nowait(terminal)
+        except queue.Full:
+            # Another producer cannot legitimately fill this single-response
+            # queue after the reader has declared a terminal protocol failure.
+            # Remaining fail-closed state is still visible through _closed.
+            pass
+
+    def _schedule_protocol_shutdown(self, generation: int, proc: object) -> None:
+        """Retire only the failed generation, away from its reader thread."""
+        with self._waiters_lock:
+            if self._protocol_shutdown_scheduled:
+                return
+            self._protocol_shutdown_scheduled = True
+
+        def cleanup_generation() -> None:
+            try:
+                self._cleanup_protocol_generation(generation, proc)
+            except Exception:
+                # stop() deliberately retains failed handles for a later retry.
+                # The reader error remains the authoritative caller-visible fault.
+                pass
+
+        threading.Thread(
+            target=cleanup_generation,
+            name="experiment-design-mcp-protocol-cleanup",
+            daemon=True,
+        ).start()
+
+    def _cleanup_protocol_generation(self, generation: int, proc: object) -> None:
+        """Stop a failed generation only while its exact process is current."""
+        with self._lifecycle_lock:
+            # A delayed cleanup from an old reader must never stop a
+            # successfully restarted generation.
+            if generation != self._generation or self._proc is not proc:
+                return
+            self._stop_locked()
+
+    def _fail_protocol(self, generation: int, proc: object, message: str) -> None:
+        """Fail every request and retire a generation after malformed routing."""
+        if generation != self._generation:
+            return
+        with self._waiters_lock:
+            self._reader_error = message
+            self._closed = True
+            waiters = list(self._waiters.values())
+        terminal = _ReaderFailure(message)
+        for waiter in waiters:
+            self._put_terminal_nowait(waiter, terminal)
+        self._schedule_protocol_shutdown(generation, proc)
+
+    @staticmethod
+    def _valid_response_envelope(msg: object) -> bool:
+        """Accept only a JSON-RPC 2.0 response for this integer-id client."""
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+            return False
+        response_id = msg.get("id")
+        if type(response_id) is not int or response_id < 1:  # bool is not an id
+            return False
+        has_result = "result" in msg
+        has_error = "error" in msg
+        if has_result == has_error:
+            return False
+        if has_error:
+            error = msg.get("error")
+            if not isinstance(error, dict):
+                return False
+            if type(error.get("code")) is not int:
+                return False
+            if not isinstance(error.get("message"), str):
+                return False
+        return True
+
+    @staticmethod
+    def _valid_server_notification(msg: object) -> bool:
+        """Allow well-formed notifications while ignoring their payloads."""
+        return (
+            isinstance(msg, dict)
+            and msg.get("jsonrpc") == "2.0"
+            and "id" not in msg
+            and isinstance(msg.get("method"), str)
+            and bool(msg.get("method"))
+            and "result" not in msg
+            and "error" not in msg
+        )
+
     def _read_stdout(self, proc, generation: int):
         if not proc or not proc.stdout:
             return
+        responded_ids: set[int] = set()
+        protocol_failed = False
         try:
             for line in proc.stdout:      # blocking readline loop on the raw stream
                 line = line.strip()
@@ -814,14 +941,50 @@ class MCPClient:
                     continue
                 try:
                     msg = json.loads(line)
-                    response_id = msg.get("id") if isinstance(msg, dict) else None
-                    if isinstance(response_id, int):
-                        with self._waiters_lock:
-                            waiter = self._waiters.get(response_id)
-                        if waiter is not None:
-                            waiter.put(msg)
                 except json.JSONDecodeError:
-                    continue
+                    self._fail_protocol(
+                        generation, proc,
+                        "MCP protocol violation: malformed JSON-RPC message",
+                    )
+                    protocol_failed = True
+                    break
+                if isinstance(msg, dict) and "id" not in msg:
+                    if self._valid_server_notification(msg):
+                        continue
+                    self._fail_protocol(
+                        generation, proc,
+                        "MCP protocol violation: malformed JSON-RPC envelope",
+                    )
+                    protocol_failed = True
+                    break
+                if not self._valid_response_envelope(msg):
+                    self._fail_protocol(
+                        generation, proc,
+                        "MCP protocol violation: malformed JSON-RPC envelope",
+                    )
+                    protocol_failed = True
+                    break
+                response_id = msg["id"]
+                if response_id in responded_ids:
+                    self._fail_protocol(
+                        generation, proc,
+                        "MCP protocol violation: duplicate response id",
+                    )
+                    protocol_failed = True
+                    break
+                with self._waiters_lock:
+                    waiter = self._waiters.get(response_id)
+                if waiter is not None:
+                    responded_ids.add(response_id)
+                    try:
+                        waiter.put_nowait(msg)
+                    except queue.Full:
+                        self._fail_protocol(
+                            generation, proc,
+                            "MCP protocol violation: duplicate response id",
+                        )
+                        protocol_failed = True
+                        break
         except (ValueError, OSError):
             pass
         finally:
@@ -830,8 +993,9 @@ class MCPClient:
             self._closed = True
             with self._waiters_lock:
                 waiters = list(self._waiters.values())
-            for waiter in waiters:
-                waiter.put(_EOF)
+            if not protocol_failed:
+                for waiter in waiters:
+                    self._put_terminal_nowait(waiter, _EOF)
 
     def _drain_stderr(self, proc, generation: int):
         if not proc or not proc.stderr:
@@ -905,6 +1069,8 @@ class MCPClient:
                 try:
                     msg = waiter.get(timeout=min(remaining, 1.0))
                 except queue.Empty:
+                    if self._reader_error is not None:
+                        raise MCPToolError(self._reader_error)
                     if self._closed or proc.poll() is not None:
                         raise MCPToolError(
                             f"MCP server exited (code {proc.returncode}); "
@@ -916,6 +1082,8 @@ class MCPClient:
                         f"MCP server closed stdout; stderr: "
                         f"{self._recent_stderr() or 'none'}"
                     )
+                if isinstance(msg, _ReaderFailure):
+                    raise MCPToolError(msg.message)
                 return self._result_from_message(msg)
         finally:
             with self._waiters_lock:

@@ -1,14 +1,13 @@
 import { createHash } from "node:crypto";
 import {
   accessSync,
+  type BigIntStats,
   constants as fsConstants,
   lstatSync,
-  readdirSync,
-  readFileSync,
   realpathSync,
   statSync,
 } from "node:fs";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, opendir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -60,6 +59,13 @@ const RUNTIME_PROBE_TIMEOUT_MS = 60_000;
 const MAX_PYTHON_RUNTIME_FILES = 2_048;
 const MAX_PYTHON_RUNTIME_BYTES = 128 * 1024 * 1024;
 const PYTHON_RUNTIME_READ_CHUNK_BYTES = 64 * 1024;
+const MAX_R_RUNTIME_FILES = 32_768;
+const MAX_R_RUNTIME_DIRECTORIES = 8_192;
+const MAX_R_RUNTIME_DIRECTORY_ENTRIES = 65_536;
+const MAX_R_RUNTIME_DEPTH = 64;
+const MAX_R_RUNTIME_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_R_RUNTIME_BYTES = 1024 * 1024 * 1024;
+const R_RUNTIME_READ_CHUNK_BYTES = 64 * 1024;
 const activeRuntimeProbeProcessGroups = new Map<
   number, ActiveRuntimeProbeProcessGroup
 >();
@@ -296,13 +302,58 @@ const APPROVED_CHILD_PATH = [
   "/Library/Frameworks/R.framework/Resources/bin",
 ].join(":");
 
-function removeNativeLoaderEnvironment(environment: NodeJS.ProcessEnv): void {
-  for (const name of Object.keys(environment)) {
-    const normalized = name.toUpperCase();
-    if (normalized.startsWith("LD_") || normalized.startsWith("DYLD_")) {
-      delete environment[name];
+function controlledBaseChildEnvironment(): NodeJS.ProcessEnv {
+  if (process.platform === "win32") {
+    const configuredRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+    if (!configuredRoot || !isAbsolute(configuredRoot)) {
+      throw new Error("Windows runtime children require an absolute SystemRoot");
     }
+    const systemRoot = realpathSync(configuredRoot);
+    if (!statSync(systemRoot).isDirectory()) {
+      throw new Error("Windows runtime SystemRoot is not a directory");
+    }
+    const system32 = join(systemRoot, "System32");
+    return {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+      ComSpec: join(system32, "cmd.exe"),
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+      PATH: `${system32};${systemRoot}`,
+      HOME: join(system32, "config", "systemprofile"),
+      USERPROFILE: join(system32, "config", "systemprofile"),
+      TEMP: join(systemRoot, "Temp"),
+      TMP: join(systemRoot, "Temp"),
+      LANG: "C",
+      LC_ALL: "C",
+      TZ: "UTC",
+    };
   }
+
+  let controlledHome = "/";
+  try {
+    if (statSync("/var/empty").isDirectory()) controlledHome = "/var/empty";
+  } catch { /* the immutable root remains the fail-closed fallback */ }
+  return {
+    PATH: APPROVED_CHILD_PATH,
+    HOME: controlledHome,
+    TMPDIR: "/tmp",
+    TMP: "/tmp",
+    TEMP: "/tmp",
+    LANG: "C",
+    LC_ALL: "C",
+    TZ: "UTC",
+  };
+}
+
+function fixedSingleThreadEnvironment(): NodeJS.ProcessEnv {
+  return {
+    OMP_NUM_THREADS: "1",
+    OPENBLAS_NUM_THREADS: "1",
+    MKL_NUM_THREADS: "1",
+    VECLIB_MAXIMUM_THREADS: "1",
+    NUMEXPR_NUM_THREADS: "1",
+    BLIS_NUM_THREADS: "1",
+  };
 }
 
 /**
@@ -312,33 +363,22 @@ function removeNativeLoaderEnvironment(environment: NodeJS.ProcessEnv): void {
  * established.
  */
 export function sanitizedRChildEnvironment(): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = { ...process.env };
-  removeNativeLoaderEnvironment(environment);
-  for (const name of [
-    "R_ENVIRON", "R_ENVIRON_USER", "R_PROFILE", "R_PROFILE_USER",
-    "R_HOME", "R_USER",
-  ]) {
-    delete environment[name];
-  }
-  environment.R_LIBS = "";
-  environment.R_LIBS_USER = "";
-  environment.R_LIBS_SITE = "";
-  environment.R_DEFAULT_PACKAGES = "datasets,utils,grDevices,graphics,stats,methods";
-  if (process.platform !== "win32") environment.PATH = APPROVED_CHILD_PATH;
-  return environment;
+  return {
+    ...controlledBaseChildEnvironment(),
+    ...fixedSingleThreadEnvironment(),
+    R_LIBS: "",
+    R_LIBS_USER: "",
+    R_LIBS_SITE: "",
+    R_DEFAULT_PACKAGES: "datasets,utils,grDevices,graphics,stats,methods",
+  };
 }
 
 /** Prevent Python/site and native-loader injection into fingerprint probes. */
 export function sanitizedPythonChildEnvironment(): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = { ...process.env };
-  removeNativeLoaderEnvironment(environment);
-  for (const name of Object.keys(environment)) {
-    if (name.toUpperCase().startsWith("PYTHON") || name === "__PYVENV_LAUNCHER__") {
-      delete environment[name];
-    }
-  }
-  if (process.platform !== "win32") environment.PATH = APPROVED_CHILD_PATH;
-  return environment;
+  return {
+    ...controlledBaseChildEnvironment(),
+    ...fixedSingleThreadEnvironment(),
+  };
 }
 
 function stableJson(value: unknown): string {
@@ -350,16 +390,6 @@ function stableJson(value: unknown): string {
       `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
   }
   return JSON.stringify(value);
-}
-
-function regularTreeFiles(path: string, seen = new Set<string>()): string[] {
-  const canonical = realpathSync(path);
-  const info = statSync(canonical);
-  if (info.isFile()) return [canonical];
-  if (!info.isDirectory() || seen.has(canonical)) return [];
-  seen.add(canonical);
-  return readdirSync(canonical).flatMap((name) =>
-    regularTreeFiles(join(canonical, name), seen));
 }
 
 /** Hash unambiguous length-prefixed fields rather than raw concatenation. */
@@ -377,32 +407,56 @@ export function hashFramedFields(
   return hash.digest("hex");
 }
 
-function hashRuntimeFiles(files: string[], seed: string): string {
-  return hashFramedFields(
-    files.sort().flatMap((path) => [path, readFileSync(path)]),
-    seed,
-  );
+export type RuntimeFingerprintLimits = {
+  maxFiles: number;
+  maxDirectories: number;
+  maxDirectoryEntries: number;
+  maxDepth: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+  readChunkBytes: number;
+};
+
+function assertRuntimeFingerprintLimits(limits: RuntimeFingerprintLimits): void {
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`Runtime fingerprint ${name} must be a positive safe integer`);
+    }
+  }
+  if (limits.maxFileBytes > limits.maxTotalBytes) {
+    throw new Error("Runtime fingerprint maxFileBytes exceeds maxTotalBytes");
+  }
+}
+
+function sameRuntimeMetadata(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino &&
+    left.size === right.size && left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs;
 }
 
 /**
- * Hash the Python import closure without allowing a module path to turn the
- * fingerprint step into an unbounded or uninterruptible read. Each descriptor
- * is bound to the canonical name before and after the read, and metadata drift
- * during the read fails closed.
+ * Incrementally hash a bounded set of runtime files or directory trees.
+ * Symlinks are never followed. Every regular file is opened with the strongest
+ * no-follow/nonblocking flags available, then rebound to its pathname before
+ * and after chunked reads. Directories receive the same descriptor/name checks
+ * while their bounded, sorted children are traversed.
  */
-async function hashBoundedPythonRuntimeFiles(
-  files: readonly string[],
+export async function hashBoundedRuntimeTree(
+  roots: readonly string[],
   seed: string,
+  limits: RuntimeFingerprintLimits,
   signal?: AbortSignal,
+  labelRoot?: string,
 ): Promise<string> {
+  assertRuntimeFingerprintLimits(limits);
   if (signal?.aborted) throw runtimeProbeAbortError();
-  const canonicalFiles = [...new Set(files.map((path) => realpathSync(path)))].sort();
-  if (canonicalFiles.length > MAX_PYTHON_RUNTIME_FILES) {
-    throw new Error(
-      `Python runtime fingerprint exceeds the ${MAX_PYTHON_RUNTIME_FILES}-file limit`,
-    );
-  }
 
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number"
+    ? fsConstants.O_NOFOLLOW : 0;
+  const nonBlock = typeof fsConstants.O_NONBLOCK === "number"
+    ? fsConstants.O_NONBLOCK : 0;
+  const directoryOnly = typeof fsConstants.O_DIRECTORY === "number"
+    ? fsConstants.O_DIRECTORY : 0;
   const hash = createHash("sha256");
   const updateFieldPrefix = (length: number | bigint) => {
     const header = Buffer.alloc(8);
@@ -415,67 +469,231 @@ async function hashBoundedPythonRuntimeFiles(
   };
   updateCompleteField(Buffer.from(seed, "utf8"));
 
-  const noFollow = typeof fsConstants.O_NOFOLLOW === "number"
-    ? fsConstants.O_NOFOLLOW : 0;
-  const nonBlock = typeof fsConstants.O_NONBLOCK === "number"
-    ? fsConstants.O_NONBLOCK : 0;
+  let fileCount = 0;
+  let directoryCount = 0;
+  let directoryEntryCount = 0;
   let totalBytes = 0n;
-  for (const path of canonicalFiles) {
-    if (signal?.aborted) throw runtimeProbeAbortError();
-    const handle = await openFile(path, fsConstants.O_RDONLY | noFollow | nonBlock);
-    try {
-      const opened = await handle.stat({ bigint: true });
-      const named = lstatSync(path, { bigint: true });
-      if (!opened.isFile() || !named.isFile()) {
-        throw new Error("Python runtime fingerprint path is not a regular file");
-      }
-      if (opened.dev !== named.dev || opened.ino !== named.ino) {
-        throw new Error("Python runtime fingerprint path changed while it was opened");
-      }
-      if (opened.size < 0n || opened.size > BigInt(MAX_PYTHON_RUNTIME_BYTES) ||
-          totalBytes + opened.size > BigInt(MAX_PYTHON_RUNTIME_BYTES)) {
-        throw new Error(
-          `Python runtime fingerprint exceeds the ${MAX_PYTHON_RUNTIME_BYTES}-byte limit`,
-        );
-      }
-      totalBytes += opened.size;
-
-      updateCompleteField(Buffer.from(path, "utf8"));
-      updateFieldPrefix(opened.size);
-      let offset = 0n;
-      while (offset < opened.size) {
-        if (signal?.aborted) throw runtimeProbeAbortError();
-        const requested = Number(
-          opened.size - offset > BigInt(PYTHON_RUNTIME_READ_CHUNK_BYTES)
-            ? BigInt(PYTHON_RUNTIME_READ_CHUNK_BYTES)
-            : opened.size - offset,
-        );
-        const chunk = Buffer.allocUnsafe(requested);
-        const { bytesRead } = await handle.read(chunk, 0, requested, Number(offset));
-        if (bytesRead === 0) {
-          throw new Error("Python runtime file changed while it was being read");
-        }
-        hash.update(chunk.subarray(0, bytesRead));
-        offset += BigInt(bytesRead);
-      }
-
-      const completed = await handle.stat({ bigint: true });
-      const rebound = lstatSync(path, { bigint: true });
-      if (!completed.isFile() || !rebound.isFile() ||
-          completed.dev !== opened.dev || completed.ino !== opened.ino ||
-          completed.size !== opened.size || completed.mtimeNs !== opened.mtimeNs ||
-          completed.ctimeNs !== opened.ctimeNs ||
-          rebound.dev !== opened.dev || rebound.ino !== opened.ino ||
-          rebound.size !== opened.size || rebound.mtimeNs !== opened.mtimeNs ||
-          rebound.ctimeNs !== opened.ctimeNs) {
-        throw new Error("Python runtime file changed while it was being read");
-      }
-    } finally {
-      await handle.close();
+  const visitedFiles = new Set<string>();
+  const visitedDirectories = new Set<string>();
+  const maximumFileBytes = BigInt(limits.maxFileBytes);
+  const maximumTotalBytes = BigInt(limits.maxTotalBytes);
+  let canonicalLabelRoot: string | undefined;
+  if (labelRoot !== undefined) {
+    if (!isAbsolute(labelRoot)) {
+      throw new Error("Runtime fingerprint label root must be absolute");
     }
+    const absoluteLabelRoot = resolve(labelRoot);
+    canonicalLabelRoot = realpathSync(labelRoot);
+    if (process.platform !== "win32" && canonicalLabelRoot !== absoluteLabelRoot) {
+      throw new Error("Runtime fingerprint label root contains symbolic-link components");
+    }
+  }
+
+  const fingerprintLabel = (path: string): string => {
+    if (canonicalLabelRoot === undefined) return path;
+    const label = relative(canonicalLabelRoot, path).split(sep).join("/");
+    if (!label || label === ".." || label.startsWith("../")) {
+      throw new Error("Runtime fingerprint source escaped its label root");
+    }
+    return label;
+  };
+
+  const assertUnchanged = (
+    path: string,
+    opened: BigIntStats,
+    expectedKind: "file" | "directory",
+    phase: string,
+  ) => {
+    const named = lstatSync(path, { bigint: true });
+    const correctKind = expectedKind === "file"
+      ? opened.isFile() && named.isFile()
+      : opened.isDirectory() && named.isDirectory();
+    if (!correctKind || named.isSymbolicLink() || !sameRuntimeMetadata(opened, named)) {
+      throw new Error(`Runtime fingerprint ${expectedKind} changed ${phase}: ${path}`);
+    }
+  };
+
+  const visit = async (path: string, depth: number): Promise<void> => {
+    if (signal?.aborted) throw runtimeProbeAbortError();
+    if (depth > limits.maxDepth) {
+      throw new Error(
+        `Runtime fingerprint tree exceeds the ${limits.maxDepth}-level depth limit`,
+      );
+    }
+    const namedBeforeOpen = lstatSync(path, { bigint: true });
+    if (namedBeforeOpen.isSymbolicLink()) {
+      throw new Error(`Runtime fingerprint refuses symbolic links: ${path}`);
+    }
+    if (!namedBeforeOpen.isFile() && !namedBeforeOpen.isDirectory()) {
+      throw new Error(`Runtime fingerprint path is not a regular file or directory: ${path}`);
+    }
+
+    const directory = namedBeforeOpen.isDirectory();
+    let handle;
+    try {
+      handle = await openFile(
+        path,
+        fsConstants.O_RDONLY | noFollow | nonBlock | (directory ? directoryOnly : 0),
+      );
+    } catch (error) {
+      // Windows does not expose a directory descriptor through fs.open. It
+      // still receives named-path checks before and after bounded opendir;
+      // regular files always require a descriptor on every platform.
+      if (!(directory && process.platform === "win32")) throw error;
+    }
+
+    try {
+      const opened = handle
+        ? await handle.stat({ bigint: true })
+        : namedBeforeOpen;
+      if (!sameRuntimeMetadata(namedBeforeOpen, opened)) {
+        throw new Error(`Runtime fingerprint path changed while opening: ${path}`);
+      }
+      assertUnchanged(path, opened, directory ? "directory" : "file", "while opening");
+
+      if (!directory) {
+        if (visitedFiles.has(path)) return;
+        visitedFiles.add(path);
+        fileCount += 1;
+        if (fileCount > limits.maxFiles) {
+          throw new Error(
+            `Runtime fingerprint tree exceeds the ${limits.maxFiles}-file limit`,
+          );
+        }
+        if (opened.size < 0n || opened.size > maximumFileBytes) {
+          throw new Error(
+            `Runtime fingerprint file exceeds the ${limits.maxFileBytes}-byte limit`,
+          );
+        }
+        if (totalBytes + opened.size > maximumTotalBytes) {
+          throw new Error(
+            `Runtime fingerprint tree exceeds the ${limits.maxTotalBytes}-byte limit`,
+          );
+        }
+        totalBytes += opened.size;
+        updateCompleteField(Buffer.from(fingerprintLabel(path), "utf8"));
+        updateFieldPrefix(opened.size);
+
+        if (!handle) {
+          throw new Error("Runtime fingerprint regular file descriptor is unavailable");
+        }
+        let offset = 0n;
+        while (offset < opened.size) {
+          if (signal?.aborted) throw runtimeProbeAbortError();
+          const remaining = opened.size - offset;
+          const requested = Number(
+            remaining > BigInt(limits.readChunkBytes)
+              ? BigInt(limits.readChunkBytes)
+              : remaining,
+          );
+          const chunk = Buffer.allocUnsafe(requested);
+          const { bytesRead } = await handle.read(chunk, 0, requested, Number(offset));
+          if (bytesRead === 0) {
+            throw new Error(`Runtime fingerprint file changed while reading: ${path}`);
+          }
+          hash.update(chunk.subarray(0, bytesRead));
+          offset += BigInt(bytesRead);
+        }
+        if (signal?.aborted) throw runtimeProbeAbortError();
+        const completed = await handle.stat({ bigint: true });
+        if (!sameRuntimeMetadata(opened, completed)) {
+          throw new Error(`Runtime fingerprint file changed while reading: ${path}`);
+        }
+        assertUnchanged(path, opened, "file", "while reading");
+        return;
+      }
+
+      const directoryIdentity = `${opened.dev}:${opened.ino}`;
+      if (visitedDirectories.has(directoryIdentity)) return;
+      visitedDirectories.add(directoryIdentity);
+      directoryCount += 1;
+      if (directoryCount > limits.maxDirectories) {
+        throw new Error(
+          `Runtime fingerprint tree exceeds the ${limits.maxDirectories}-directory limit`,
+        );
+      }
+
+      const names: string[] = [];
+      const stream = await opendir(path);
+      try {
+        for await (const entry of stream) {
+          if (signal?.aborted) throw runtimeProbeAbortError();
+          directoryEntryCount += 1;
+          if (directoryEntryCount > limits.maxDirectoryEntries) {
+            throw new Error(
+              "Runtime fingerprint tree exceeds the " +
+              `${limits.maxDirectoryEntries}-directory-entry limit`,
+            );
+          }
+          if (entry.isSymbolicLink()) {
+            throw new Error(
+              `Runtime fingerprint refuses symbolic links: ${join(path, entry.name)}`,
+            );
+          }
+          names.push(entry.name);
+        }
+      } finally {
+        await stream.close().catch(() => undefined);
+      }
+      names.sort();
+      for (const name of names) {
+        if (signal?.aborted) throw runtimeProbeAbortError();
+        await visit(join(path, name), depth + 1);
+      }
+      if (signal?.aborted) throw runtimeProbeAbortError();
+      const completed = handle
+        ? await handle.stat({ bigint: true })
+        : lstatSync(path, { bigint: true });
+      if (!sameRuntimeMetadata(opened, completed)) {
+        throw new Error(`Runtime fingerprint directory changed while reading: ${path}`);
+      }
+      assertUnchanged(path, opened, "directory", "while reading");
+    } finally {
+      await handle?.close();
+    }
+  };
+
+  const canonicalRoots: string[] = [];
+  if (BigInt(roots.length) > BigInt(limits.maxFiles) + BigInt(limits.maxDirectories)) {
+    throw new Error("Runtime fingerprint root list exceeds its structural limits");
+  }
+  for (const root of roots) {
+    if (signal?.aborted) throw runtimeProbeAbortError();
+    if (!isAbsolute(root)) {
+      throw new Error(`Runtime fingerprint root must be absolute: ${root}`);
+    }
+    const named = lstatSync(root, { bigint: true });
+    if (named.isSymbolicLink()) {
+      throw new Error(`Runtime fingerprint refuses symbolic links: ${root}`);
+    }
+    const absolute = resolve(root);
+    const canonical = realpathSync(root);
+    if (process.platform !== "win32" && canonical !== absolute) {
+      throw new Error(`Runtime fingerprint refuses symbolic-link path components: ${root}`);
+    }
+    canonicalRoots.push(canonical);
+  }
+  for (const root of [...new Set(canonicalRoots)].sort()) {
+    await visit(root, 0);
   }
   if (signal?.aborted) throw runtimeProbeAbortError();
   return hash.digest("hex");
+}
+
+async function hashBoundedPythonRuntimeFiles(
+  files: readonly string[],
+  seed: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  return hashBoundedRuntimeTree(files, seed, {
+    maxFiles: MAX_PYTHON_RUNTIME_FILES,
+    maxDirectories: 1,
+    maxDirectoryEntries: 1,
+    maxDepth: 1,
+    maxFileBytes: MAX_PYTHON_RUNTIME_BYTES,
+    maxTotalBytes: MAX_PYTHON_RUNTIME_BYTES,
+    readChunkBytes: PYTHON_RUNTIME_READ_CHUNK_BYTES,
+  }, signal);
 }
 
 /** Resolve and hash the runtime that a fresh --vanilla R child will execute. */
@@ -529,9 +747,16 @@ export async function currentRRuntimeSnapshot(
   state.invoked_rscript = RSCRIPT_EXECUTABLE;
   const roots = [RSCRIPT_EXECUTABLE, state.rscript, ...runtimeFiles, ...Object.values(packagePaths)]
     .filter((path): path is string => typeof path === "string");
-  const files = [...new Set(roots.flatMap((path) => regularTreeFiles(path)))];
   return {
-    fingerprint: hashRuntimeFiles(files, stableJson(state)),
+    fingerprint: await hashBoundedRuntimeTree(roots, stableJson(state), {
+      maxFiles: MAX_R_RUNTIME_FILES,
+      maxDirectories: MAX_R_RUNTIME_DIRECTORIES,
+      maxDirectoryEntries: MAX_R_RUNTIME_DIRECTORY_ENTRIES,
+      maxDepth: MAX_R_RUNTIME_DEPTH,
+      maxFileBytes: MAX_R_RUNTIME_FILE_BYTES,
+      maxTotalBytes: MAX_R_RUNTIME_BYTES,
+      readChunkBytes: R_RUNTIME_READ_CHUNK_BYTES,
+    }, signal),
     version: state.version,
     packageVersions: packageVersions as Record<string, string | null>,
   };
@@ -712,37 +937,52 @@ export const ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES = {
 
 /** Files whose bytes determine analysis, orchestration, or verification behavior. */
 export function mutableEngineFiles(suiteRoot: string): string[] {
-  const files: string[] = [
+  return [
     ...Object.values(ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES)
       .flatMap((category) => category)
       .map((path) => join(suiteRoot, ...path.split("/"))),
     ...REGRESSION_SKILLS.map((skill) =>
       join(suiteRoot, skill, "scripts", "tests", "run_tests.R")),
   ];
-  for (const skill of readdirSync(suiteRoot).filter((name) => name.startsWith("vera-"))) {
-    const rRoot = join(suiteRoot, skill, "scripts", "R");
-    try {
-      for (const name of readdirSync(rRoot).filter((item) => item.endsWith(".R")).sort()) {
-        files.push(join(rRoot, name));
-      }
-    } catch { /* skill without an R runtime */ }
-  }
-  return files;
 }
 
-/** Hash the complete maintained engine manifest using root-relative path labels. */
-export function fingerprintMutableEngineRuntime(suiteRoot: string, seed = ""): string {
-  const root = resolve(suiteRoot);
-  const fields: Array<string | Uint8Array> = [];
-  for (const path of mutableEngineFiles(root).sort()) {
-    const absolute = resolve(path);
-    const label = relative(root, absolute).split(sep).join("/");
-    if (!label || label === ".." || label.startsWith("../")) {
-      throw new Error("engine runtime source escaped the suite root");
-    }
-    fields.push(label, readFileSync(absolute));
-  }
-  return hashFramedFields(fields, seed);
+/** Fixed files plus the five maintained R implementation directory roots. */
+export function mutableEngineRoots(suiteRoot: string): string[] {
+  return [
+    ...mutableEngineFiles(suiteRoot),
+    ...REGRESSION_SKILLS.map((skill) =>
+      join(suiteRoot, skill, "scripts", "R")),
+  ];
+}
+
+export const ENGINE_RUNTIME_FINGERPRINT_LIMITS = {
+  maxFiles: 4_096,
+  maxDirectories: 1_024,
+  maxDirectoryEntries: 8_192,
+  maxDepth: 32,
+  maxFileBytes: 16 * 1024 * 1024,
+  maxTotalBytes: 256 * 1024 * 1024,
+  readChunkBytes: 64 * 1024,
+} as const satisfies RuntimeFingerprintLimits;
+
+/**
+ * Hash the complete fixed engine manifest with suite-root-relative labels.
+ * Directory discovery is limited to the five named scripts/R roots above;
+ * ambient vera-* directories at the suite root are never enumerated.
+ */
+export async function fingerprintMutableEngineRuntime(
+  suiteRoot: string,
+  seed = "",
+  signal?: AbortSignal,
+): Promise<string> {
+  const root = realpathSync(resolve(suiteRoot));
+  return hashBoundedRuntimeTree(
+    mutableEngineRoots(root),
+    seed,
+    ENGINE_RUNTIME_FINGERPRINT_LIMITS,
+    signal,
+    root,
+  );
 }
 
 /** One resolved value plus one shared in-flight load for each fingerprint. */

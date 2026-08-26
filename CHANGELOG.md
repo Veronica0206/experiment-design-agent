@@ -4,6 +4,31 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## Unreleased — 2026-08-25 independent public-interface review
+
+- Reconciled the master-protocol MCP schema with its verifier: unsupported
+  efficacy stopping is no longer advertised, platform essentials are checked
+  before execution, and unsupported interim/platform-only combinations fail
+  with configuration errors instead of consuming an R workload first.
+- Bound A/B sizing and randomization outputs back to their effective requests,
+  including sample-size arithmetic, seeds, methods, arm rosters, allocation
+  contracts, block structure, and exact unit coverage.
+- Replaced unbounded runtime and mutable engine-source fingerprinting plus
+  inherited child environments with bounded descriptor reads, mutation
+  rebinding, cancellation, and explicit runtime environment allowlists.
+- Added a hard verifier-stdout ceiling and terminal, nonblocking JSON-RPC
+  handling. Response envelopes are validated before routing, duplicate IDs
+  retire only their own process generation, and concurrent cleanup is
+  serialized so a delayed reader cannot stop a restarted server.
+- Added a least-privilege public CI workflow for public-distribution, Node
+  lifecycle, Python contract, hook/governance, dependency, and credential
+  checks. Checkout credentials are discarded, and a structural validator pins
+  the exact read-only permissions, actions, steps, environments, and commands.
+  The public lifecycle stops honestly at the missing-engine preflight. Its
+  reduced test mode now requires an exact `--public-only` argument and rejects
+  the former ambient environment switch, so a polluted shell cannot silently
+  weaken a complete lifecycle run.
+
 ## Unreleased — 2026-08-14 public distribution boundary
 
 - Made the public portfolio boundary prominent in both READMEs: the required

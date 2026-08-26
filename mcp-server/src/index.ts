@@ -287,9 +287,10 @@ async function engineFingerprint(signal?: AbortSignal): Promise<string> {
   // recompute their hashes at provenance time rather than freezing startup state.
   const rRuntime = await currentRRuntimeSnapshot(signal);
   const pythonRuntime = await currentPythonRuntimeSnapshot(signal);
-  const fingerprint = fingerprintMutableEngineRuntime(
+  const fingerprint = await fingerprintMutableEngineRuntime(
     SUITE_ROOT,
     `${STARTUP_RUNTIME_FINGERPRINT}:${rRuntime.fingerprint}:${pythonRuntime.fingerprint}`,
+    signal,
   );
   runtimeByEngineFingerprint.set(fingerprint, { r: rRuntime, python: pythonRuntime });
   while (runtimeByEngineFingerprint.size > 16) {
@@ -971,18 +972,27 @@ registerStrictTool(
 
 // --- Tool: master_simulate ---
 
+const PLATFORM_REQUIRED_MASTER_FIELDS = [
+  "n_periods", "n_per_period", "arms_schedule",
+] as const;
+const PLATFORM_ONLY_MASTER_FIELDS = [
+  ...PLATFORM_REQUIRED_MASTER_FIELDS,
+  "shared_control", "ncc_method", "ncc_weight_decay", "rar_enabled",
+  "rar_burn_in", "rar_min_alloc", "interim_frequency", "futility_threshold",
+] as const;
+const PLATFORM_INTERIM_UNAVAILABLE_MESSAGE =
+  "interim_frequency/futility_threshold are unavailable for this endpoint and " +
+  "NCC method because no consistent interim model is implemented";
+
 registerStrictTool(
   "master_simulate",
   "Run a multi-arm adaptive design simulation: basket (with borrowing), umbrella (MAMS/DTL/BAR), or platform (with NCC adjustment). Returns OC tables, FWER, subgroup decisions, and output file paths.",
   {
     ...verificationMeta,
-    // Every key below is a real create_master_config() formal that an engine
-    // reads (or that the R layer explicitly rejects with an informative error —
-    // selection_rule / power_type / shared_control, and the design-scoped knobs
-    // phase / borrowing_method / umbrella_method / ncc_method when sent to the
-    // wrong design type). `overdispersion` and `rar_eta` stay unexposed: no
-    // engine reads them and R rejects them, so with .strict() they fail loudly
-    // here instead of being zod-stripped into a silent default run.
+    // Every key below is part of the implemented or explicitly rejected public
+    // contract. Unsupported controls such as effect_threshold, overdispersion,
+    // and rar_eta stay unexposed, so .strict() rejects them at the boundary
+    // instead of allowing a run under a capability label the engine cannot honor.
     config: z.object({
       master_design_type: z.enum(["basket", "umbrella", "platform"]),
       endpoint_type: z.enum(["binary", "continuous", "tte", "incidence_rate"]),
@@ -1049,8 +1059,10 @@ registerStrictTool(
       power_type: z.enum(["one_minimum"]).optional()
         .describe("Only 'one_minimum' exists — power is always reported per-arm / at-least-one-minimum. Any other value is REJECTED by the R layer."),
       // Platform-specific
-      n_periods: z.number().int().min(2).max(100).optional(),
-      n_per_period: z.number().int().min(1).max(100000).optional(),
+      n_periods: z.number().int().min(2).max(100).optional()
+        .describe("Platform designs only: required number of enrollment periods"),
+      n_per_period: z.number().int().min(1).max(100000).optional()
+        .describe("Platform designs only: required participants per period"),
       arms_schedule: z.object({
         enter: z.array(z.number().int()).min(2).max(50).describe("Period each arm enters (length = n_subgroups)"),
         leave: z.array(z.number().int()).min(2).max(50).describe("Period each arm leaves (length = n_subgroups, each >= enter)"),
@@ -1068,11 +1080,9 @@ registerStrictTool(
       rar_min_alloc: z.number().gt(0).lt(1).optional()
         .describe("Platform RAR: minimum allocation fraction per arm (default 0.10)"),
       interim_frequency: z.number().int().min(1).optional()
-        .describe("Platform: interim analysis every N periods (default 1)"),
-      effect_threshold: z.number().gt(0).lt(1).optional()
-        .describe("Platform: posterior probability threshold for early effect stopping (default 0.99)"),
+        .describe("Platform binary/continuous with ncc_method='none' only: interim analysis every N periods (default 1)"),
       futility_threshold: z.number().gt(0).lt(1).optional()
-        .describe("Platform: posterior probability threshold for early futility stopping (default 0.05)"),
+        .describe("Platform binary/continuous with ncc_method='none' only: posterior probability threshold for early futility stopping (default 0.05). Early efficacy stopping is not exposed."),
       // Endpoint-specific
       accrual_time: z.number().positive().optional(),
       followup_time: z.number().positive().optional(),
@@ -1088,13 +1098,67 @@ registerStrictTool(
     const domain = { ...identityDomain };
     const cfgForBudget = domain.config as Record<string, unknown>;
     const designType = String(cfgForBudget.master_design_type);
-    const nSims = Number(cfgForBudget.n_sims ?? 10000);
-    const nSubgroups = Number(cfgForBudget.n_subgroups);
+    const nSims = typeof cfgForBudget.n_sims === "number"
+      ? cfgForBudget.n_sims : 10000;
+    const nSubgroups = cfgForBudget.n_subgroups as number;
+    let platformBudget: { nPeriods: number; nPerPeriod: number } | undefined;
+    if (designType === "platform") {
+      if (PLATFORM_REQUIRED_MASTER_FIELDS.some(
+        (field) => cfgForBudget[field] === undefined,
+      )) {
+        throw new Error(
+          "platform designs require n_periods, n_per_period, and arms_schedule",
+        );
+      }
+      const nPeriods = cfgForBudget.n_periods as number;
+      const nPerPeriod = cfgForBudget.n_per_period as number;
+      const schedule = cfgForBudget.arms_schedule as {
+        enter: number[];
+        leave: number[];
+      };
+      if (schedule.enter.length !== nSubgroups ||
+          schedule.leave.length !== nSubgroups) {
+        throw new Error(
+          "arms_schedule enter and leave must each contain exactly n_subgroups values",
+        );
+      }
+      const scheduleIsValid = schedule.enter.every((enter, index) => {
+        const leave = schedule.leave[index];
+        return Number.isInteger(enter) && Number.isInteger(leave) &&
+          enter >= 1 && enter <= leave && leave <= nPeriods;
+      });
+      if (!scheduleIsValid) {
+        throw new Error(
+          "arms_schedule must satisfy 1 <= enter[i] <= leave[i] <= n_periods for every subgroup",
+        );
+      }
+      const hasInterimSettings = cfgForBudget.interim_frequency !== undefined ||
+        cfgForBudget.futility_threshold !== undefined;
+      const interimSettingsSupported =
+        ["binary", "continuous"].includes(String(cfgForBudget.endpoint_type)) &&
+        cfgForBudget.ncc_method === "none";
+      if (hasInterimSettings && !interimSettingsSupported) {
+        throw new Error(PLATFORM_INTERIM_UNAVAILABLE_MESSAGE);
+      }
+      platformBudget = { nPeriods, nPerPeriod };
+    } else if (PLATFORM_ONLY_MASTER_FIELDS.some(
+      (field) => cfgForBudget[field] !== undefined,
+    )) {
+      throw new Error(
+        "platform-only configuration fields require master_design_type='platform'",
+      );
+    }
+    const nPerSubgroup = typeof cfgForBudget.n_per_subgroup === "number"
+      ? cfgForBudget.n_per_subgroup : 25;
+    const nPerArmStage = typeof cfgForBudget.n_per_arm_stage === "number"
+      ? cfgForBudget.n_per_arm_stage : 9;
+    const nStages = typeof cfgForBudget.n_stages === "number"
+      ? cfgForBudget.n_stages : 2;
     const workload = designType === "basket"
-      ? nSims * nSubgroups * Number(cfgForBudget.n_per_subgroup ?? 25)
+      ? nSims * nSubgroups * nPerSubgroup
       : designType === "umbrella"
-        ? nSims * (nSubgroups + 1) * Number(cfgForBudget.n_per_arm_stage ?? 9) * Number(cfgForBudget.n_stages ?? 2)
-        : nSims * Number(cfgForBudget.n_periods) * Number(cfgForBudget.n_per_period);
+        ? nSims * (nSubgroups + 1) * nPerArmStage * nStages
+        : nSims * platformBudget!.nPeriods * platformBudget!.nPerPeriod;
     if (!Number.isFinite(workload) || workload > MAX_SIMULATED_UNITS) {
       throw new Error(
         `requested ${designType} workload=${workload} simulated units exceeds the ` +
@@ -1159,9 +1223,6 @@ registerStrictTool(
           drops.reduce((sum, value) => sum + value, 0) >= arms)) {
         throw new Error("n_drop_per_stage must cover every interim and leave at least one arm");
       }
-    }
-    if (designType === "platform" && Number(cfgForBudget.futility_threshold ?? 0.05) >= Number(cfgForBudget.effect_threshold ?? 0.99)) {
-      throw new Error("futility_threshold must be below effect_threshold");
     }
     const executionFingerprint = await engineFingerprint(signal);
     const regression = await regressionAttestation(executionFingerprint, signal);
@@ -1466,7 +1527,7 @@ registerStrictTool(
 
 registerStrictTool(
   "randomize",
-  "Generate a seeded treatment-assignment plan for n units. method='simple' is unrestricted; 'block' uses permuted blocks for balance; 'stratified' block-randomizes within each stratum. Supports >2 arms and an allocation ratio.",
+  "Generate a seeded treatment-assignment plan for n units. method='simple' is unrestricted equal-probability randomization; a non-equal allocation ratio requires 'block' or 'stratified'. 'block' uses permuted blocks for balance; 'stratified' block-randomizes within each stratum.",
   {
     ...verificationMeta,
     n: z.number().int().min(1).max(10000),
@@ -1478,10 +1539,22 @@ registerStrictTool(
     block_size: z.number().int().min(1).max(10000).optional()
       .describe("Block/stratified only. Honored only when it is a whole multiple of the smallest exact integer allocation implied by the ratio; otherwise that exact base block is used. The effective size is echoed as block_size_used."),
     strata: z.array(z.union([z.string().max(MAX_LABEL_CHARS), z.number()])).max(10000).optional().describe("Per-unit stratum labels (length n), required for method='stratified'"),
-    ratio: z.array(z.number().positive()).min(2).max(100).optional().describe("Positive allocation weights, one per arm"),
+    ratio: z.array(z.number().positive()).min(2).max(100).optional()
+      .describe("Positive allocation weights, one per arm. Non-equal weights require method='block' or 'stratified'; method='simple' supports equal weights only."),
     seed: z.number().int().min(0).max(2147483647).optional(),
   },
-  async (params, signal) => runRandomizeTool(params, signal)
+  async (params, signal) => {
+    const method = String(params.method ?? "simple");
+    const ratio = params.ratio as number[] | undefined;
+    if (method === "simple" && ratio &&
+        ratio.some((weight) => weight !== ratio[0])) {
+      throw new Error(
+        "method='simple' supports only equal allocation; use method='block' or " +
+        "'stratified' for a non-equal ratio",
+      );
+    }
+    return runRandomizeTool(params, signal);
+  }
 );
 
 // --- Tool: run_tests ---

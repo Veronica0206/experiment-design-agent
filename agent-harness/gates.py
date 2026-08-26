@@ -21,8 +21,10 @@ import stat
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
+from fractions import Fraction
 from itertools import product
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 
 from artifact_download import MAX_ARTIFACT_BYTES
@@ -448,56 +450,168 @@ def check_config_completeness(config: dict) -> GateVerdict:
                        blocked=blocked, notes=notes)
 
 
-# ── A/B test result sanity ─────────────────────────────────────────
+# ── A/B test result sanity + request fidelity ──────────────────────
 
-def check_ab_test(result: dict) -> GateVerdict:
-    """Sanity + completeness for the two-arm A/B sizing result (doe.R
-    ab_test_size): positive arms, a non-zero MDE, a valid sidedness, and an
-    achieved power that actually meets the target it solved for."""
+def check_ab_test(result: dict, args: dict) -> GateVerdict:
+    """Bind a two-arm A/B sizing result to the public request.
+
+    The R result reports the *effective* MDE rather than ``effect`` and
+    ``effect_type`` separately, so those request fields are normalized to the
+    same effective MDE before comparison. Likewise, ``sd`` is not echoed for
+    mean outcomes; its use is independently bound by reconstructing the
+    closed-form normal-approximation sample size.
+    """
     checks: dict[str, bool] = {}
     failures: list[str] = []
     if not isinstance(result, dict):
         return GateVerdict(passed=False, failures=["ab_test returned no parseable result"])
     if result.get("error"):
         return GateVerdict(passed=False, checks={"no_tool_error": False},
-                           failures=[f"tool returned error: {result['error']}"])
+                           failures=["ab_test returned an error"])
+    if not isinstance(args, dict):
+        return GateVerdict(passed=False, checks={"request_contract": False},
+                           failures=["ab_test request is missing or malformed"])
 
-    def _pos(key: str) -> bool:
-        v = result.get(key)
-        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
-        checks[f"{key}_positive"] = ok
+    # Defaults are the current public MCP defaults and match ab_test_size.
+    baseline = args.get("baseline")
+    effect = args.get("effect")
+    metric = args.get("metric", "proportion")
+    effect_type = args.get("effect_type", "absolute")
+    alpha = args.get("alpha", 0.05)
+    power = args.get("power", 0.8)
+    sided = args.get("sided", 2)
+    ratio = args.get("ratio", 1)
+    sd = args.get("sd")
+
+    numeric_request = all(_num(value) for value in
+                          (baseline, effect, alpha, power, ratio))
+    request_valid = (
+        numeric_request
+        and metric in {"proportion", "mean"}
+        and effect_type in {"absolute", "relative"}
+        and 0 < alpha < 1 and 0 < power < 1 and ratio > 0
+        and isinstance(sided, int) and not isinstance(sided, bool)
+        and sided in {1, 2}
+        and (metric != "mean" or (_num(sd) and sd > 0))
+    )
+    checks["request_contract"] = request_valid
+    if not request_valid:
+        return GateVerdict(
+            passed=False, checks=checks,
+            failures=["ab_test request fields are missing, invalid, or inconsistent"],
+        )
+
+    effective_mde = effect if effect_type == "absolute" else baseline * effect
+    nonzero_mde = math.isfinite(effective_mde) and effective_mde != 0
+    checks["effective_mde_nonzero"] = nonzero_mde
+    if not nonzero_mde:
+        failures.append("requested effective minimum detectable effect is not finite and non-zero")
+
+    if metric == "proportion":
+        treatment_rate = baseline + effective_mde
+        rates_valid = 0 < baseline < 1 and 0 < treatment_rate < 1
+        checks["proportion_rates_in_bounds"] = rates_valid
+        if not rates_valid:
+            failures.append("requested control or treatment proportion is outside (0, 1)")
+
+    def _bind_number(check_name: str, result_key: str,
+                     expected: int | float) -> bool:
+        actual = result.get(result_key)
+        try:
+            actual_decimal = (Decimal(actual) if isinstance(actual, int)
+                              else Decimal(repr(actual)))
+            expected_decimal = (Decimal(expected) if isinstance(expected, int)
+                                else Decimal(repr(expected)))
+            # jsonlite's default encoder rounds ordinary decimals to four
+            # places. Keep the tolerance absolute so large means cannot hide
+            # materially different requested values behind a relative window.
+            ok = (_num(actual)
+                  and abs(actual_decimal - expected_decimal) <= Decimal("0.000051"))
+        except (InvalidOperation, ValueError, OverflowError):
+            ok = False
+        checks[check_name] = ok
         if not ok:
-            failures.append(f"{key}={v}, expected positive")
+            failures.append(f"ab_test result does not match requested {check_name}")
         return ok
 
-    _pos("n_total"); _pos("n_control"); _pos("n_treatment")
+    checks["metric_matches_request"] = result.get("metric") == metric
+    if not checks["metric_matches_request"]:
+        failures.append("ab_test result metric does not match the request")
+    _bind_number("baseline", "baseline", baseline)
+    _bind_number("effective_mde", "mde", effective_mde)
+    result_mde = result.get("mde")
+    checks["result_mde_nonzero"] = _num(result_mde) and result_mde != 0
+    if not checks["result_mde_nonzero"]:
+        failures.append("ab_test result mde is missing or zero")
+    _bind_number("alpha", "alpha", alpha)
+    _bind_number("target_power", "target_power", power)
+    _bind_number("allocation_ratio", "allocation_ratio", ratio)
+    result_sided = result.get("sided")
+    checks["sided_matches_request"] = (
+        isinstance(result_sided, int) and not isinstance(result_sided, bool)
+        and result_sided == sided
+    )
+    if not checks["sided_matches_request"]:
+        failures.append("ab_test result sidedness does not match the request")
 
-    mde = result.get("mde")
-    checks["mde_nonzero"] = isinstance(mde, (int, float)) and mde != 0
-    if not checks["mde_nonzero"]:
-        failures.append(f"mde={mde}, expected a non-zero minimum detectable effect")
+    def _positive_integer(key: str) -> int | None:
+        value = result.get(key)
+        ok = isinstance(value, int) and not isinstance(value, bool) and value > 0
+        checks[f"{key}_positive_integer"] = ok
+        if not ok:
+            failures.append(f"ab_test result {key} is not a positive integer")
+        return value if ok else None
 
-    sided = result.get("sided")
-    checks["sided_valid"] = sided in (1, 2)
-    if not checks["sided_valid"]:
-        failures.append(f"sided={sided}, expected 1 or 2")
+    n_total = _positive_integer("n_total")
+    n_control = _positive_integer("n_control")
+    n_treatment = _positive_integer("n_treatment")
+    count_sum_ok = (
+        n_total is not None and n_control is not None and n_treatment is not None
+        and n_control + n_treatment == n_total
+    )
+    checks["arm_counts_sum_to_total"] = count_sum_ok
+    if not count_sum_ok:
+        failures.append("ab_test arm counts do not sum to n_total")
+
+    rounding_ok = (
+        n_control is not None and n_treatment is not None
+        and abs(n_treatment - ratio * n_control) <= 1 + 1e-9
+    )
+    checks["integer_allocation_matches_ratio"] = rounding_ok
+    if not rounding_ok:
+        failures.append("ab_test integer arm counts are incompatible with the allocation ratio")
+
+    # Mean sizing is the one place a request parameter (sd) is not directly
+    # echoed. Reconstructing n_control proves that the requested sd, alpha,
+    # power, sidedness, allocation ratio, and effective MDE all reached sizing.
+    if metric == "mean" and nonzero_mde and n_control is not None:
+        try:
+            z_alpha = NormalDist().inv_cdf(1 - alpha / sided)
+            z_power = NormalDist().inv_cdf(power)
+            raw_control = (
+                ((z_alpha + z_power) * sd / effective_mde) ** 2
+                * (1 + 1 / ratio)
+            )
+            expected_control = math.ceil(raw_control)
+            mean_size_ok = abs(n_control - expected_control) <= 1
+        except (OverflowError, ValueError):
+            mean_size_ok = False
+        checks["mean_sd_and_size_match_request"] = mean_size_ok
+        if not mean_size_ok:
+            failures.append("mean ab_test sample size does not match the requested sd and design")
 
     target = result.get("target_power")
     achieved = result.get("achieved_power")
-    blocked: list[str] = []
-    if isinstance(target, (int, float)) and isinstance(achieved, (int, float)):
-        # The design solves n to hit target; ceiling makes achieved >= target
-        # (small tolerance). A large shortfall means the sizing is wrong.
-        ok = achieved >= target - 0.02
-        checks["power_meets_target"] = ok
-        if not ok:
-            failures.append(f"achieved_power={achieved} well below target={target}")
-    else:
-        # Never let a renamed/missing field make this check silently vacuous —
-        # a clean PASS must mean the check actually ran.
-        failures.append("target_power/achieved_power missing or non-numeric")
-    return GateVerdict(passed=not failures, checks=checks, failures=failures,
-                       blocked=blocked)
+    achieved_valid = _num(achieved) and 0 <= achieved <= 1
+    checks["achieved_power_valid"] = achieved_valid
+    if not achieved_valid:
+        failures.append("achieved_power is missing or outside [0, 1]")
+    power_ok = _num(target) and achieved_valid and achieved >= target - 0.02
+    checks["power_meets_target"] = power_ok
+    if not power_ok:
+        failures.append("achieved_power is materially below target_power")
+
+    return GateVerdict(passed=not failures, checks=checks, failures=failures)
 
 
 # ── sample_size table sanity ───────────────────────────────────────
@@ -1482,58 +1596,291 @@ def check_meta(result: dict, args: dict) -> GateVerdict:
                        blocked=blocked, notes=notes)
 
 
-# ── Randomization plan invariants ──────────────────────────────────
+# ── Randomization plan invariants + request fidelity ───────────────
+
+def _integer_allocation_weights(values: list[int | float]) -> list[int] | None:
+    """Normalize positive JSON weights to their smallest integer allocation.
+
+    Decimal JSON numbers such as 1.3333333333 are transport approximations to
+    simple requested ratios (4/3 here). A denominator cap at the public maximum
+    block size recovers that intent without creating unbounded integer quotas
+    inside the verifier.
+    """
+    if not values or not all(_num(value) and value > 0 for value in values):
+        return None
+    fractions = [Fraction(str(value)).limit_denominator(10_000)
+                 for value in values]
+    if any(value.numerator <= 0 for value in fractions):
+        return None
+    denominator = math.lcm(*(value.denominator for value in fractions))
+    whole = [value.numerator * (denominator // value.denominator)
+             for value in fractions]
+    divisor = math.gcd(*whole)
+    normalized = [value // divisor for value in whole]
+    if not normalized or sum(normalized) > 10_000:
+        return None
+    return normalized
+
+
+def _allocation_sequence_matches(rows: list[dict], arms: list[str],
+                                 quota: list[int], block_size: int) -> bool:
+    """Check every complete permuted block and the capacity of its final tail."""
+    base_size = sum(quota)
+    if block_size < base_size or block_size % base_size:
+        return False
+    per_block = {
+        arm: weight * (block_size // base_size)
+        for arm, weight in zip(arms, quota)
+    }
+    labels = [row.get("arm") for row in sorted(rows, key=lambda row: row["unit"])]
+    for start in range(0, len(labels), block_size):
+        chunk = labels[start:start + block_size]
+        observed = Counter(chunk)
+        if len(chunk) == block_size:
+            if any(observed.get(arm, 0) != per_block[arm] for arm in arms):
+                return False
+        elif any(observed.get(arm, 0) > per_block[arm] for arm in arms):
+            return False
+    return True
+
 
 def check_randomize(result: dict, args: dict) -> GateVerdict:
-    """Structural invariants of the assignment plan: every unit assigned, arm
-    labels consistent, counts sum to n, and the seed echoed for reproduction."""
+    """Bind a randomization plan to n, method, arms, ratio, seed, and units.
+
+    ``simple`` randomization is accepted only for equal allocation weights: its
+    result does not echo weights, so a non-equal request cannot be proven from a
+    finite stochastic realization. Block and stratified requests are bound by
+    their exact integer quota in every complete block (and by the quota capacity
+    of the final partial block).
+    """
     checks: dict[str, bool] = {}
     failures: list[str] = []
-    blocked: list[str] = []
     if not isinstance(result, dict):
         return GateVerdict(passed=False, failures=["no parseable result"])
     if result.get("error"):
         return GateVerdict(passed=False, checks={"no_tool_error": False},
-                           failures=[f"tool returned error: {result['error']}"])
+                           failures=["randomize returned an error"])
+    if not isinstance(args, dict):
+        return GateVerdict(passed=False, checks={"request_contract": False},
+                           failures=["randomize request is missing or malformed"])
+
+    requested_n = args.get("n")
+    requested_method = args.get("method", "simple")
+    requested_seed = args.get("seed", 42)
+    requested_arms = args.get("arms", 2)
+    if (isinstance(requested_arms, int) and not isinstance(requested_arms, bool)
+            and 2 <= requested_arms <= 100):
+        normalized_arms = [f"arm{index}" for index in range(1, requested_arms + 1)]
+    elif isinstance(requested_arms, list) and 2 <= len(requested_arms) <= 100:
+        normalized_arms = list(requested_arms)
+    else:
+        normalized_arms = []
+    requested_ratio = args.get("ratio", [1] * len(normalized_arms))
+    quota = (
+        _integer_allocation_weights(requested_ratio)
+        if isinstance(requested_ratio, list) and 2 <= len(requested_ratio) <= 100
+        else None
+    )
+    requested_block = args.get("block_size")
+    requested_strata = args.get("strata")
+
+    request_valid = (
+        isinstance(requested_n, int) and not isinstance(requested_n, bool)
+        and 1 <= requested_n <= 10_000
+        and requested_method in {"simple", "block", "stratified"}
+        and len(normalized_arms) >= 2
+        and all(isinstance(arm, str) for arm in normalized_arms)
+        and len(set(normalized_arms)) == len(normalized_arms)
+        and quota is not None and len(quota) == len(normalized_arms)
+        and isinstance(requested_seed, int) and not isinstance(requested_seed, bool)
+        and 0 <= requested_seed <= 2_147_483_647
+        and (requested_block is None or (
+            isinstance(requested_block, int) and not isinstance(requested_block, bool)
+            and 1 <= requested_block <= 10_000
+        ))
+        and (requested_method != "stratified" or (
+            isinstance(requested_strata, list)
+            and len(requested_strata) == requested_n
+            and all(isinstance(value, str) or _num(value)
+                    for value in requested_strata)
+        ))
+    )
+    checks["request_contract"] = request_valid
+    if not request_valid:
+        return GateVerdict(
+            passed=False, checks=checks,
+            failures=["randomize request fields are missing, invalid, or inconsistent"],
+        )
+
+    normalized_strata = requested_strata
+    if requested_method == "stratified" and any(
+            isinstance(value, str) for value in requested_strata):
+        # jsonlite simplifies a mixed string/number array to an R character
+        # vector before randomize_units sees it. Mirror that effective request
+        # without ever placing the private labels in checks or failures.
+        def _r_character(value: Any) -> str:
+            if isinstance(value, str):
+                return value
+            if isinstance(value, int):
+                return str(value)
+            if value == 0:
+                return "0"
+            if float(value).is_integer():
+                return str(int(value))
+            return format(value, ".15g")
+        normalized_strata = [_r_character(value) for value in requested_strata]
+
+    if requested_method == "simple":
+        equal_ratio = len(set(quota)) == 1
+        checks["simple_ratio_is_provable"] = equal_ratio
+        if not equal_ratio:
+            failures.append(
+                "simple randomization cannot verify a non-equal allocation ratio"
+            )
+
     n = result.get("n")
     assignment = result.get("assignment")
     arms = result.get("arms")
     counts = result.get("counts")
-    if not (_num(n) and isinstance(assignment, list)):
-        return GateVerdict(passed=False, checks={"assignment_contract": False},
-                           failures=["randomize output missing numeric n or assignment rows"])
-    if not (isinstance(arms, list) and arms):
-        failures.append("randomize output missing declared arms")
-    if not isinstance(counts, dict):
-        failures.append("randomize output missing arm counts")
-    checks["all_units_assigned"] = len(assignment) == n
-    if len(assignment) != n:
-        failures.append(f"{len(assignment)} assignment rows for n={n}")
-    if isinstance(counts, dict):
-        total = sum(v for v in counts.values() if _num(v))
-        checks["counts_sum_to_n"] = total == n
-        if total != n:
-            failures.append(f"arm counts sum to {total}, expected n={n}")
-    if isinstance(arms, list) and arms:
-        assigned_arms = {r.get("arm") for r in assignment if isinstance(r, dict)}
-        ok = assigned_arms.issubset(set(arms))
-        checks["arm_labels_consistent"] = ok
-        if not ok:
-            failures.append(f"assignment uses arm labels {assigned_arms - set(arms)} "
-                            "not in the declared arms")
-    unit_ids = [r.get("unit", r.get("unit_id"))
-                for r in assignment if isinstance(r, dict)]
-    unique_units = (len(unit_ids) == len(assignment)
-                    and all(v is not None for v in unit_ids)
-                    and len(set(unit_ids)) == len(unit_ids))
-    checks["unit_ids_unique"] = unique_units
-    if not unique_units:
-        failures.append("assignment unit identifiers are missing or duplicated")
-    checks["seed_echoed"] = _num(result.get("seed"))
-    if not checks["seed_echoed"]:
-        failures.append("seed not echoed — plan not independently reproducible")
-    return GateVerdict(passed=not failures, checks=checks, failures=failures,
-                       blocked=blocked)
+    n_matches = (
+        isinstance(n, int) and not isinstance(n, bool) and n == requested_n
+    )
+    checks["n_matches_request"] = n_matches
+    if not n_matches:
+        failures.append("randomize result n does not match the request")
+    checks["method_matches_request"] = result.get("method") == requested_method
+    if not checks["method_matches_request"]:
+        failures.append("randomize result method does not match the request")
+    checks["arms_match_request"] = arms == normalized_arms
+    if not checks["arms_match_request"]:
+        failures.append("randomize result arms do not match the request")
+    seed_matches = (
+        isinstance(result.get("seed"), int)
+        and not isinstance(result.get("seed"), bool)
+        and result.get("seed") == requested_seed
+    )
+    checks["seed_matches_request"] = seed_matches
+    if not seed_matches:
+        failures.append("randomize result seed does not match the effective request seed")
+
+    rows_valid = (
+        isinstance(assignment, list)
+        and len(assignment) == requested_n
+        and all(isinstance(row, dict) for row in assignment)
+    )
+    checks["assignment_rows_valid"] = rows_valid
+    if not rows_valid:
+        failures.append("randomize assignment rows are missing or malformed")
+    rows = assignment if rows_valid else []
+    unit_ids = [row.get("unit") for row in rows]
+    units_exact = (
+        rows_valid
+        and all(isinstance(unit, int) and not isinstance(unit, bool)
+                for unit in unit_ids)
+        and sorted(unit_ids) == list(range(1, requested_n + 1))
+    )
+    checks["requested_units_exactly_once"] = units_exact
+    if not units_exact:
+        failures.append("randomize result does not assign every requested unit exactly once")
+
+    assignment_arms_valid = (
+        rows_valid and all(row.get("arm") in normalized_arms for row in rows)
+    )
+    checks["assignment_arms_valid"] = assignment_arms_valid
+    if not assignment_arms_valid:
+        failures.append("randomize assignment contains an undeclared arm")
+
+    counts_valid = (
+        isinstance(counts, dict)
+        and set(counts) == set(normalized_arms)
+        and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in counts.values())
+        and sum(counts.values()) == requested_n
+    )
+    checks["declared_counts_valid"] = counts_valid
+    if not counts_valid:
+        failures.append("randomize arm counts are missing, malformed, or do not sum to n")
+    counts_match = (
+        counts_valid and assignment_arms_valid
+        and Counter(row["arm"] for row in rows) == Counter(counts)
+    )
+    checks["counts_match_assignment"] = counts_match
+    if not counts_match:
+        failures.append("randomize arm counts do not match the assignment rows")
+
+    strata_match = True
+    if requested_method == "stratified":
+        strata_match = units_exact and all(
+            row.get("stratum") == normalized_strata[row["unit"] - 1]
+            for row in rows
+        )
+        if not strata_match:
+            failures.append("stratified assignment does not match requested unit strata")
+    else:
+        strata_match = rows_valid and all(row.get("stratum") is None for row in rows)
+        if not strata_match:
+            failures.append("non-stratified assignment unexpectedly contains strata")
+    checks["unit_strata_contract"] = strata_match
+
+    ratio_contract = requested_method == "simple" and len(set(quota)) == 1
+    if requested_method == "simple":
+        empty_block = (
+            "block_size_used" in result
+            and result.get("block_size_used") in (None, {}, [])
+        )
+        checks["simple_has_no_block_size"] = empty_block
+        if not empty_block:
+            failures.append("simple randomization reported a non-empty block size")
+    else:
+        base_size = sum(quota)
+        expected_block = (
+            requested_block
+            if requested_block is not None and requested_block % base_size == 0
+            else base_size
+        )
+        used = result.get("block_size_used")
+        block_contract = (
+            isinstance(used, int) and not isinstance(used, bool)
+            and used == expected_block
+        )
+        checks["effective_block_size_matches_request"] = block_contract
+        if not block_contract:
+            failures.append("randomize effective block size does not follow the requested rule")
+
+        if block_contract and units_exact and assignment_arms_valid and strata_match:
+            if requested_method == "block":
+                ratio_contract = _allocation_sequence_matches(
+                    rows, normalized_arms, quota, expected_block
+                )
+            else:
+                rows_by_stratum: dict[Any, list[dict]] = {}
+                for row in rows:
+                    stratum = normalized_strata[row["unit"] - 1]
+                    rows_by_stratum.setdefault(stratum, []).append(row)
+                ratio_contract = True
+                for stratum_rows in rows_by_stratum.values():
+                    if not _allocation_sequence_matches(
+                            stratum_rows, normalized_arms, quota, expected_block):
+                        ratio_contract = False
+                        break
+            if not ratio_contract:
+                failures.append("randomize assignment blocks do not match the requested ratio")
+        else:
+            ratio_contract = False
+    checks["allocation_ratio_matches_request"] = ratio_contract
+
+    # Future engine versions may echo the normalized ratio. Bind it when
+    # present, but do not require a field that the current public result omits.
+    if "ratio" in result:
+        echoed = result.get("ratio")
+        echoed_quota = (_integer_allocation_weights(echoed)
+                        if isinstance(echoed, list) else None)
+        echoed_ok = echoed_quota == quota
+        checks["echoed_ratio_matches_request"] = echoed_ok
+        if not echoed_ok:
+            failures.append("randomize echoed ratio does not match the request")
+
+    return GateVerdict(passed=not failures, checks=checks, failures=failures)
 
 
 # ── Factorial / RSM design invariants ──────────────────────────────
@@ -2111,7 +2458,7 @@ def design_checks_for(tool_name: str, args: dict, result: dict) -> list[GateVerd
         verdicts.append(check_config_completeness(args))
         verdicts.append(check_sample_size(result, args))
     elif tool_name == "ab_test":
-        verdicts.append(check_ab_test(result))
+        verdicts.append(check_ab_test(result, args))
     elif tool_name == "indirect_compare":
         verdicts.append(check_bucher(result, args))
     elif tool_name == "meta_analyze":

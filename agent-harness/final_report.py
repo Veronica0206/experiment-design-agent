@@ -241,7 +241,7 @@ _MASTER_CONFIG = {
     "master_design_type", "endpoint_type", "n_subgroups", "null_params", "alt_params",
     "n_per_subgroup", "n_sims", "seed", "alpha", "n_arms", "n_stages",
     "n_per_arm_stage", "n_periods", "n_per_period", "arms_schedule", "go_threshold",
-    "nogo_threshold", "futility_threshold", "effect_threshold", "sd", "accrual_time",
+    "nogo_threshold", "futility_threshold", "sd", "accrual_time",
     "followup_time", "exposure_time", "tte_method", "rate_method", "borrowing_method",
     "phase", "n_interims", "n_per_interim", "tau_prior", "homogeneity_prior",
     "response_prior", "cbhm_a", "cbhm_b", "ia_pruning_alpha", "chen_strategy",

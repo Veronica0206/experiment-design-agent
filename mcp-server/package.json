@@ -11,6 +11,7 @@
     "start": "node dist/index.js",
     "prepublishOnly": "node scripts/block-publish.mjs",
     "test:private": "node tests/private-package.mjs",
+    "test:public-lifecycle": "npm run build && npm run test:private && EXPDESIGN_RSCRIPT=/usr/bin/false node tests/lifecycle.mjs --public-only",
     "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs"
   },
   "dependencies": {

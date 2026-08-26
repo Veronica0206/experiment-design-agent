@@ -13,6 +13,7 @@ import {
 const SUITE_ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const VERIFIER = resolve(SUITE_ROOT, "agent-harness", "server_verify.py");
 const VERIFY_TIMEOUT_MS = 30_000;
+export const MAX_VERIFIER_STDOUT_BYTES = 5 * 1024 * 1024;
 
 interface ActiveVerifierProcessGroup {
   terminate: () => void;
@@ -97,8 +98,8 @@ export function runVerifierRequest(
         env: sanitizedPythonChildEnvironment(),
       },
     );
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    let stdoutBytes = 0;
     let settled = false;
     let stopping = false;
     let abortListening = false;
@@ -155,10 +156,21 @@ export function runVerifierRequest(
       );
     }, VERIFY_TIMEOUT_MS);
 
-    proc.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr = (stderr + chunk.toString()).slice(-4000);
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (stdoutBytes + bytes.length > MAX_VERIFIER_STDOUT_BYTES) {
+        stopProcessGroup(new Error(
+          `verification process output exceeded the ${MAX_VERIFIER_STDOUT_BYTES}-byte limit`,
+        ));
+        return;
+      }
+      stdoutBytes += bytes.length;
+      stdoutChunks.push(bytes);
     });
+    // Drain stderr so a verifier cannot block on a full pipe. Its content may
+    // contain request values or paths, so it is never reflected to callers.
+    proc.stderr?.on("data", () => {});
     proc.stdin?.on("error", () => { /* close/error supplies the final verdict */ });
     proc.on("error", (error) => {
       // A failed spawn has no process group and no group to await. If a pid was
@@ -169,13 +181,14 @@ export function runVerifierRequest(
     proc.on("close", (code) => {
       markClosed();
       if (settled) return;
+      const stdout = Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8");
       try {
         const parsed = JSON.parse(stdout) as VerificationEnvelope;
         if (code !== 0 || !parsed || typeof parsed.presentable !== "boolean") {
-          fail(new Error(`verification process failed: ${stderr || stdout}`));
+          fail(new Error("verification process failed without a valid envelope"));
         } else succeed(parsed);
-      } catch (error) {
-        fail(new Error(`verification process returned invalid JSON: ${String(error)}`));
+      } catch {
+        fail(new Error("verification process returned invalid JSON"));
       }
     });
     if (processGroupId !== undefined) {

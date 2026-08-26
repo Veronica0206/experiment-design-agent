@@ -176,8 +176,9 @@ make public-check
 ```
 
 It validates the public path policy, installs and compiles the distributed MCP
-interface, and confirms that the npm package remains non-publishable. It does
-not execute or attest the omitted statistical engines.
+interface, confirms that the npm package remains non-publishable, and exercises
+the public-safe lifecycle through the fail-closed missing-engine preflight. It
+does not execute or attest the omitted statistical engines.
 
 This project is a research and design-support tool. Final study decisions remain
 the responsibility of qualified domain experts.

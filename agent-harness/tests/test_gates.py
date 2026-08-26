@@ -206,15 +206,63 @@ v = check_single_endpoint(missing_mc, {"design": "single_arm",
 check("se_missing_mc_uncertainty_fails", not v.passed, str(v))
 
 # ── check_ab_test ──────────────────────────────────────────────────
-ab_ok = {"n_total": 200, "n_control": 100, "n_treatment": 100, "mde": 0.05,
-         "sided": 2, "target_power": 0.8, "achieved_power": 0.81}
-v = check_ab_test(ab_ok)
+ab_args = {
+    "baseline": 0.1, "effect": 0.02, "metric": "proportion",
+    "effect_type": "absolute", "alpha": 0.05, "power": 0.8,
+    "sided": 2, "ratio": 1,
+}
+ab_ok = {
+    "metric": "proportion", "n_control": 3839, "n_treatment": 3839,
+    "n_total": 7678, "allocation_ratio": 1, "mde": 0.02,
+    "baseline": 0.1, "alpha": 0.05, "sided": 2,
+    "target_power": 0.8, "achieved_power": 0.8001,
+}
+v = check_ab_test(ab_ok, ab_args)
 check("ab_good_passes", v.passed and not v.blocked, str(v))
-v = check_ab_test({k: v2 for k, v2 in ab_ok.items()
-                   if k not in ("target_power", "achieved_power")})
+v = check_ab_test(ab_ok, {"baseline": 0.1, "effect": 0.02})
+check("ab_public_defaults_pass", v.passed, str(v))
+v = check_ab_test({k: value for k, value in ab_ok.items()
+                   if k not in ("target_power", "achieved_power")}, ab_args)
 check("ab_missing_power_fails", not v.passed, str(v))
-v = check_ab_test(dict(ab_ok, achieved_power=0.5))
+v = check_ab_test(dict(ab_ok, achieved_power=0.5), ab_args)
 check("ab_power_shortfall_fails", not v.passed, str(v))
+
+for field, bad_value in (
+    ("baseline", 0.2), ("mde", 0.03), ("metric", "mean"),
+    ("alpha", 0.1), ("target_power", 0.9),
+    ("allocation_ratio", 2), ("sided", 1),
+):
+    v = check_ab_test(dict(ab_ok, **{field: bad_value}), ab_args)
+    check(f"ab_mismatched_{field}_fails", not v.passed, str(v))
+
+v = check_ab_test(ab_ok, dict(ab_args, effect=0.02, effect_type="relative"))
+check("ab_effect_type_changes_effective_mde", not v.passed, str(v))
+tiny_mde_args = dict(ab_args, effect=0.00004)
+v = check_ab_test(dict(ab_ok, mde=0), tiny_mde_args)
+check("ab_rounded_zero_mde_fails_closed", not v.passed, str(v))
+v = check_ab_test(dict(ab_ok, n_total=7679), ab_args)
+check("ab_arm_counts_must_sum_to_total", not v.passed, str(v))
+v = check_ab_test(dict(ab_ok, n_treatment=3845, n_total=7684), ab_args)
+check("ab_integer_allocation_must_match_ratio", not v.passed, str(v))
+v = check_ab_test(ab_ok, dict(ab_args, baseline=0.9, effect=0.2,
+                              effect_type="relative"))
+check("ab_relative_treatment_rate_must_be_in_bounds", not v.passed, str(v))
+
+mean_args = {
+    "baseline": 10, "effect": 0.1, "metric": "mean",
+    "effect_type": "relative", "sd": 2, "alpha": 0.1,
+    "power": 0.9, "sided": 1, "ratio": 2,
+}
+mean_ok = {
+    "metric": "mean", "n_control": 40, "n_treatment": 80,
+    "n_total": 120, "allocation_ratio": 2, "mde": 1,
+    "baseline": 10, "alpha": 0.1, "sided": 1,
+    "target_power": 0.9, "achieved_power": 0.9033,
+}
+v = check_ab_test(mean_ok, mean_args)
+check("ab_mean_sd_bound_by_reconstructed_size", v.passed, str(v))
+v = check_ab_test(mean_ok, dict(mean_args, sd=4))
+check("ab_mean_sd_mismatch_fails", not v.passed, str(v))
 
 # ── check_reproducibility ──────────────────────────────────────────
 a = {"x": 1.0, "y": [1, 2]}
@@ -991,26 +1039,140 @@ v = check_meta({k: value for k, value in meta_ok.items()
 check("meta_missing_effect_measure_fails", not v.passed, str(v))
 
 # ── check_randomize ────────────────────────────────────────────────
-rand_ok = {"method": "block", "n": 4, "arms": ["control", "treatment"],
-           "counts": {"control": 2, "treatment": 2}, "seed": 42,
-           "assignment": [{"unit": 1, "arm": "control"},
-                          {"unit": 2, "arm": "treatment"},
-                          {"unit": 3, "arm": "control"},
-                          {"unit": 4, "arm": "treatment"}]}
-v = check_randomize(rand_ok, {})
-check("randomize_good_passes", v.passed, str(v))
-v = check_randomize(dict(rand_ok, assignment=rand_ok["assignment"][:3]), {})
+simple_args = {"n": 5}
+rand_ok = {
+    "method": "simple", "n": 5, "arms": ["arm1", "arm2"],
+    "counts": {"arm1": 4, "arm2": 1}, "seed": 42,
+    "block_size_used": {},
+    "assignment": [
+        {"unit": 1, "stratum": None, "arm": "arm1"},
+        {"unit": 2, "stratum": None, "arm": "arm1"},
+        {"unit": 3, "stratum": None, "arm": "arm2"},
+        {"unit": 4, "stratum": None, "arm": "arm1"},
+        {"unit": 5, "stratum": None, "arm": "arm1"},
+    ],
+}
+v = check_randomize(rand_ok, simple_args)
+check("randomize_public_defaults_pass", v.passed, str(v))
+v = check_randomize(rand_ok, {"n": 5, "ratio": [2, 2]})
+check("randomize_simple_scaled_equal_ratio_passes", v.passed, str(v))
+v = check_randomize(rand_ok, {"n": 5, "ratio": [3, 1]})
+check("randomize_simple_non_equal_ratio_fails_closed", not v.passed, str(v))
+v = check_randomize(rand_ok, {"n": 5, "ratio": [1e-300, 1e-300]})
+check("randomize_tiny_unrepresentable_ratio_fails_without_crashing",
+      not v.passed, str(v))
+
+block_args = {
+    "n": 8, "arms": ["control", "treatment"], "method": "block",
+    "block_size": 4, "ratio": [1, 1], "seed": 42,
+}
+block_ok = {
+    "method": "block", "n": 8, "arms": ["control", "treatment"],
+    "counts": {"control": 4, "treatment": 4}, "seed": 42,
+    "block_size_used": 4,
+    "assignment": [
+        {"unit": 1, "stratum": None, "arm": "control"},
+        {"unit": 2, "stratum": None, "arm": "treatment"},
+        {"unit": 3, "stratum": None, "arm": "treatment"},
+        {"unit": 4, "stratum": None, "arm": "control"},
+        {"unit": 5, "stratum": None, "arm": "control"},
+        {"unit": 6, "stratum": None, "arm": "treatment"},
+        {"unit": 7, "stratum": None, "arm": "control"},
+        {"unit": 8, "stratum": None, "arm": "treatment"},
+    ],
+}
+v = check_randomize(block_ok, block_args)
+check("randomize_block_good_passes", v.passed, str(v))
+
+fallback_args = dict(block_args, block_size=3)
+fallback_ok = dict(block_ok, block_size_used=2)
+v = check_randomize(fallback_ok, fallback_args)
+check("randomize_invalid_requested_block_falls_back_to_base", v.passed, str(v))
+
+weighted_args = {
+    "n": 5, "arms": 3, "method": "block", "block_size": 7,
+    "ratio": [2, 1, 1], "seed": 9,
+}
+weighted_ok = {
+    "method": "block", "n": 5, "arms": ["arm1", "arm2", "arm3"],
+    "counts": {"arm1": 3, "arm2": 1, "arm3": 1}, "seed": 9,
+    "block_size_used": 4,
+    "assignment": [
+        {"unit": 1, "stratum": None, "arm": "arm2"},
+        {"unit": 2, "stratum": None, "arm": "arm1"},
+        {"unit": 3, "stratum": None, "arm": "arm1"},
+        {"unit": 4, "stratum": None, "arm": "arm3"},
+        {"unit": 5, "stratum": None, "arm": "arm1"},
+    ],
+}
+v = check_randomize(weighted_ok, weighted_args)
+check("randomize_integer_arms_weighted_ratio_and_tail_pass", v.passed, str(v))
+v = check_randomize(dict(weighted_ok, ratio=[1, 1, 1]), weighted_args)
+check("randomize_echoed_ratio_mismatch_fails", not v.passed, str(v))
+
+v = check_randomize(dict(rand_ok, assignment=rand_ok["assignment"][:4]), simple_args)
 check("randomize_missing_unit_fails", not v.passed, str(v))
-v = check_randomize(dict(rand_ok, counts={"control": 3, "treatment": 2}), {})
+v = check_randomize(dict(rand_ok, counts={"arm1": 3, "arm2": 2}), simple_args)
 check("randomize_counts_mismatch_fails", not v.passed, str(v))
-v = check_randomize({k: v2 for k, v2 in rand_ok.items() if k != "seed"}, {})
+v = check_randomize({key: value for key, value in rand_ok.items()
+                     if key != "seed"}, simple_args)
 check("randomize_no_seed_fails", not v.passed, str(v))
 duplicate_units = dict(rand_ok, assignment=[
-    {"unit": 1, "arm": "control"}, {"unit": 1, "arm": "treatment"},
-    {"unit": 3, "arm": "control"}, {"unit": 4, "arm": "treatment"},
+    {"unit": 1, "stratum": None, "arm": "arm1"},
+    {"unit": 1, "stratum": None, "arm": "arm1"},
+    {"unit": 3, "stratum": None, "arm": "arm2"},
+    {"unit": 4, "stratum": None, "arm": "arm1"},
+    {"unit": 5, "stratum": None, "arm": "arm1"},
 ])
-v = check_randomize(duplicate_units, {})
+v = check_randomize(duplicate_units, simple_args)
 check("randomize_duplicate_unit_fails", not v.passed, str(v))
+
+for field, bad_value in (
+    ("n", 7), ("method", "simple"),
+    ("arms", ["private-arm-a", "private-arm-b"]), ("seed", 7),
+):
+    v = check_randomize(dict(block_ok, **{field: bad_value}), block_args)
+    check(f"randomize_mismatched_{field}_fails", not v.passed, str(v))
+
+v = check_randomize(dict(block_ok, block_size_used=2), block_args)
+check("randomize_mismatched_effective_block_fails", not v.passed, str(v))
+v = check_randomize(block_ok, dict(block_args, ratio=[3, 1], block_size=4))
+check("randomize_mismatched_block_ratio_fails", not v.passed, str(v))
+
+private_a = "SITE-PRIVATE-ALPHA"
+private_b = "SITE-PRIVATE-BETA"
+strat_args = {
+    "n": 8, "arms": ["A", "B"], "method": "stratified",
+    "block_size": 4, "ratio": [1, 1], "seed": 7,
+    "strata": [private_a] * 4 + [private_b] * 4,
+}
+strat_ok = {
+    "method": "stratified", "n": 8, "arms": ["A", "B"],
+    "counts": {"A": 4, "B": 4}, "seed": 7, "block_size_used": 4,
+    "assignment": [
+        {"unit": 1, "stratum": private_a, "arm": "A"},
+        {"unit": 2, "stratum": private_a, "arm": "B"},
+        {"unit": 3, "stratum": private_a, "arm": "A"},
+        {"unit": 4, "stratum": private_a, "arm": "B"},
+        {"unit": 5, "stratum": private_b, "arm": "B"},
+        {"unit": 6, "stratum": private_b, "arm": "A"},
+        {"unit": 7, "stratum": private_b, "arm": "A"},
+        {"unit": 8, "stratum": private_b, "arm": "B"},
+    ],
+}
+v = check_randomize(strat_ok, strat_args)
+check("randomize_stratified_good_passes_without_publishing_strata",
+      v.passed and private_a not in str(v) and private_b not in str(v), str(v))
+bad_strata_rows = [dict(row) for row in strat_ok["assignment"]]
+bad_strata_rows[0]["stratum"] = "SHOULD-NOT-LEAK"
+v = check_randomize(dict(strat_ok, assignment=bad_strata_rows), strat_args)
+check("randomize_stratified_unit_stratum_mismatch_fails_privately",
+      not v.passed and private_a not in str(v) and private_b not in str(v)
+      and "SHOULD-NOT-LEAK" not in str(v), str(v))
+bad_strat_units = [dict(row) for row in strat_ok["assignment"]]
+bad_strat_units[1]["unit"] = 1
+v = check_randomize(dict(strat_ok, assignment=bad_strat_units), strat_args)
+check("randomize_stratified_unit_coverage_fails", not v.passed, str(v))
 
 # ── check_factorial ────────────────────────────────────────────────
 fact_ok = {"type": "full_factorial", "n_factors": 2, "n_runs": 4,
@@ -1447,7 +1609,11 @@ vs = design_checks_for("master_simulate",
                                    "fwer_control": "holm"}},
                        {"result": {"oc_table": []}})
 check("dcf_master_catches_reserved", not combined_gate(*vs).passed)
-vs = design_checks_for("randomize", {"n": 4}, rand_ok)
+vs = design_checks_for("ab_test", ab_args, ab_ok)
+check("dcf_ab_test_request_fidelity_wired", combined_gate(*vs).passed)
+vs = design_checks_for("ab_test", dict(ab_args, baseline=0.2), ab_ok)
+check("dcf_ab_test_mismatch_fails", not combined_gate(*vs).passed)
+vs = design_checks_for("randomize", simple_args, rand_ok)
 check("dcf_randomize_wired", combined_gate(*vs).passed)
 vs = design_checks_for("meta_analyze", {"alpha": 0.05}, dict(meta_ok, lower=0.6))
 check("dcf_meta_catches_bad_ci", not combined_gate(*vs).passed)

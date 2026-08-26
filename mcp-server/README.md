@@ -88,8 +88,9 @@ The MCP SDK parses arguments with zod; a key absent from a schema would be
 silently stripped, so the run would proceed with defaults under the caller's
 requested label. The server closes that class of bug three ways:
 
-- **Complete schemas.** Every engine-read `create_config()` /
-  `create_master_config()` formal is exposed and typed:
+- **Explicit schemas.** Implemented engine-read `create_config()` /
+  `create_master_config()` controls are exposed and typed; unsupported controls
+  are deliberately absent and therefore rejected by the strict boundary:
   - `validate_config` / `sample_size` accept `prior` (named or custom
     hyperparameters), `go_threshold`, `consider_threshold`, `go_target` — so
     validating a config validates *the* config that will be simulated.
@@ -103,14 +104,22 @@ requested label. The server closes that class of bug three ways:
     `futility_boundaries`, `n_drop_per_stage`, `rar_gamma` (constant form only —
     the stage-increasing function default cannot be expressed in JSON),
     `n_per_interim`, `ncc_weight_decay`, `rar_burn_in`,
-    `rar_min_alloc`, `interim_frequency`, `effect_threshold`,
-    `futility_threshold`, ...).
+    `rar_min_alloc`, `interim_frequency`, `futility_threshold`, ...).
+    Platform requests must provide `n_periods`, `n_per_period`, and an
+    `arms_schedule` whose `enter`/`leave` arrays each have `n_subgroups` integer
+    values satisfying `1 <= enter <= leave <= n_periods`. Platform-only fields
+    are rejected for basket and umbrella designs. `interim_frequency` and
+    `futility_threshold` are available only for binary/continuous platform
+    designs with `ncc_method='none'`. `effect_threshold` is not exposed because
+    calibrated interim efficacy stopping is not implemented; the Python gate
+    retains a defense-in-depth rejection for any bypassed legacy request.
 - **Strict tool objects.** Every top-level tool input and nested configuration
   object is strict: an unknown key (typo, or a reserved knob
   like `overdispersion` / `rar_eta`) errors at the boundary instead of being
-  stripped. Knobs intentionally rejected by the R layer stay exposed so the
-  request fails rather than silently degrading; model-facing execution errors
-  use a fixed value-free message. These include single-value enums (`tte_method`, `rate_method`,
+  stripped. Selected fixed-value/reserved enums stay exposed so the request
+  fails rather than silently degrading; wholly unsupported controls are absent.
+  Model-facing execution errors use a fixed value-free message. Exposed
+  refusal cases include single-value enums (`tte_method`, `rate_method`,
   `fwer_control`, `power_type`, `shared_control`), `selection_rule` (derived
   only), and the design-scoped keys `phase` / `borrowing_method` (basket),
   `umbrella_method` (umbrella), `ncc_method` (platform), which error when sent
@@ -122,9 +131,11 @@ requested label. The server closes that class of bug three ways:
     number or `{n_trt, n_ctrl}`), `seed`.
   - `master_simulate`: `seed` (the config's resolved seed).
   - `factorial_design` / `rsm_design`: `seed` echoed when `randomize=true`.
-  - `randomize`: `block_size_used` — a requested `block_size` is honored only
-    when it is a whole multiple of the ratio's base block; otherwise the base
-    block is used, and this field shows which.
+  - `randomize`: `method='simple'` is equal-probability randomization only;
+    non-equal `ratio` weights require `block` or `stratified`. For those methods,
+    `block_size_used` shows the effective block: a requested `block_size` is
+    honored only when it is a whole multiple of the ratio's base block;
+    otherwise the base block is used.
   - `meta_analyze`: `n_input`, `k_used`, `dropped_studies` (+ per-study
     `dropped_detail` with reasons) — pooling drops studies with non-finite or
     malformed inputs, and that exclusion is now visible instead of silent.

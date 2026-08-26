@@ -31,11 +31,14 @@ import {
 import {
   currentPythonRuntimeSnapshot,
   currentRRuntimeSnapshot,
+  ENGINE_RUNTIME_FINGERPRINT_LIMITS,
   ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES,
   FingerprintPromiseCache,
   fingerprintMutableEngineRuntime,
+  hashBoundedRuntimeTree,
   hashFramedFields,
   mutableEngineFiles,
+  mutableEngineRoots,
   PYTHON_EXECUTABLE,
   REGRESSION_SKILLS,
   RSCRIPT_EXECUTABLE,
@@ -57,9 +60,14 @@ import {
   STARTUP_RUNTIME_FINGERPRINT,
 } from "../dist/index.js";
 import { publicRegressionStatus } from "../dist/public-projection.js";
-import { runVerifierRequest } from "../dist/verifier.js";
 import {
+  MAX_VERIFIER_STDOUT_BYTES,
+  runVerifierRequest,
+} from "../dist/verifier.js";
+import {
+  captureBoundedSupervisorProgram,
   killRuntimeProcessTree,
+  MAX_SUPERVISOR_PROGRAM_BYTES,
   PINNED_RUNTIME_SUPERVISOR_COMMITMENT,
   runtimeSupervisorProgramCommitment,
   spawnRuntimeProcess,
@@ -99,7 +107,32 @@ const assertRejectsBeforeRead = (action, expected) => {
   }
   assert.equal(readCalls, 0, "oversized artifact bytes were read before rejection");
 };
-const workspace = await mkdtemp(join(tmpdir(), "expdesign-lifecycle-test-"));
+const boundedRuntimeLimits = (overrides = {}) => ({
+  maxFiles: 32,
+  maxDirectories: 32,
+  maxDirectoryEntries: 64,
+  maxDepth: 8,
+  maxFileBytes: 8 * 1024 * 1024,
+  maxTotalBytes: 16 * 1024 * 1024,
+  readChunkBytes: 4 * 1024,
+  ...overrides,
+});
+if (Object.prototype.hasOwnProperty.call(process.env, "EXPDESIGN_PUBLIC_ONLY")) {
+  console.error("EXPDESIGN_PUBLIC_ONLY is forbidden; use --public-only");
+  process.exit(2);
+}
+const lifecycleArguments = process.argv.slice(2);
+if (
+  lifecycleArguments.length > 1
+  || (lifecycleArguments.length === 1 && lifecycleArguments[0] !== "--public-only")
+) {
+  console.error("Usage: node tests/lifecycle.mjs [--public-only]");
+  process.exit(2);
+}
+const publicOnly = lifecycleArguments[0] === "--public-only";
+const workspace = realpathSync(
+  await mkdtemp(join(tmpdir(), "expdesign-lifecycle-test-")),
+);
 
 try {
   const overflow = JSON.parse('{"go_target":1e309,"nested":[{"value":-1e309}]}');
@@ -134,6 +167,178 @@ try {
     fractional: 1.0000000000000002,
   }));
   console.log("TEST unsafe_integral_json_numbers_are_rejected_recursively : PASS");
+
+  const runtimeTreeRoot = join(workspace, "bounded-runtime-tree");
+  const runtimeTreeNested = join(runtimeTreeRoot, "nested");
+  mkdirSync(runtimeTreeNested, { recursive: true, mode: 0o700 });
+  writeFileSync(join(runtimeTreeRoot, "root.bin"), "root\n", { mode: 0o600 });
+  writeFileSync(join(runtimeTreeNested, "nested.bin"), "nested\n", { mode: 0o600 });
+  const boundedTreeFingerprint = await hashBoundedRuntimeTree(
+    [runtimeTreeRoot], "bounded-tree", boundedRuntimeLimits(),
+  );
+  assert.equal(
+    await hashBoundedRuntimeTree(
+      [runtimeTreeRoot], "bounded-tree", boundedRuntimeLimits(),
+    ),
+    boundedTreeFingerprint,
+  );
+
+  const oversizedRuntimeFile = join(workspace, "oversized-runtime.bin");
+  writeFileSync(oversizedRuntimeFile, Buffer.alloc(2_049), { mode: 0o600 });
+  await assert.rejects(
+    hashBoundedRuntimeTree(
+      [oversizedRuntimeFile], "oversized", boundedRuntimeLimits({
+        maxFileBytes: 2_048,
+        maxTotalBytes: 4_096,
+      }),
+    ),
+    /file exceeds the 2048-byte limit/,
+  );
+
+  const manyRuntimeFiles = join(workspace, "many-runtime-files");
+  mkdirSync(manyRuntimeFiles, { mode: 0o700 });
+  for (let index = 0; index < 3; index += 1) {
+    writeFileSync(join(manyRuntimeFiles, `${index}.bin`), `${index}\n`, { mode: 0o600 });
+  }
+  await assert.rejects(
+    hashBoundedRuntimeTree(
+      [manyRuntimeFiles], "many-files", boundedRuntimeLimits({ maxFiles: 2 }),
+    ),
+    /exceeds the 2-file limit/,
+  );
+  await assert.rejects(
+    hashBoundedRuntimeTree(
+      [manyRuntimeFiles], "many-entries",
+      boundedRuntimeLimits({ maxDirectoryEntries: 2 }),
+    ),
+    /exceeds the 2-directory-entry limit/,
+  );
+
+  const deepRuntimeTree = join(workspace, "deep-runtime-tree");
+  const deepRuntimeLeaf = join(deepRuntimeTree, "one", "two", "three");
+  mkdirSync(deepRuntimeLeaf, { recursive: true, mode: 0o700 });
+  writeFileSync(join(deepRuntimeLeaf, "leaf.bin"), "leaf\n", { mode: 0o600 });
+  await assert.rejects(
+    hashBoundedRuntimeTree(
+      [deepRuntimeTree], "deep-tree", boundedRuntimeLimits({ maxDepth: 2 }),
+    ),
+    /exceeds the 2-level depth limit/,
+  );
+
+  if (process.platform !== "win32") {
+    const symlinkRuntimeRoot = join(workspace, "symlink-runtime-tree");
+    mkdirSync(symlinkRuntimeRoot, { mode: 0o700 });
+    const symlinkTarget = join(workspace, "symlink-runtime-target.bin");
+    writeFileSync(symlinkTarget, "target\n", { mode: 0o600 });
+    symlinkSync(symlinkTarget, join(symlinkRuntimeRoot, "linked.bin"));
+    await assert.rejects(
+      hashBoundedRuntimeTree(
+        [symlinkRuntimeRoot], "symlink-tree", boundedRuntimeLimits(),
+      ),
+      /refuses symbolic links/,
+    );
+  }
+
+  const mutatingRuntimeFile = join(workspace, "mutating-runtime.bin");
+  writeFileSync(mutatingRuntimeFile, Buffer.alloc(4 * 1024 * 1024), { mode: 0o600 });
+  const mutatingHash = hashBoundedRuntimeTree(
+    [mutatingRuntimeFile], "mutating-file", boundedRuntimeLimits(),
+  );
+  const mutationTimer = setInterval(() => {
+    appendFileSync(mutatingRuntimeFile, "x");
+  }, 1);
+  try {
+    await assert.rejects(mutatingHash, /changed while reading/);
+  } finally {
+    clearInterval(mutationTimer);
+  }
+
+  const cancellableRuntimeFile = join(workspace, "cancellable-runtime.bin");
+  writeFileSync(cancellableRuntimeFile, Buffer.alloc(4 * 1024 * 1024), { mode: 0o600 });
+  const runtimeHashController = new AbortController();
+  const cancellableHash = hashBoundedRuntimeTree(
+    [cancellableRuntimeFile], "cancelled-file",
+    boundedRuntimeLimits({ readChunkBytes: 1_024 }),
+    runtimeHashController.signal,
+  );
+  setImmediate(() => runtimeHashController.abort());
+  await assert.rejects(cancellableHash, (error) => error?.name === "AbortError");
+  console.log("TEST runtime_tree_hashing_is_bounded_rebound_and_cancellable : PASS");
+
+  const hostileChildEnvironment = {
+    OPENAI_API_KEY: "host-secret",
+    ANTHROPIC_API_KEY: "host-secret",
+    HTTPS_PROXY: "http://hostile.invalid",
+    http_proxy: "http://hostile.invalid",
+    EXPDESIGN_UNTRUSTED_FEATURE: "enabled",
+    R_TESTS: join(workspace, "hostile-r-tests.R"),
+    OMP_NUM_THREADS: "999",
+  };
+  const previousHostileEnvironment = new Map(
+    Object.keys(hostileChildEnvironment).map((name) => [name, process.env[name]]),
+  );
+  Object.assign(process.env, hostileChildEnvironment);
+  try {
+    for (const environment of [
+      sanitizedRChildEnvironment(), sanitizedPythonChildEnvironment(),
+    ]) {
+      for (const name of [
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HTTPS_PROXY", "http_proxy",
+        "EXPDESIGN_UNTRUSTED_FEATURE", "R_TESTS",
+      ]) {
+        assert.equal(environment[name], undefined, `${name} leaked into a runtime target`);
+      }
+      assert.equal(environment.OMP_NUM_THREADS, "1");
+      assert.equal(environment.LANG, "C");
+      assert.equal(environment.LC_ALL, "C");
+      assert.equal(environment.TZ, "UTC");
+      assert.ok(environment.HOME);
+      assert.ok(environment.TEMP);
+      assert.ok(environment.TMP);
+      assert.ok(environment.PATH);
+      const environmentProbe = spawnSync(
+        process.execPath,
+        ["--input-type=module", "-e", "console.log(JSON.stringify(process.env))"],
+        { encoding: "utf8", env: environment },
+      );
+      assert.equal(environmentProbe.status, 0, environmentProbe.stderr);
+      const observed = JSON.parse(environmentProbe.stdout);
+      assert.equal(observed.OPENAI_API_KEY, undefined);
+      assert.equal(observed.HTTPS_PROXY, undefined);
+      assert.equal(observed.R_TESTS, undefined);
+      assert.equal(observed.OMP_NUM_THREADS, "1");
+    }
+  } finally {
+    for (const [name, value] of previousHostileEnvironment) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  console.log("TEST runtime_target_environments_use_a_closed_deterministic_allowlist : PASS");
+
+  const oversizedVerifierMarker = "VERIFIER_STDOUT_SECRET_MARKER";
+  const oversizedVerifier = join(workspace, "oversized-verifier-stdout.py");
+  writeFileSync(
+    oversizedVerifier,
+    "import sys\n" +
+      `marker = ${JSON.stringify(oversizedVerifierMarker)}.encode('ascii')\n` +
+      `limit = ${MAX_VERIFIER_STDOUT_BYTES}\n` +
+      "sys.stdout.buffer.write(marker + b'x' * (limit + 1 - len(marker)))\n" +
+      "sys.stdout.buffer.flush()\n",
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    runVerifierRequest("{}", undefined, oversizedVerifier),
+    (error) => {
+      assert.equal(
+        error?.message,
+        `verification process output exceeded the ${MAX_VERIFIER_STDOUT_BYTES}-byte limit`,
+      );
+      assert.equal(error.message.includes(oversizedVerifierMarker), false);
+      return true;
+    },
+  );
+  console.log("TEST verifier_stdout_is_byte_bounded_without_content_leakage : PASS");
 
   const dependencyRoot = join(workspace, "installed-sdk");
   mkdirSync(dependencyRoot, { mode: 0o700 });
@@ -221,6 +426,27 @@ try {
     PINNED_RUNTIME_SUPERVISOR_COMMITMENT,
     runtimeSupervisorProgramCommitment(capturedSupervisorProgram),
   );
+  const growingSupervisorProgram = join(workspace, "growing-runtime-supervisor.js");
+  const initialGrowingSupervisorBytes = "export const captured = true;\n";
+  writeFileSync(growingSupervisorProgram, initialGrowingSupervisorBytes, { mode: 0o600 });
+  assert.equal(
+    captureBoundedSupervisorProgram(growingSupervisorProgram),
+    initialGrowingSupervisorBytes,
+  );
+  let supervisorGrowthHookRan = false;
+  assert.throws(
+    () => captureBoundedSupervisorProgram(growingSupervisorProgram, () => {
+      supervisorGrowthHookRan = true;
+      appendFileSync(
+        growingSupervisorProgram,
+        Buffer.alloc(MAX_SUPERVISOR_PROGRAM_BYTES + 1, 0x78),
+      );
+    }),
+    /runtime supervisor program grew while it was captured/,
+  );
+  assert.equal(supervisorGrowthHookRan, true);
+  console.log("TEST supervisor_capture_rejects_post_size_check_growth_before_unbounded_read : PASS");
+
   const mutatedSupervisorProgram = `${capturedSupervisorProgram}\n` +
     "// deterministic post-capture mutation\n";
   const startupFilesWithoutSupervisor = fs.readdirSync(join(process.cwd(), "dist"))
@@ -271,6 +497,7 @@ try {
   const syntheticEngineFiles = [
     ...maintainedEngineFiles,
     ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/tests/run_tests.R`),
+    ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/R/runtime_fixture.R`),
   ];
   for (const relativePath of syntheticEngineFiles) {
     const path = join(engineRoot, ...relativePath.split("/"));
@@ -285,11 +512,26 @@ try {
       `${relativePath} is absent from the engine runtime manifest`,
     );
   }
-  let engineFingerprint = fingerprintMutableEngineRuntime(engineRoot, "runtime-seed");
-  for (const relativePath of maintainedEngineFiles) {
+  const listedEngineRoots = new Set(mutableEngineRoots(engineRoot));
+  for (const skill of REGRESSION_SKILLS) {
+    assert.equal(
+      listedEngineRoots.has(join(engineRoot, skill, "scripts", "R")),
+      true,
+      `${skill}/scripts/R is absent from the fixed engine roots`,
+    );
+  }
+  let engineFingerprint = await fingerprintMutableEngineRuntime(
+    engineRoot, "runtime-seed",
+  );
+  for (const relativePath of [
+    ...maintainedEngineFiles,
+    ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/R/runtime_fixture.R`),
+  ]) {
     const path = join(engineRoot, ...relativePath.split("/"));
     appendFileSync(path, `mutation: ${relativePath}\n`);
-    const mutatedFingerprint = fingerprintMutableEngineRuntime(engineRoot, "runtime-seed");
+    const mutatedFingerprint = await fingerprintMutableEngineRuntime(
+      engineRoot, "runtime-seed",
+    );
     assert.notEqual(
       mutatedFingerprint,
       engineFingerprint,
@@ -297,7 +539,49 @@ try {
     );
     engineFingerprint = mutatedFingerprint;
   }
-  console.log("TEST governance_multi_agent_and_hook_sources_are_fingerprinted : PASS");
+
+  const engineRRoot = join(engineRoot, REGRESSION_SKILLS[0], "scripts", "R");
+  const oversizedEngineSource = join(engineRRoot, "oversized_runtime.R");
+  writeFileSync(oversizedEngineSource, "", { mode: 0o600 });
+  truncateSync(
+    oversizedEngineSource,
+    ENGINE_RUNTIME_FINGERPRINT_LIMITS.maxFileBytes + 1,
+  );
+  await assert.rejects(
+    fingerprintMutableEngineRuntime(engineRoot, "oversized-engine"),
+    new RegExp(
+      `file exceeds the ${ENGINE_RUNTIME_FINGERPRINT_LIMITS.maxFileBytes}-byte limit`,
+    ),
+  );
+  unlinkSync(oversizedEngineSource);
+
+  if (process.platform !== "win32") {
+    const outsideEngineSource = join(workspace, "outside-engine-source.R");
+    const linkedEngineSource = join(engineRRoot, "linked_runtime.R");
+    writeFileSync(outsideEngineSource, "outside <- TRUE\n", { mode: 0o600 });
+    symlinkSync(outsideEngineSource, linkedEngineSource);
+    await assert.rejects(
+      fingerprintMutableEngineRuntime(engineRoot, "linked-engine"),
+      /refuses symbolic links/,
+    );
+    unlinkSync(linkedEngineSource);
+  }
+
+  const mutatingEngineSource = join(engineRRoot, "mutating_runtime.R");
+  writeFileSync(mutatingEngineSource, Buffer.alloc(4 * 1024 * 1024), { mode: 0o600 });
+  const mutatingEngineFingerprint = fingerprintMutableEngineRuntime(
+    engineRoot, "mutating-engine",
+  );
+  const engineMutationTimer = setInterval(() => {
+    appendFileSync(mutatingEngineSource, "x");
+  }, 1);
+  try {
+    await assert.rejects(mutatingEngineFingerprint, /changed while reading/);
+  } finally {
+    clearInterval(engineMutationTimer);
+    unlinkSync(mutatingEngineSource);
+  }
+  console.log("TEST engine_runtime_roots_are_bounded_rebound_and_fingerprinted : PASS");
 
   const importHandlerProbe = spawnSync(process.execPath, [
     "--input-type=module", "-e", `
@@ -409,6 +693,9 @@ try {
   assert.equal(incompleteExecutableProbe.stderr.includes("vera-"), false);
   console.log("TEST executable_preflight_refuses_incomplete_public_copy_before_mcp_connect : PASS");
 
+  if (publicOnly) {
+    console.log("TEST public_only_lifecycle_stops_after_public_preflight : PASS");
+  } else {
   if (process.platform !== "win32") {
     const rMarker = join(workspace, "unexpected-r-execution.txt");
     const rShim = join(workspace, "forbidden-rscript.sh");
@@ -960,12 +1247,15 @@ try {
     chmodSync(registryRoot, 0o700);
     const registryIdentity = statSync(registryRoot, { bigint: true });
     const registryToken = "a".repeat(64);
-    const supervisorEnvironment = {
-      ...process.env,
+    const registryConfiguration = {
       EXPDESIGN_RUNTIME_REGISTRY_DIR: registryRoot,
       EXPDESIGN_RUNTIME_REGISTRY_TOKEN: registryToken,
       EXPDESIGN_RUNTIME_REGISTRY_DEV: String(registryIdentity.dev),
       EXPDESIGN_RUNTIME_REGISTRY_INO: String(registryIdentity.ino),
+    };
+    const supervisorEnvironment = {
+      ...sanitizedRChildEnvironment(),
+      ...registryConfiguration,
     };
     const waitForRegistryEntry = async () => {
       for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -977,18 +1267,44 @@ try {
       throw new Error("timed out waiting for an authenticated runtime registry entry");
     };
 
-    let supervised = spawnRuntimeProcess("/bin/sh", ["-c", [
-      "if [ \"${EXPDESIGN_RUNTIME_REGISTRY_TOKEN+x}\" = x ] ||",
-      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DIR+x}\" = x ] ||",
-      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DEV+x}\" = x ] ||",
-      "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_INO+x}\" = x ] ||",
-      "   [ \"${EXPDESIGN_RUNTIME_TARGET_CWD+x}\" = x ]; then exit 91; fi",
-      "exec /bin/sleep 0.2",
-    ].join("\n")], {
-      stdio: ["ignore", "ignore", "pipe"],
-      detached: true,
-      env: supervisorEnvironment,
-    });
+    const wrapperOnlyHostEnvironment = {
+      ...registryConfiguration,
+      OPENAI_API_KEY: "wrapper-host-secret",
+      HTTPS_PROXY: "http://wrapper-hostile.invalid",
+      EXPDESIGN_UNTRUSTED_FEATURE: "enabled",
+      R_TESTS: join(workspace, "wrapper-hostile-r-tests.R"),
+      OMP_NUM_THREADS: "999",
+    };
+    const previousWrapperHostEnvironment = new Map(
+      Object.keys(wrapperOnlyHostEnvironment).map((name) => [name, process.env[name]]),
+    );
+    Object.assign(process.env, wrapperOnlyHostEnvironment);
+    let supervised;
+    try {
+      supervised = spawnRuntimeProcess("/bin/sh", ["-c", [
+        "if [ \"${EXPDESIGN_RUNTIME_REGISTRY_TOKEN+x}\" = x ] ||",
+        "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DIR+x}\" = x ] ||",
+        "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_DEV+x}\" = x ] ||",
+        "   [ \"${EXPDESIGN_RUNTIME_REGISTRY_INO+x}\" = x ] ||",
+        "   [ \"${EXPDESIGN_RUNTIME_TARGET_CWD+x}\" = x ]; then exit 91; fi",
+        "if [ \"${OPENAI_API_KEY+x}\" = x ] ||",
+        "   [ \"${HTTPS_PROXY+x}\" = x ] ||",
+        "   [ \"${EXPDESIGN_UNTRUSTED_FEATURE+x}\" = x ] ||",
+        "   [ \"${R_TESTS+x}\" = x ]; then exit 92; fi",
+        "if [ \"$OMP_NUM_THREADS\" != 1 ] || [ \"$LANG\" != C ] ||",
+        "   [ \"$LC_ALL\" != C ] || [ \"$TZ\" != UTC ]; then exit 93; fi",
+        "exec /bin/sleep 0.2",
+      ].join("\n")], {
+        stdio: ["ignore", "ignore", "pipe"],
+        detached: true,
+        env: sanitizedRChildEnvironment(),
+      });
+    } finally {
+      for (const [name, value] of previousWrapperHostEnvironment) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
     let supervisedStderr = "";
     supervised.stderr.on("data", (chunk) => { supervisedStderr += chunk.toString(); });
     let supervisedClosed = new Promise((resolve) => supervised.once(
@@ -1419,6 +1735,7 @@ try {
     }
   }
   console.log("TEST ambient_runtime_shims_node_preloads_and_r_libraries_are_ignored : PASS");
+  }
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }

@@ -37,6 +37,7 @@ R_INTEGRITY_PROOF_BOUNDARY = (
     "restore; it does not authenticate source or binary archives."
 )
 REQUIRED_RUNTIME_FILES = {
+    ".github/workflows/public-assurance.yml",
     ".claude/launch.json",
     "governance/agents.json",
     "governance/r-package-integrity.json",
@@ -299,7 +300,14 @@ def valid_private_mcp_package(package: object, lock: object) -> bool:
         and isinstance(scripts, dict)
         and scripts.get("prepublishOnly") == "node scripts/block-publish.mjs"
         and scripts.get("test:private") == "node tests/private-package.mjs"
-        and "npm run test:private" in str(scripts.get("test:lifecycle", ""))
+        and scripts.get("test:public-lifecycle") == (
+            "npm run build && npm run test:private && "
+            "EXPDESIGN_RSCRIPT=/usr/bin/false "
+            "node tests/lifecycle.mjs --public-only"
+        )
+        and scripts.get("test:lifecycle") == (
+            "npm run build && npm run test:private && node tests/lifecycle.mjs"
+        )
         and isinstance(lock_root, dict)
         and lock_root.get("private") is True
         and lock_root.get("name") == package.get("name")
@@ -541,6 +549,7 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r"^public-check:\s*$",
         r'^\s*@tools/run-publication-python\.sh "\$\(CURDIR\)/tools/'
         r'validate_public_distribution\.py" --public-clone "\$\(CURDIR\)"\s*$',
+        r"^\s*@cd mcp-server && npm run test:public-lifecycle\s*$",
         r"^\s*@\$\(MAKE\) check-claude-version\s*$",
         r"^\s*@\$\(MAKE\) validate-python-lock\s*$",
         r"^\s*@\$\(MAKE\) harness-release-check\s*$",
@@ -580,6 +589,189 @@ def valid_release_entrypoints(makefile: str) -> bool:
             for line in makefile.splitlines()
             if line.startswith("\t") and ".py" in line
         )
+    )
+
+
+def valid_public_assurance_workflow(workflow: str) -> bool:
+    """Keep public CI least-privilege, SHA-pinned, and engine-honest.
+
+    This deliberately validates the executable YAML structure rather than
+    searching source text.  Comments, alternate list syntax, inline mappings,
+    quoted permission values, and job-level overrides therefore cannot satisfy
+    or bypass the public assurance contract.
+    """
+    checkout = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+    setup_node = "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444"
+    setup_python = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
+
+    checkout_step = {
+        "uses": checkout,
+        "with": {"persist-credentials": False},
+    }
+    setup_node_step = {
+        "uses": setup_node,
+        "with": {
+            "node-version": "20",
+            "cache": "npm",
+            "cache-dependency-path": "mcp-server/package-lock.json",
+        },
+    }
+    expected_steps = {
+        "public-distribution": [
+            checkout_step,
+            setup_node_step,
+            {"run": "make public-check"},
+        ],
+        "node-boundaries": [
+            checkout_step,
+            setup_node_step,
+            {
+                "working-directory": "mcp-server",
+                "run": "npm ci --no-audit --no-fund",
+            },
+            {
+                "working-directory": "mcp-server",
+                "env": {
+                    "EXPDESIGN_PYTHON": "/usr/bin/python3",
+                    "EXPDESIGN_RSCRIPT": "/usr/bin/false",
+                },
+                "run": "npm run test:public-lifecycle",
+            },
+        ],
+        "python-contracts": [
+            checkout_step,
+            {
+                "uses": setup_python,
+                "with": {"python-version": "${{ matrix.python }}"},
+            },
+            {"run": "\n".join([
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_gates.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_verification.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_audit.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_artifact_download.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py --public-only',
+            ])},
+        ],
+        "governance-hooks": [
+            checkout_step,
+            {
+                "uses": setup_python,
+                "with": {"python-version": "3.14"},
+            },
+            {"run": "\n".join([
+                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_enforce_verification.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_coordinator_verification.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_verification_ledger.py',
+            ])},
+        ],
+        "supply-chain": [
+            {
+                "uses": checkout,
+                "with": {"persist-credentials": False, "fetch-depth": 0},
+            },
+            setup_node_step,
+            {
+                "working-directory": "mcp-server",
+                "run": "npm audit --omit=dev --audit-level=high",
+            },
+            {
+                "shell": "bash",
+                "run": "\n".join([
+                    "set -o pipefail",
+                    "git rev-list --objects --all \\",
+                    "  | awk '{print $1}' \\",
+                    "  | git cat-file --batch \\",
+                    '  | tools/run-publication-python.sh "$PWD/tools/check_diff_credentials.py"',
+                ]),
+            },
+        ],
+    }
+    expected_job_options = {
+        "public-distribution": {},
+        "node-boundaries": {},
+        "python-contracts": {
+            "strategy": {
+                "fail-fast": False,
+                "matrix": {"python": ["3.9", "3.14"]},
+            },
+        },
+        "governance-hooks": {},
+        "supply-chain": {},
+    }
+
+    try:
+        document = yaml.safe_load(workflow)
+    except yaml.YAMLError:
+        return False
+    if not isinstance(document, dict):
+        return False
+
+    # PyYAML follows YAML 1.1 and resolves the unquoted GitHub key `on` to True.
+    on_key: object = "on" if "on" in document else True
+    if set(document) != {
+        "name", on_key, "permissions", "concurrency", "jobs",
+    }:
+        return False
+    if document.get("name") != "Public assurance":
+        return False
+    if document.get(on_key) != {
+        "push": {"branches": ["main"]},
+        "pull_request": None,
+        "workflow_dispatch": None,
+    }:
+        return False
+    if document.get("permissions") != {"contents": "read"}:
+        return False
+    if document.get("concurrency") != {
+        "group": "public-assurance-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }:
+        return False
+
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or set(jobs) != set(expected_steps):
+        return False
+
+    actions: list[str] = []
+    for job_name, expected in expected_steps.items():
+        job = jobs.get(job_name)
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            return False
+        actual_job = dict(job)
+        actual_job.pop("name")
+        steps = actual_job.pop("steps", None)
+        if actual_job != {
+            "runs-on": "ubuntu-24.04",
+            "timeout-minutes": 15,
+            **expected_job_options[job_name],
+        }:
+            return False
+        if not isinstance(steps, list) or len(steps) != len(expected):
+            return False
+        normalized_steps: list[dict[str, object]] = []
+        for step in steps:
+            if not isinstance(step, dict) or not isinstance(step.get("name"), str):
+                return False
+            normalized = dict(step)
+            normalized.pop("name")
+            if "run" in normalized:
+                if not isinstance(normalized["run"], str):
+                    return False
+                normalized["run"] = normalized["run"].strip()
+            if "uses" in normalized:
+                if not isinstance(normalized["uses"], str):
+                    return False
+                actions.append(normalized["uses"])
+            normalized_steps.append(normalized)
+        if normalized_steps != expected:
+            return False
+
+    approved_actions = {checkout, setup_node, setup_python}
+    return (
+        bool(actions)
+        and set(actions) == approved_actions
+        and all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", action) for action in actions)
+        and "secrets." not in workflow
     )
 
 
@@ -851,6 +1043,18 @@ def main() -> int:
             )
     except Exception as exc:
         fail(f"invalid release entrypoints: {exc}", failures)
+
+    try:
+        public_workflow = (ROOT / ".github" / "workflows" /
+                           "public-assurance.yml").read_text(encoding="utf-8")
+        if not valid_public_assurance_workflow(public_workflow):
+            fail(
+                "public assurance workflow must remain read-only, SHA-pinned, "
+                "public-safe, and explicit about its missing-engine boundary",
+                failures,
+            )
+    except Exception as exc:
+        fail(f"invalid public assurance workflow: {exc}", failures)
 
     try:
         sync_script = (ROOT / "tools" / "sync-to-github.sh").read_text(encoding="utf-8")

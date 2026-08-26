@@ -14,13 +14,22 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+if "EXPDESIGN_PUBLIC_ONLY" in os.environ:
+    print("EXPDESIGN_PUBLIC_ONLY is forbidden; use --public-only", file=sys.stderr)
+    raise SystemExit(2)
+
+if sys.argv[1:] not in ([], ["--public-only"]):
+    print("Usage: test_mcp_client.py [--public-only]", file=sys.stderr)
+    raise SystemExit(2)
+
+PUBLIC_ONLY = sys.argv[1:] == ["--public-only"]
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 import mcp_client as mcp_client_module  # noqa: E402
 from mcp_client import (CONTROL_TIMEOUT_S, MCP_SERVER_DIR, PRIVATE_ARTIFACT_META_KEY,
                         PRIVATE_PROVENANCE_META_KEY, SERVER_LAUNCHER,
                         TOOL_TIMEOUT_S, MCPClient, MCPToolError)  # noqa: E402
-
 
 client = MCPClient()
 client._proc = SimpleNamespace(poll=lambda: None, returncode=None)
@@ -86,6 +95,182 @@ late_client._read_stdout(late_proc, 3)
 next_result = late_client._recv(10)
 late_ok = next_result == {"value": "next"}
 print(f"TEST late_cancelled_reply_cannot_contaminate_next_request : {'PASS' if late_ok else 'FAIL'}")
+
+duplicate_client = MCPClient()
+duplicate_client._generation = 4
+duplicate_client._closed = False
+duplicate_client._waiters = {
+    31: queue.Queue(maxsize=1),
+    32: queue.Queue(maxsize=1),
+}
+duplicate_proc = SimpleNamespace(
+    stdout=[
+        '{"jsonrpc":"2.0","id":31,"result":{"value":"first"}}\n',
+        '{"jsonrpc":"2.0","id":31,"result":{"value":"duplicate"}}\n',
+        '{"jsonrpc":"2.0","id":32,"result":{"value":"must-not-arrive"}}\n',
+    ],
+    poll=lambda: None,
+    returncode=None,
+)
+duplicate_client._proc = duplicate_proc
+duplicate_cleanup_calls = []
+duplicate_client._schedule_protocol_shutdown = (
+    lambda generation, proc: duplicate_cleanup_calls.append((generation, proc))
+)
+duplicate_reader = threading.Thread(
+    target=duplicate_client._read_stdout,
+    args=(duplicate_proc, 4),
+    daemon=True,
+)
+duplicate_reader.start()
+duplicate_reader.join(timeout=1)
+duplicate_errors = []
+if not duplicate_reader.is_alive():
+    for request_id in (31, 32):
+        try:
+            duplicate_client._recv(request_id, timeout_s=0.1)
+        except MCPToolError as error:
+            duplicate_errors.append(str(error))
+duplicate_ok = (
+    not duplicate_reader.is_alive()
+    and duplicate_client._closed
+    and duplicate_cleanup_calls == [(4, duplicate_proc)]
+    and duplicate_errors == [
+        "MCP protocol violation: duplicate response id",
+        "MCP protocol violation: duplicate response id",
+    ]
+)
+print(
+    "TEST duplicate_response_fails_generation_without_blocking_reader : "
+    f"{'PASS' if duplicate_ok else 'FAIL'}"
+)
+
+eof_client = MCPClient()
+eof_client._generation = 5
+eof_client._closed = False
+eof_waiter = queue.Queue(maxsize=1)
+eof_waiter.put({"jsonrpc": "2.0", "id": 41, "result": {"value": "complete"}})
+eof_client._waiters = {41: eof_waiter}
+eof_proc = SimpleNamespace(stdout=[], poll=lambda: 0, returncode=0)
+eof_client._proc = eof_proc
+eof_reader = threading.Thread(
+    target=eof_client._read_stdout,
+    args=(eof_proc, 5),
+    daemon=True,
+)
+eof_reader.start()
+eof_reader.join(timeout=1)
+eof_result = eof_client._recv(41, timeout_s=0.1) if not eof_reader.is_alive() else None
+eof_ok = not eof_reader.is_alive() and eof_result == {"value": "complete"}
+print(
+    "TEST eof_never_blocks_or_overwrites_queued_response : "
+    f"{'PASS' if eof_ok else 'FAIL'}"
+)
+
+
+def malformed_response_error(raw_message: str) -> str | None:
+    malformed_client = MCPClient()
+    malformed_client._generation = 6
+    malformed_client._closed = False
+    malformed_client._waiters = {1: queue.Queue(maxsize=1)}
+    malformed_proc = SimpleNamespace(
+        stdout=[raw_message + "\n"], poll=lambda: None, returncode=None,
+    )
+    malformed_client._proc = malformed_proc
+    malformed_client._schedule_protocol_shutdown = lambda generation, proc: None
+    malformed_client._read_stdout(malformed_proc, 6)
+    try:
+        malformed_client._recv(1, timeout_s=0.1)
+    except MCPToolError as error:
+        return str(error)
+    return None
+
+
+malformed_envelopes = [
+    '{"jsonrpc":"2.0","id":true,"result":{}}',
+    '{"id":1,"result":{}}',
+    '{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}',
+    '{"jsonrpc":"2.0","id":1,"error":{"code":true,"message":"x"}}',
+]
+malformed_errors = [malformed_response_error(raw) for raw in malformed_envelopes]
+malformed_ok = malformed_errors == [
+    "MCP protocol violation: malformed JSON-RPC envelope"
+] * len(malformed_envelopes)
+print(
+    "TEST malformed_jsonrpc_envelopes_fail_closed : "
+    f"{'PASS' if malformed_ok else 'FAIL'}"
+)
+
+
+generation_client = MCPClient()
+old_generation_proc = object()
+new_generation_proc = object()
+generation_client._generation = 8
+generation_client._proc = new_generation_proc
+old_cleanup_calls = []
+generation_client._stop_locked = lambda: old_cleanup_calls.append(True)
+generation_client._cleanup_protocol_generation(7, old_generation_proc)
+old_generation_ok = old_cleanup_calls == [] and generation_client._proc is new_generation_proc
+print(
+    "TEST delayed_old_generation_cleanup_cannot_stop_restart : "
+    f"{'PASS' if old_generation_ok else 'FAIL'}"
+)
+
+
+class CountingRegistry:
+    def __init__(self):
+        self.calls = []
+        self.calls_lock = threading.Lock()
+
+    def _record(self, name):
+        with self.calls_lock:
+            self.calls.append(name)
+        time.sleep(0.01)
+
+    def stop_accepting(self):
+        self._record("stop_accepting")
+
+    def terminate_registered_groups(self):
+        self._record("terminate_registered_groups")
+
+    def finish(self):
+        self._record("finish")
+
+
+serialized_client = MCPClient()
+serialized_registry = CountingRegistry()
+serialized_client._runtime_registry = serialized_registry
+serialized_client._proc = SimpleNamespace(poll=lambda: 0, returncode=0)
+serialized_errors = []
+
+
+def capture_stop_error(_index):
+    try:
+        serialized_client.stop()
+    except Exception as error:
+        serialized_errors.append(str(error))
+
+
+serialized_threads = [
+    threading.Thread(target=capture_stop_error, args=(index,), daemon=True)
+    for index in range(2)
+]
+for thread in serialized_threads:
+    thread.start()
+for thread in serialized_threads:
+    thread.join(timeout=1)
+serialized_ok = (
+    not any(thread.is_alive() for thread in serialized_threads)
+    and serialized_errors == []
+    and serialized_registry.calls == [
+        "stop_accepting", "terminate_registered_groups", "finish",
+    ]
+    and serialized_client._runtime_registry is None
+)
+print(
+    "TEST concurrent_stop_serializes_registry_cleanup : "
+    f"{'PASS' if serialized_ok else 'FAIL'}"
+)
 
 analysis_id = "analysis-private-meta"
 input_digest = "1" * 64
@@ -186,6 +371,15 @@ else:
     cleanup_failed_closed = False
 cleanup_ok = cleanup_failed_closed and cleanup_client._proc is cleanup_process
 print(f"TEST failed_process_cleanup_retains_handle : {'PASS' if cleanup_ok else 'FAIL'}")
+
+if PUBLIC_ONLY:
+    public_ok = all((
+        ok, restart_ok, budget_ok, cancel_ok, late_ok, duplicate_ok, eof_ok,
+        metadata_ok, hostile_ok, cleanup_ok,
+    ))
+    print("TEST public_only_protocol_boundary : PASS" if public_ok else
+          "TEST public_only_protocol_boundary : FAIL")
+    raise SystemExit(0 if public_ok else 1)
 
 
 class PartialStartupProcess:
@@ -504,5 +698,6 @@ else:
     print("TEST natural_target_exit_reaps_background_descendant_and_drains_lease : SKIP")
 
 sys.exit(0 if all((ok, restart_ok, budget_ok, cancel_ok, late_ok,
+                   duplicate_ok, eof_ok,
                    metadata_ok, hostile_ok, cleanup_ok, partial_cleanup_ok,
                    forced_fallback_ok, natural_descendant_ok)) else 1)

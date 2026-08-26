@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "hooks"))
 
 from mcp_client import MCPClient, MCPToolError  # noqa: E402
+from final_report import public_arguments_view  # noqa: E402
 from gates import combined_gate, design_checks_for  # noqa: E402
 from gates import check_reproducibility  # noqa: E402
 from verification import content_hash, public_arguments_hash  # noqa: E402
@@ -43,6 +45,15 @@ def expect_tool_error(name, fn):
         fn()
     except MCPToolError:
         check(name, True)
+    else:
+        check(name, False, "call unexpectedly succeeded")
+
+
+def expect_tool_error_message(name, fn, expected):
+    try:
+        fn()
+    except MCPToolError as exc:
+        check(name, expected in str(exc), str(exc))
     else:
         check(name, False, "call unexpectedly succeeded")
 
@@ -111,6 +122,28 @@ output_dir = None
 with MCPClient() as client:
     tools = client.list_tools()
     check("server_lists_all_tools", len(tools) == 11, len(tools))
+    master_tool = next(tool for tool in tools if tool.get("name") == "master_simulate")
+    master_schema_fields = (
+        master_tool.get("inputSchema", {}).get("properties", {})
+        .get("config", {}).get("properties", {})
+    )
+    check("master_effect_threshold_is_absent_from_public_schema",
+          "effect_threshold" not in master_schema_fields, master_schema_fields)
+    legacy_master_arguments = {"config": {
+        "master_design_type": "platform", "endpoint_type": "binary",
+        "n_subgroups": 2, "null_params": 0.2, "alt_params": [0.4, 0.4],
+        "n_periods": 2, "n_per_period": 10,
+        "arms_schedule": {"enter": [1, 1], "leave": [2, 2]},
+        "ncc_method": "none", "futility_threshold": 0.05,
+        "effect_threshold": 0.99,
+    }}
+    public_master_arguments = public_arguments_view(
+        "master_simulate", legacy_master_arguments,
+    )
+    check("master_effect_threshold_is_absent_from_public_argument_projection",
+          "effect_threshold" not in public_master_arguments.get("config", {})
+          and public_master_arguments.get("config", {}).get("futility_threshold") == 0.05,
+          public_master_arguments)
 
     tests = client.call_tool("run_tests", {})
     check("run_tests_fixed_public_status", tests.get("all_ok") is True
@@ -462,6 +495,124 @@ with MCPClient() as client:
     check("mcp_omitted_delta_uses_go_target_margin",
           zero_row["p_go"] > derived_row["p_go"] + 0.2,
           (derived_row, zero_row))
+
+if os.name == "posix":
+    with tempfile.TemporaryDirectory(prefix="expdesign-master-contract-") as directory:
+        contract_root = Path(directory)
+        r_marker = contract_root / "unexpected-r-execution.txt"
+        r_shim = contract_root / "forbidden-rscript.sh"
+        r_shim.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' executed > {shlex.quote(str(r_marker))}\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        r_shim.chmod(0o700)
+        old_rscript = os.environ.get("EXPDESIGN_RSCRIPT")
+        os.environ["EXPDESIGN_RSCRIPT"] = str(r_shim)
+        platform_base = {
+            "master_design_type": "platform", "endpoint_type": "binary",
+            "n_subgroups": 2, "null_params": 0.2, "alt_params": [0.4, 0.4],
+            "n_periods": 2, "n_per_period": 10,
+            "arms_schedule": {"enter": [1, 1], "leave": [2, 2]},
+            "n_sims": 1,
+        }
+        try:
+            with MCPClient() as contract_client:
+                for required_field in ("n_periods", "n_per_period", "arms_schedule"):
+                    incomplete_platform = dict(platform_base)
+                    incomplete_platform.pop(required_field)
+                    expect_tool_error_message(
+                        f"platform_requires_{required_field}_before_r",
+                        lambda config=incomplete_platform: contract_client.call_tool(
+                            "master_simulate", {"config": config},
+                        ),
+                        "platform designs require n_periods, n_per_period, and arms_schedule",
+                    )
+                expect_tool_error_message(
+                    "platform_schedule_length_fails_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base,
+                        "arms_schedule": {"enter": [1, 1, 1], "leave": [2, 2, 2]},
+                    }}),
+                    "arms_schedule enter and leave must each contain exactly n_subgroups values",
+                )
+                expect_tool_error_message(
+                    "platform_schedule_range_fails_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base,
+                        "arms_schedule": {"enter": [0, 2], "leave": [2, 3]},
+                    }}),
+                    "arms_schedule must satisfy 1 <= enter[i] <= leave[i] <= n_periods",
+                )
+                expect_tool_error(
+                    "platform_schedule_noninteger_fails_at_schema_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base,
+                        "arms_schedule": {"enter": [1, 1.5], "leave": [2, 2]},
+                    }}),
+                )
+                nonplatform_base = {
+                    "master_design_type": "basket", "endpoint_type": "binary",
+                    "n_subgroups": 2, "null_params": 0.2,
+                    "alt_params": [0.4, 0.4], "n_per_subgroup": 10,
+                    "n_sims": 1,
+                }
+                platform_only_examples = {
+                    "n_periods": 2,
+                    "n_per_period": 10,
+                    "arms_schedule": {"enter": [1, 1], "leave": [2, 2]},
+                    "interim_frequency": 1,
+                    "futility_threshold": 0.05,
+                }
+                for field, value in platform_only_examples.items():
+                    expect_tool_error_message(
+                        f"nonplatform_rejects_{field}_before_r",
+                        lambda key=field, item=value: contract_client.call_tool(
+                            "master_simulate",
+                            {"config": {**nonplatform_base, key: item}},
+                        ),
+                        "platform-only configuration fields require master_design_type='platform'",
+                    )
+                expect_tool_error_message(
+                    "platform_interim_endpoint_combination_fails_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base, "endpoint_type": "tte", "null_params": 1,
+                        "alt_params": [0.8, 0.8], "ncc_method": "none",
+                        "interim_frequency": 1,
+                    }}),
+                    "interim_frequency/futility_threshold are unavailable for this endpoint and NCC method",
+                )
+                expect_tool_error_message(
+                    "platform_interim_ncc_combination_fails_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base, "futility_threshold": 0.05,
+                    }}),
+                    "interim_frequency/futility_threshold are unavailable for this endpoint and NCC method",
+                )
+                expect_tool_error(
+                    "legacy_effect_threshold_fails_at_schema_before_r",
+                    lambda: contract_client.call_tool("master_simulate", {"config": {
+                        **platform_base, "effect_threshold": 0.99,
+                    }}),
+                )
+                expect_tool_error_message(
+                    "simple_randomization_rejects_nonequal_ratio_before_r",
+                    lambda: contract_client.call_tool("randomize", {
+                        "n": 12, "ratio": [1, 2], "seed": 42,
+                    }),
+                    "method='simple' supports only equal allocation",
+                )
+            check("invalid_master_and_randomize_contract_requests_never_reach_r",
+                  not r_marker.exists(), r_marker)
+        finally:
+            if old_rscript is None:
+                os.environ.pop("EXPDESIGN_RSCRIPT", None)
+            else:
+                os.environ["EXPDESIGN_RSCRIPT"] = old_rscript
+else:
+    check("invalid_master_and_randomize_contract_requests_never_reach_r",
+          True, "POSIX-only shim")
 
 if output_dir:
     shutil.rmtree(output_dir, ignore_errors=True)

@@ -62,8 +62,9 @@ pin.
 
 Anyone reviewing a public clone can run `make public-check`. That limited check
 enforces the strict public path policy, compiles the distributed MCP interface,
-and verifies that npm publication is blocked. It does not execute the omitted
-engines or replace the complete internal release gate.
+verifies that npm publication is blocked, and exercises the public-safe
+lifecycle through the missing-engine startup refusal. It does not execute the
+omitted engines or replace the complete internal release gate.
 
 ## Validation claims
 

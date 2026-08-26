@@ -21,6 +21,10 @@ assert spec and spec.loader
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+public_workflow = (
+    module.ROOT / ".github" / "workflows" / "public-assurance.yml"
+).read_text(encoding="utf-8")
+
 checks = {
     "string_tools_are_structural": module.normalized_tools("Bash, Read") == {"Bash", "Read"},
     "yaml_list_tools_are_structural": module.normalized_tools(["Bash", "Read"]) == {"Bash", "Read"},
@@ -79,7 +83,36 @@ checks = {
             "scripts": {
                 "prepublishOnly": "node scripts/block-publish.mjs",
                 "test:private": "node tests/private-package.mjs",
+                "test:public-lifecycle": "npm run build && npm run test:private && EXPDESIGN_RSCRIPT=/usr/bin/false node tests/lifecycle.mjs --public-only",
                 "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs",
+            },
+        },
+        {"packages": {"": {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+        }}},
+    ),
+    "ambient_public_mode_mcp_package_rejected": not module.valid_private_mcp_package(
+        {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+            "scripts": {
+                "prepublishOnly": "node scripts/block-publish.mjs",
+                "test:private": "node tests/private-package.mjs",
+                "test:public-lifecycle": "npm run build && npm run test:private && EXPDESIGN_RSCRIPT=/usr/bin/false EXPDESIGN_PUBLIC_ONLY=1 node tests/lifecycle.mjs",
+                "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs",
+            },
+        },
+        {"packages": {"": {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+        }}},
+    ),
+    "full_lifecycle_public_mode_downgrade_rejected": not module.valid_private_mcp_package(
+        {
+            "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
+            "scripts": {
+                "prepublishOnly": "node scripts/block-publish.mjs",
+                "test:private": "node tests/private-package.mjs",
+                "test:public-lifecycle": "npm run build && npm run test:private && EXPDESIGN_RSCRIPT=/usr/bin/false node tests/lifecycle.mjs --public-only",
+                "test:lifecycle": "npm run build && npm run test:private && node tests/lifecycle.mjs --public-only",
             },
         },
         {"packages": {"": {
@@ -110,6 +143,112 @@ checks = {
         {"packages": {"": {
             "name": "experiment-design-mcp", "version": "1.1.0", "private": True,
         }}},
+    ),
+    "public_assurance_workflow_accepted": (
+        module.valid_public_assurance_workflow(public_workflow)
+    ),
+    "public_assurance_write_permission_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace("contents: read", "contents: write")
+        )
+    ),
+    "public_assurance_other_write_permission_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "  contents: read", "  contents: read\n  issues: write"
+            )
+        )
+    ),
+    "public_assurance_write_all_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "permissions:\n  contents: read", "permissions: write-all"
+            )
+        )
+    ),
+    "public_assurance_inline_write_permission_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "permissions:\n  contents: read",
+                'permissions: { contents: "write" }',
+            )
+        )
+    ),
+    "public_assurance_job_permission_override_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "    runs-on: ubuntu-24.04",
+                '    runs-on: ubuntu-24.04\n    permissions: { issues: "write" }',
+                1,
+            )
+        )
+    ),
+    "public_assurance_pull_request_target_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace("  pull_request:\n", "  pull_request_target:\n")
+        )
+    ),
+    "public_assurance_floating_action_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+                "actions/checkout@v5",
+            )
+        )
+    ),
+    "public_assurance_list_style_floating_action_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "      - name: Check out reviewed source\n"
+                "        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5\n"
+                "        with:\n"
+                "          persist-credentials: false",
+                "      - uses: actions/checkout@v5",
+                1,
+            )
+        )
+    ),
+    "public_assurance_extra_floating_action_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "      - name: Validate the public source-review distribution",
+                "      - name: Unpinned extra action\n"
+                "        uses: actions/cache@v4\n"
+                "      - name: Validate the public source-review distribution",
+                1,
+            )
+        )
+    ),
+    "public_assurance_commented_lifecycle_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "run: npm run test:public-lifecycle",
+                "run: true # npm run test:public-lifecycle",
+            )
+        )
+    ),
+    "public_assurance_ambient_public_mode_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py --public-only',
+                'EXPDESIGN_PUBLIC_ONLY=1 "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py',
+            )
+        )
+    ),
+    "public_assurance_commented_credential_scan_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "          set -o pipefail\n",
+                "          true # tools/check_diff_credentials.py\n",
+            )
+        )
+    ),
+    "public_assurance_persisted_checkout_credentials_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                "persist-credentials: false", "persist-credentials: true", 1
+            )
+        )
     ),
     "record_launcher_accepted": module.valid_hook_launcher({
         "type": "command",

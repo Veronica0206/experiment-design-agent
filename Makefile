@@ -49,13 +49,13 @@ deps:
 	@cd mcp-server && npm ci
 
 # Runnable in the public portfolio distribution. This checks only the strict
-# public path policy, TypeScript build, and npm non-publication guard; it does
-# not claim that the omitted statistical engines or full release suite exist.
+# public path policy, TypeScript build, npm non-publication guard, and the
+# lifecycle checks that stop at the missing-engine preflight. It does not claim
+# that the omitted statistical engines or full release suite exist.
 public-check:
 	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-clone "$(CURDIR)"
 	@cd mcp-server && npm ci
-	@cd mcp-server && npm run build
-	@cd mcp-server && npm run test:private
+	@cd mcp-server && npm run test:public-lifecycle
 	@echo "== public-check: PASS (source-review surface only; analysis engines not tested) =="
 
 validate-skills:

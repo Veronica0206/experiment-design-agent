@@ -35,7 +35,7 @@ const TARGET_CWD_ENV = "EXPDESIGN_RUNTIME_TARGET_CWD";
 const INTERNAL_MODE = "--expdesign-runtime-supervisor-v1";
 const STOP_BASENAME = ".stop";
 const STOP_POLL_MS = 100;
-const MAX_SUPERVISOR_PROGRAM_BYTES = 128 * 1024;
+export const MAX_SUPERVISOR_PROGRAM_BYTES = 128 * 1024;
 const MAX_PROC_DIRECTORY_ENTRIES = 262_144;
 const MAX_PROC_STAT_BYTES = 4_096;
 const MAX_PS_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -59,33 +59,71 @@ type RuntimeSpawnOptions = Pick<SpawnOptions, "cwd" | "env" | "stdio"> & {
   detached: boolean;
 };
 
+/**
+ * Capture one bounded supervisor program through a pinned descriptor. The
+ * optional hook exists for deterministic lifecycle race tests and runs only
+ * after the initial descriptor/name/size binding.
+ */
+export function captureBoundedSupervisorProgram(
+  path: string,
+  afterInitialBinding?: () => void,
+): string {
+  if (!isAbsolute(path)) {
+    throw new Error("runtime supervisor program path must be absolute");
+  }
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  const nonBlock = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
+  const fd = openSync(path, fsConstants.O_RDONLY | noFollow | nonBlock);
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    const namedBefore = lstatSync(path, { bigint: true });
+    if (!before.isFile() || !namedBefore.isFile() || namedBefore.isSymbolicLink() ||
+        before.dev !== namedBefore.dev || before.ino !== namedBefore.ino ||
+        before.size !== namedBefore.size || before.mtimeNs !== namedBefore.mtimeNs ||
+        before.ctimeNs !== namedBefore.ctimeNs || before.size < 0n ||
+        before.size > BigInt(MAX_SUPERVISOR_PROGRAM_BYTES)) {
+      throw new Error("runtime supervisor program is unsafe");
+    }
+    afterInitialBinding?.();
+
+    const expectedBytes = Number(before.size);
+    const bytes = Buffer.allocUnsafe(expectedBytes);
+    let offset = 0;
+    while (offset < expectedBytes) {
+      const count = readSync(fd, bytes, offset, expectedBytes - offset, offset);
+      if (count === 0) {
+        throw new Error("runtime supervisor program changed while it was captured");
+      }
+      offset += count;
+    }
+    const probe = Buffer.allocUnsafe(1);
+    if (readSync(fd, probe, 0, 1, expectedBytes) !== 0) {
+      throw new Error("runtime supervisor program grew while it was captured");
+    }
+
+    const after = fstatSync(fd, { bigint: true });
+    const namedAfter = lstatSync(path, { bigint: true });
+    if (!after.isFile() || !namedAfter.isFile() || namedAfter.isSymbolicLink() ||
+        before.dev !== after.dev || before.ino !== after.ino ||
+        before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
+        before.ctimeNs !== after.ctimeNs ||
+        before.dev !== namedAfter.dev || before.ino !== namedAfter.ino ||
+        before.size !== namedAfter.size || before.mtimeNs !== namedAfter.mtimeNs ||
+        before.ctimeNs !== namedAfter.ctimeNs) {
+      throw new Error("runtime supervisor program changed while it was captured");
+    }
+    return bytes.toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function captureSupervisorProgram(): string | undefined {
   // A wrapper launched through --eval has INTERNAL_MODE at argv[1] and must
   // not reopen a mutable file. The long-lived server captures these bytes once
   // while its complete dist tree is being bound into the startup fingerprint.
   if (process.argv[1] === INTERNAL_MODE) return undefined;
-  const path = fileURLToPath(import.meta.url);
-  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-  const fd = openSync(path, fsConstants.O_RDONLY | noFollow);
-  try {
-    const before = fstatSync(fd, { bigint: true });
-    const named = lstatSync(path, { bigint: true });
-    if (!before.isFile() || !named.isFile() || named.isSymbolicLink() ||
-        before.dev !== named.dev || before.ino !== named.ino ||
-        before.size > BigInt(MAX_SUPERVISOR_PROGRAM_BYTES)) {
-      throw new Error("runtime supervisor program is unsafe");
-    }
-    const program = readFileSync(fd, "utf8");
-    const after = fstatSync(fd, { bigint: true });
-    if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino ||
-        before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
-        before.ctimeNs !== after.ctimeNs) {
-      throw new Error("runtime supervisor program changed while it was captured");
-    }
-    return program;
-  } finally {
-    closeSync(fd);
-  }
+  return captureBoundedSupervisorProgram(fileURLToPath(import.meta.url));
 }
 
 const PINNED_SUPERVISOR_PROGRAM = captureSupervisorProgram();
@@ -183,12 +221,22 @@ export function spawnRuntimeProcess(
   if (!isAbsolute(executable)) {
     throw new Error("runtime executable must be absolute");
   }
-  const targetEnvironment = options.env ?? process.env;
-  const registry = configuration(targetEnvironment);
-  if (!registry) return spawn(executable, args, options);
+  const requestedTargetEnvironment = { ...(options.env ?? {}) };
+  const registry = configuration(requestedTargetEnvironment) ?? configuration(process.env);
+  const targetEnvironment = stripSupervisorEnvironment(requestedTargetEnvironment);
+  if (!registry) {
+    return spawn(executable, args, { ...options, env: targetEnvironment });
+  }
 
   const nonce = randomUUID().replaceAll("-", "");
   const wrapperEnvironment = { ...targetEnvironment };
+  // These values belong only to the authenticated Node wrapper. The final
+  // runtime receives requestedTargetEnvironment after the internal names are
+  // stripped, so target allowlists never need to carry supervisor secrets.
+  wrapperEnvironment[REGISTRY_DIR_ENV] = registry.directory;
+  wrapperEnvironment[REGISTRY_TOKEN_ENV] = registry.token;
+  wrapperEnvironment[REGISTRY_DEV_ENV] = String(registry.dev);
+  wrapperEnvironment[REGISTRY_INO_ENV] = String(registry.ino);
   wrapperEnvironment[SERVER_PID_ENV] = String(process.pid);
   wrapperEnvironment[NONCE_ENV] = nonce;
   wrapperEnvironment[TARGET_CWD_ENV] = canonicalTargetCwd(options.cwd);
