@@ -9,11 +9,15 @@ exact function of the verified arguments, result, and identity.
 from __future__ import annotations
 
 import json
+import math
+from itertools import combinations
 from typing import Any, Iterable
 
 from verification import (PUBLIC_LIMITATION_MESSAGES, canonical_value,
                           content_hash,
                           domain_arguments, identity_matches_call,
+                          normalize_platform_analysis_methods,
+                          platform_interim_reason_code,
                           public_check_summary, public_envelope_matches_call,
                           public_limitation_codes)
 
@@ -69,8 +73,10 @@ _ENUM_VALUES = {
 }
 
 _BOOLEAN_FIELDS = {
-    "interim_stopping_applied", "orthogonal", "random", "randomize",
-    "rar_enabled", "shared_control", "truly_active",
+    "interim_efficacy_enabled", "interim_futility_enabled",
+    "interim_stopping_applied", "orthogonal", "power_precision_met",
+    "precision_met", "random", "randomize", "rar_enabled",
+    "reject_precision_met", "shared_control", "truly_active",
 }
 
 _PRIOR_NAMES = {"jeffreys", "flat", "skeptical"}
@@ -159,7 +165,13 @@ _MASTER_ROW = {
     "effect_scale", "per_arm_power", "cond_estimate", "selection_prob", "metric",
     "value", "expected_n", "enter_period", "leave_period", "true_alt_param",
     "true_null_param", "mean_n", "mean_early_posterior_prob",
-    "mean_final_p_value", "type_i_error",
+    "mean_final_p_value", "type_i_error", "requested_ncc_method",
+    "actual_analysis_method", "actual_analysis_methods", "reject_mcse_pct",
+    "reject_ci_lower_pct", "reject_ci_upper_pct", "reject_precision_met",
+    "power_mcse_pct", "power_ci_lower_pct", "power_ci_upper_pct",
+    "power_precision_met", "fwer_mcse_pct", "fwer_ci_lower_pct",
+    "fwer_ci_upper_pct", "mcse", "ci_lower", "ci_upper", "precision_met",
+    "n_simulations",
 }
 _BUCHER_ROW = {
     "estimate", "se", "lower", "upper", "ci_lower", "ci_upper", "natural_estimate",
@@ -188,7 +200,10 @@ _RESULT_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
             "oc_table", "fwer_table", "power_table", "sample_size_table",
             "arm_results", "type_i_table", "alloc_df", "decision_matrix",
             "multiplicity_method", "final_alpha_per_arm",
-            "interim_stopping_applied", "boundary_source",
+            "interim_futility_enabled", "interim_efficacy_enabled",
+            "interim_stopping_applied", "interim_stopping_reason",
+            "requested_ncc_method", "actual_analysis_methods",
+            "mc_precision_target_probability_half_width", "boundary_source",
         },
         ("result", "oc_table"): set(_MASTER_ROW),
         ("result", "fwer_table"): set(_MASTER_ROW),
@@ -227,7 +242,8 @@ _RESULT_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
     },
     "factorial_design": {
         (): {"n_factors", "levels", "fraction", "replicates", "center_points",
-             "randomize", "seed", "n_runs", "resolution", "orthogonal", "design", "type"},
+             "randomize", "seed", "n_runs", "resolution", "orthogonal", "design",
+             "type", "generators", "defining_relation", "alias_structure"},
     },
     "rsm_design": {
         (): {"n_factors", "alpha", "fraction", "center_points", "randomize", "seed",
@@ -278,7 +294,7 @@ _ARG_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
     "ab_test": {(): set(_RESULT_FIELDS_BY_PATH["ab_test"][()])},
     "factorial_design": {
         (): {"n_factors", "levels", "fraction", "replicates", "center_points",
-             "randomize", "seed"},
+             "randomize", "seed", "generators"},
     },
     "rsm_design": {
         (): {"n_factors", "design", "alpha", "fraction", "center_points",
@@ -393,6 +409,183 @@ def _factor_name_sort_key(name: str) -> tuple[int, int, str]:
     return (1, 0, name)
 
 
+def _positive_factor_index(value: Any, maximum: int) -> int | None:
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= maximum):
+        return value
+    return None
+
+
+def _project_factorial_generators(value: dict[str, Any]) -> Any:
+    """Normalize a custom generator request to one-based public factor indices."""
+    n_factors = value.get("n_factors")
+    fraction = value.get("fraction", 0)
+    raw = value.get("generators")
+    if raw is None:
+        return _DROP
+    if (not isinstance(n_factors, int) or isinstance(n_factors, bool)
+            or not isinstance(fraction, int) or isinstance(fraction, bool)
+            or not 1 <= fraction < n_factors or not isinstance(raw, list)
+            or len(raw) != fraction):
+        return _DROP
+    basic_count = n_factors - fraction
+    normalized: list[dict[str, Any]] = []
+    seen_sources: set[tuple[int, ...]] = set()
+    for offset, item in enumerate(raw):
+        if isinstance(item, dict):
+            expected_keys = {"generated_factor_index", "source_factor_indices"}
+            if set(item) != expected_keys:
+                return _DROP
+            generated = _positive_factor_index(
+                item.get("generated_factor_index"), n_factors,
+            )
+            sources_raw = item.get("source_factor_indices")
+            if generated != basic_count + offset + 1:
+                return _DROP
+        else:
+            generated = basic_count + offset + 1
+            sources_raw = item
+        if not isinstance(sources_raw, list) or len(sources_raw) < 2:
+            return _DROP
+        sources = [_positive_factor_index(source, basic_count)
+                   for source in sources_raw]
+        if any(source is None for source in sources):
+            return _DROP
+        source_key = tuple(sorted(int(source) for source in sources))
+        if len(set(source_key)) != len(source_key) or source_key in seen_sources:
+            return _DROP
+        seen_sources.add(source_key)
+        normalized.append({
+            "generated_factor_index": generated,
+            "source_factor_indices": list(source_key),
+        })
+    return normalized
+
+
+def _factor_names_from_design(value: dict[str, Any]) -> list[str]:
+    design = value.get("design")
+    if not isinstance(design, list):
+        return []
+    rows = [row for row in design if isinstance(row, dict)]
+    return sorted(
+        {
+            str(key) for row in rows for key, item in row.items()
+            if str(key).lower() not in {"point_type", "run", "std_order"}
+            and _number(item) is not _DROP
+        },
+        key=_factor_name_sort_key,
+    )
+
+
+def _project_defining_relation(value: dict[str, Any]) -> Any:
+    """Convert relation words to sorted lists of public factor indices."""
+    factor_names = _factor_names_from_design(value)
+    n_factors = value.get("n_factors")
+    if (not isinstance(n_factors, int) or isinstance(n_factors, bool)
+            or n_factors != len(factor_names) or not 1 <= n_factors <= 12):
+        return _DROP
+    raw = value.get("defining_relation")
+    words = [raw] if isinstance(raw, str) else raw
+    if not isinstance(words, list) or not words:
+        return _DROP
+    name_to_index = {name: index + 1 for index, name in enumerate(factor_names)}
+    normalized: list[tuple[int, ...]] = []
+    for word in words:
+        if isinstance(word, str):
+            if not word or word != word.strip():
+                return _DROP
+            indices = [name_to_index.get(letter) for letter in word]
+            if any(index is None for index in indices):
+                return _DROP
+            candidate = tuple(sorted(int(index) for index in indices))
+        elif isinstance(word, list):
+            indices = [_positive_factor_index(index, n_factors) for index in word]
+            if any(index is None for index in indices):
+                return _DROP
+            candidate = tuple(sorted(int(index) for index in indices))
+        else:
+            return _DROP
+        if len(candidate) < 2 or len(set(candidate)) != len(candidate):
+            return _DROP
+        normalized.append(candidate)
+    if len(set(normalized)) != len(normalized):
+        return _DROP
+    return [list(word) for word in sorted(normalized, key=lambda word: (len(word), word))]
+
+
+def _factorial_result_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Build bounded, label-free generator, relation, and alias metadata."""
+    if value.get("type") != "fractional_factorial":
+        return {}
+    relation = _project_defining_relation(value)
+    if relation is _DROP:
+        return {}
+    n_factors = int(value["n_factors"])
+    group_size = len(relation) + 1
+    if group_size < 2 or group_size & (group_size - 1):
+        return {}
+    fraction = int(math.log2(group_size))
+    if not 1 <= fraction < n_factors:
+        return {}
+    basic_count = n_factors - fraction
+    word_sets = [frozenset(word) for word in relation]
+
+    generators: list[dict[str, Any]] = []
+    generated_factors = set(range(basic_count + 1, n_factors + 1))
+    for generated in sorted(generated_factors):
+        candidates = [
+            word for word in word_sets
+            if generated in word and not ((word - {generated}) & generated_factors)
+        ]
+        if len(candidates) != 1:
+            generators = []
+            break
+        sources = sorted(candidates[0] - {generated})
+        if not sources or any(source > basic_count for source in sources):
+            generators = []
+            break
+        generators.append({
+            "generated_factor_index": generated,
+            "source_factor_indices": sources,
+        })
+
+    group = [frozenset(), *word_sets]
+    visible_effects = [
+        frozenset(effect)
+        for order in (1, 2)
+        for effect in combinations(range(1, n_factors + 1), order)
+    ]
+    alias_classes: set[tuple[tuple[int, ...], ...]] = set()
+    for effect in visible_effects:
+        visible_class = {
+            tuple(sorted(effect.symmetric_difference(word)))
+            for word in group
+            if 1 <= len(effect.symmetric_difference(word)) <= 2
+        }
+        if visible_class:
+            alias_classes.add(tuple(sorted(
+                visible_class, key=lambda member: (len(member), member),
+            )))
+    ordered_classes = sorted(
+        alias_classes,
+        key=lambda members: tuple((len(member), member) for member in members),
+    )
+    metadata: dict[str, Any] = {
+        "defining_relation": relation,
+        "alias_structure": {
+            "factor_index_basis": "one_based_public_design_columns",
+            "scope": "main_and_two_factor",
+            "classes": [
+                {"effects": [list(effect) for effect in members]}
+                for members in ordered_classes
+            ],
+        },
+    }
+    if len(generators) == fraction:
+        metadata["generators"] = generators
+    return metadata
+
+
 def _project_design(value: Any) -> Any:
     """Preserve a numeric design matrix while pseudonymizing factor names."""
     if not isinstance(value, (list, tuple)):
@@ -491,6 +684,26 @@ def _project_value(
         return summary
     if lowered == "design" and tool in {"factorial_design", "rsm_design"} and mode == "result":
         return _project_design(value)
+    if (tool == "factorial_design" and path == ()
+            and lowered in {"generators", "defining_relation", "alias_structure"}):
+        # These fields are rebuilt together from the verified matrix/relation or
+        # the validated request. Never pass through engine free text.
+        return _DROP
+    if (tool == "master_simulate" and mode == "result"
+            and lowered in {"actual_analysis_method", "actual_analysis_methods"}):
+        normalized_methods = normalize_platform_analysis_methods(value)
+        return normalized_methods if normalized_methods is not None else _DROP
+    if (tool == "master_simulate" and mode == "result"
+            and lowered == "requested_ncc_method"):
+        if not isinstance(value, str):
+            return _DROP
+        normalized_ncc = value.lower()
+        return (normalized_ncc if normalized_ncc in _ENUM_VALUES["ncc_method"]
+                else _DROP)
+    if (tool == "master_simulate" and mode == "result"
+            and lowered == "interim_stopping_reason"):
+        reason = platform_interim_reason_code(value)
+        return reason if reason is not None else _DROP
     if tool == "master_simulate" and lowered == "metric":
         if not isinstance(value, str):
             return _DROP
@@ -602,7 +815,14 @@ def _project_mapping(
             continue
         public = _project_value(tool, lowered, item, path, schemas, mode)
         if public is not _DROP:
-            safe[lowered] = public
+            output_key = (
+                "actual_analysis_methods"
+                if (tool == "master_simulate" and mode == "result"
+                    and path == ("result", "arm_results")
+                    and lowered in {"actual_analysis_method", "actual_analysis_methods"})
+                else lowered
+            )
+            safe[output_key] = public
     if private_count:
         safe["private_artifacts"] = {"available": True, "length": private_count}
     return safe
@@ -614,7 +834,10 @@ def privacy_safe_view(tool: str, value: Any) -> Any:
         return _project_randomize(value, "result")
     if not isinstance(value, dict):
         return {}
-    return _project_mapping(tool, value, (), _RESULT_FIELDS_BY_PATH, "result")
+    safe = _project_mapping(tool, value, (), _RESULT_FIELDS_BY_PATH, "result")
+    if tool == "factorial_design":
+        safe.update(_factorial_result_metadata(value))
+    return safe
 
 
 def public_arguments_view(tool: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
@@ -622,7 +845,12 @@ def public_arguments_view(tool: str, arguments: dict[str, Any] | None) -> dict[s
     value = domain_arguments(arguments)
     if tool == "randomize":
         return _project_randomize(value, "arguments")
-    return _project_mapping(tool, value, (), _ARG_FIELDS_BY_PATH, "arguments")
+    safe = _project_mapping(tool, value, (), _ARG_FIELDS_BY_PATH, "arguments")
+    if tool == "factorial_design":
+        generators = _project_factorial_generators(value)
+        if generators is not _DROP:
+            safe["generators"] = generators
+    return safe
 
 
 def _normal_status(envelope: dict[str, Any]) -> str:

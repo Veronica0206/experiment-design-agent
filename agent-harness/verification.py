@@ -34,6 +34,64 @@ PRESENTABLE_STATUSES = {
 }
 
 
+# Fixed public codes for the analysis procedures that the reviewed platform
+# engine can actually execute.  The raw engine strings are useful for verifying
+# behavior, but arbitrary strings must never become model-visible merely because
+# they appeared in a result row.
+PLATFORM_ANALYSIS_METHOD_CODES = frozenset({
+    "concurrent_fisher_exact",
+    "naive_all_control_fisher_exact",
+    "exact_stratified_cmh",
+    "temporal_decay_weighted_effective_binomial_exact_approximation",
+    "concurrent_welch_t",
+    "naive_all_control_welch_t",
+    "ols_period_adjusted_t",
+    "temporal_decay_weighted_welch_t_approximation",
+    "cox_ph",
+    "poisson_log_link_period_adjusted",
+})
+
+PLATFORM_INTERIM_REASON_CODES = frozenset({
+    "futility_only_posterior_monitoring_enabled",
+    "disabled_no_ncc_consistent_interim_model",
+})
+
+
+def normalize_platform_analysis_methods(value: Any) -> list[str] | None:
+    """Return a unique, sorted list of reviewed platform-method codes.
+
+    R auto-unboxes a one-element vector and joins the methods used by one arm
+    with semicolons.  Accept those two wire shapes, but reject whitespace,
+    duplicates, empty tokens, and every value outside the fixed public enum.
+    """
+    if isinstance(value, str):
+        raw = value.split(";")
+    elif isinstance(value, list):
+        raw = value
+    else:
+        return None
+    if (not raw or not all(isinstance(item, str) and item
+                           and item == item.strip() for item in raw)
+            or len(set(raw)) != len(raw)
+            or any(item not in PLATFORM_ANALYSIS_METHOD_CODES for item in raw)):
+        return None
+    return sorted(raw)
+
+
+def platform_interim_reason_code(value: Any) -> str | None:
+    """Collapse reviewed engine explanations to non-data-bearing public codes."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().lower()
+    if normalized in PLATFORM_INTERIM_REASON_CODES:
+        return normalized
+    if "futility-only posterior monitoring is enabled" in normalized:
+        return "futility_only_posterior_monitoring_enabled"
+    if "no ncc-consistent interim model" in normalized:
+        return "disabled_no_ncc_consistent_interim_model"
+    return None
+
+
 PUBLIC_CHECK_CATEGORIES = frozenset({
     "artifact_integrity",
     "design_validation",

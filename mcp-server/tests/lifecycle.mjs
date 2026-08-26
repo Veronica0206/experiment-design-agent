@@ -58,6 +58,7 @@ import {
   fingerprintStartupRuntime,
   installedProductionDependencyRoots,
   STARTUP_RUNTIME_FINGERPRINT,
+  readAllowedFile,
 } from "../dist/index.js";
 import { publicRegressionStatus } from "../dist/public-projection.js";
 import {
@@ -72,6 +73,12 @@ import {
   runtimeSupervisorProgramCommitment,
   spawnRuntimeProcess,
 } from "../dist/runtime-supervisor.js";
+import {
+  InvalidRequestToolError,
+  PUBLIC_TOOL_ERROR_MESSAGES,
+  publicToolErrorResponse,
+} from "../dist/tool-errors.js";
+import { normalizedAllocationWeights } from "../dist/allocation-ratio.js";
 
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -135,6 +142,66 @@ const workspace = realpathSync(
 );
 
 try {
+  const outsideInput = join(workspace, "outside-input.csv");
+  writeFileSync(outsideInput, "value\n1\n", { mode: 0o600 });
+  let privatePathError;
+  try {
+    await readAllowedFile(outsideInput);
+  } catch (error) {
+    privatePathError = error;
+  }
+  assert.ok(privatePathError instanceof InvalidRequestToolError);
+  const privateArtifactRoot = join(
+    process.cwd(), "agent-harness", "runs", "artifacts",
+  );
+  const privateRuntimePath = join(process.cwd(), "private-runtime", "Rscript");
+  const combinedPrivateError = new InvalidRequestToolError(
+    `${privatePathError.message}; artifact=${privateArtifactRoot}; runtime=${privateRuntimePath}`,
+  );
+  const privateDiagnostics = [];
+  const publicFailure = publicToolErrorResponse(
+    "indirect_compare",
+    combinedPrivateError,
+    (message) => privateDiagnostics.push(message),
+  );
+  const publicFailureText = publicFailure.content[0].text;
+  assert.equal(publicFailure.isError, true);
+  assert.deepEqual(JSON.parse(publicFailureText), {
+    error: {
+      code: "invalid_request",
+      message: PUBLIC_TOOL_ERROR_MESSAGES.invalid_request,
+    },
+  });
+  for (const privateValue of [outsideInput, privateArtifactRoot, privateRuntimePath]) {
+    assert.equal(publicFailureText.includes(privateValue), false);
+    assert.equal(privateDiagnostics[0].includes(privateValue), true);
+  }
+  const cancelled = new Error("cancelled at /private/runtime/path");
+  cancelled.name = "AbortError";
+  assert.deepEqual(
+    JSON.parse(publicToolErrorResponse("sample_size", cancelled, () => {}).content[0].text),
+    {
+      error: {
+        code: "request_cancelled",
+        message: PUBLIC_TOOL_ERROR_MESSAGES.request_cancelled,
+      },
+    },
+  );
+  assert.deepEqual(
+    JSON.parse(publicToolErrorResponse(
+      "run_tests",
+      new Error(`runtime integrity failed at ${privateRuntimePath}`),
+      () => {},
+    ).content[0].text),
+    {
+      error: {
+        code: "internal_error",
+        message: PUBLIC_TOOL_ERROR_MESSAGES.internal_error,
+      },
+    },
+  );
+  console.log("TEST mcp_tool_errors_are_path_free_with_private_diagnostics : PASS");
+
   const overflow = JSON.parse('{"go_target":1e309,"nested":[{"value":-1e309}]}');
   assert.equal(overflow.go_target, Infinity);
   assert.throws(() => assertFiniteNumericInputs(overflow), /must be finite/);
@@ -167,6 +234,19 @@ try {
     fractional: 1.0000000000000002,
   }));
   console.log("TEST unsafe_integral_json_numbers_are_rejected_recursively : PASS");
+
+  for (const scaled of [
+    [1, 2],
+    [2, 4],
+    [0.00001, 0.00002],
+    [1e-300, 2e-300],
+  ]) {
+    assert.deepEqual(normalizedAllocationWeights(scaled), [1, 2]);
+  }
+  assert.deepEqual(normalizedAllocationWeights([1.3333333333, 1]), [4, 3]);
+  assert.deepEqual(normalizedAllocationWeights([1e-300, 1e-300]), [1, 1]);
+  assert.equal(normalizedAllocationWeights([1e-300, 1e300]), null);
+  console.log("TEST allocation_ratio_normalization_is_scale_invariant : PASS");
 
   const runtimeTreeRoot = join(workspace, "bounded-runtime-tree");
   const runtimeTreeNested = join(runtimeTreeRoot, "nested");

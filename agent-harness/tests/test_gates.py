@@ -734,7 +734,7 @@ with tempfile.TemporaryDirectory() as directory:
         "arm,reject_rate,mean_n,requested_ncc_method,actual_analysis_method,"
         "reject_mcse_pct,reject_ci_lower_pct,reject_ci_upper_pct,"
         "reject_precision_met\n"
-        "1,5,100,regression,exact_concurrent_stratified,0.69,3.8,6.6,TRUE\n",
+        "1,5,100,regression,exact_stratified_cmh,0.69,3.8,6.6,TRUE\n",
         encoding="utf-8")
     (root / "platform_oc_table.csv").write_text(
         "metric,value,mcse,ci_lower,ci_upper,precision_met,n_simulations\n"
@@ -746,7 +746,7 @@ with tempfile.TemporaryDirectory() as directory:
             "arm_results": [{
                 "arm": 1, "reject_rate": 5, "mean_n": 100,
                 "requested_ncc_method": "regression",
-                "actual_analysis_method": "exact_concurrent_stratified",
+                "actual_analysis_method": "exact_stratified_cmh",
                 "reject_mcse_pct": 0.69, "reject_ci_lower_pct": 3.8,
                 "reject_ci_upper_pct": 6.6, "reject_precision_met": True,
             }],
@@ -758,7 +758,7 @@ with tempfile.TemporaryDirectory() as directory:
             "interim_efficacy_enabled": False,
             "interim_stopping_reason": "No NCC-consistent interim model",
             "requested_ncc_method": "regression",
-            "actual_analysis_methods": ["exact_concurrent_stratified"],
+            "actual_analysis_methods": ["exact_stratified_cmh"],
             "mc_precision_target_probability_half_width": 0.02,
         },
         "output_dir": str(root),
@@ -785,7 +785,7 @@ with tempfile.TemporaryDirectory() as directory:
     single_method = {
         **platform_result,
         "result": {**platform_result["result"],
-                   "actual_analysis_methods": "exact_concurrent_stratified"},
+                   "actual_analysis_methods": "exact_stratified_cmh"},
     }
     verdict = check_master_result(
         single_method,
@@ -800,9 +800,9 @@ with tempfile.TemporaryDirectory() as directory:
         ("empty_string", ""),
         ("nonstring", 3),
         ("whitespace", "   "),
-        ("whitespace_member", ["exact_concurrent_stratified", "   "]),
-        ("duplicate_member", ["exact_concurrent_stratified",
-                              "exact_concurrent_stratified"]),
+        ("whitespace_member", ["exact_stratified_cmh", "   "]),
+        ("duplicate_member", ["exact_stratified_cmh",
+                              "exact_stratified_cmh"]),
         # An unhashable element must fail the contract, not raise before the
         # verdict is returned.
         ("unhashable_member", [{}]),
@@ -824,7 +824,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     # An arm that used several methods across periods reports them ";"-joined,
     # and the declared list is their union over every arm.
-    joined_label = "exact_concurrent_stratified;not_run_interim_futility"
+    joined_label = "exact_stratified_cmh;concurrent_fisher_exact"
     with tempfile.TemporaryDirectory() as joined_directory:
         joined_root = Path(joined_directory)
         (joined_root / "platform_arm_results.csv").write_text(
@@ -843,7 +843,7 @@ with tempfile.TemporaryDirectory() as directory:
             "result": {
                 **platform_result["result"],
                 "actual_analysis_methods": [
-                    "exact_concurrent_stratified", "not_run_interim_futility",
+                    "exact_stratified_cmh", "concurrent_fisher_exact",
                 ],
                 "arm_results": [
                     {**platform_result["result"]["arm_results"][0],
@@ -858,8 +858,8 @@ with tempfile.TemporaryDirectory() as directory:
         check("master_platform_joined_arm_methods_reconcile", verdict.passed, str(verdict))
 
     for label, joined in (
-        ("blank_token", "exact_concurrent_stratified;"),
-        ("padded_token", "exact_concurrent_stratified; not_run_interim_futility"),
+        ("blank_token", "exact_stratified_cmh;"),
+        ("padded_token", "exact_stratified_cmh; concurrent_fisher_exact"),
     ):
         malformed_join = {
             **platform_result,
@@ -887,7 +887,7 @@ with tempfile.TemporaryDirectory() as directory:
             "arm_results": [
                 {**platform_result["result"]["arm_results"][0],
                  "actual_analysis_method":
-                     "exact_concurrent_stratified;exact_concurrent_stratified"},
+                     "exact_stratified_cmh;exact_stratified_cmh"},
             ],
         },
     }
@@ -907,7 +907,7 @@ with tempfile.TemporaryDirectory() as directory:
         "result": {
             **platform_result["result"],
             "actual_analysis_methods": [
-                "exact_concurrent_stratified", "never_ran_method",
+                "exact_stratified_cmh", "never_ran_method",
             ],
         },
     }
@@ -1058,9 +1058,13 @@ v = check_randomize(rand_ok, {"n": 5, "ratio": [2, 2]})
 check("randomize_simple_scaled_equal_ratio_passes", v.passed, str(v))
 v = check_randomize(rand_ok, {"n": 5, "ratio": [3, 1]})
 check("randomize_simple_non_equal_ratio_fails_closed", not v.passed, str(v))
-v = check_randomize(rand_ok, {"n": 5, "ratio": [1e-300, 1e-300]})
-check("randomize_tiny_unrepresentable_ratio_fails_without_crashing",
-      not v.passed, str(v))
+for label, ratio in (
+    ("tiny_decimal", [1e-5, 1e-5]),
+    ("subnormal_scale", [1e-300, 1e-300]),
+):
+    v = check_randomize(rand_ok, {"n": 5, "ratio": ratio})
+    check(f"randomize_simple_{label}_equal_ratio_is_scale_invariant",
+          v.passed, str(v))
 
 block_args = {
     "n": 8, "arms": ["control", "treatment"], "method": "block",
@@ -1083,6 +1087,33 @@ block_ok = {
 }
 v = check_randomize(block_ok, block_args)
 check("randomize_block_good_passes", v.passed, str(v))
+v = check_randomize(block_ok, dict(block_args, ratio=[1e-5, 1e-5]))
+check("randomize_block_equal_ratio_is_scale_invariant", v.passed, str(v))
+
+scaled_weighted_args = {
+    "n": 6, "arms": ["control", "treatment"], "method": "block",
+    "block_size": 3, "ratio": [1e-5, 2e-5], "seed": 42,
+}
+scaled_weighted_ok = {
+    "method": "block", "n": 6, "arms": ["control", "treatment"],
+    "counts": {"control": 2, "treatment": 4}, "seed": 42,
+    "block_size_used": 3,
+    "assignment": [
+        {"unit": 1, "stratum": None, "arm": "treatment"},
+        {"unit": 2, "stratum": None, "arm": "control"},
+        {"unit": 3, "stratum": None, "arm": "treatment"},
+        {"unit": 4, "stratum": None, "arm": "treatment"},
+        {"unit": 5, "stratum": None, "arm": "treatment"},
+        {"unit": 6, "stratum": None, "arm": "control"},
+    ],
+}
+v = check_randomize(scaled_weighted_ok, scaled_weighted_args)
+check("randomize_block_weighted_ratio_is_scale_invariant", v.passed, str(v))
+v = check_randomize(
+    scaled_weighted_ok,
+    dict(scaled_weighted_args, ratio=[1e-300, 1e300]),
+)
+check("randomize_unbounded_relative_quota_fails_closed", not v.passed, str(v))
 
 fallback_args = dict(block_args, block_size=3)
 fallback_ok = dict(block_ok, block_size_used=2)
@@ -1452,6 +1483,34 @@ v = check_factorial(dict(forged_relation, resolution=3, defining_relation=["ABD"
                     frac_args)
 check("fractional_true_defining_relation_of_same_design_passes", v.passed, str(v))
 
+# An internally valid regular half fraction is still the wrong answer when the
+# caller explicitly requested D=AB. D=ABC with I=ABCD must fail request binding
+# even though its matrix, relation, and resolution agree with one another.
+custom_generator_args = {**frac_args, "generators": [[1, 2]]}
+v = check_factorial(frac, custom_generator_args)
+check("fractional_internally_valid_wrong_requested_generator_fails",
+      not v.passed and v.checks.get("requested_generators_honored") is False,
+      str(v))
+requested_generator_design = dict(
+    forged_relation, resolution=3, defining_relation=["ABD"],
+)
+v = check_factorial(requested_generator_design, custom_generator_args)
+check("fractional_requested_generator_is_bound_to_generated_column",
+      v.passed and v.checks.get("custom_generators_valid") is True
+      and v.checks.get("requested_generators_honored") is True, str(v))
+for label, invalid_generators in (
+    ("wrong_count", []),
+    ("duplicate_index", [[1, 1]]),
+    ("generated_factor_reference", [[1, 4]]),
+):
+    v = check_factorial(
+        requested_generator_design,
+        {**frac_args, "generators": invalid_generators},
+    )
+    check(f"fractional_custom_generator_{label}_fails_closed",
+          not v.passed and v.checks.get("custom_generators_valid") is False,
+          str(v))
+
 # A real 2^(5-2): basic A,B,C with D=AB and E=AC, so I=ABD=ACE=BCDE.
 frac_two = {
     "type": "fractional_factorial", "n_factors": 5, "n_runs": 8,
@@ -1466,6 +1525,16 @@ check("fractional_complete_defining_group_passes",
       v.passed and v.checks.get("defining_relation_cardinality") is True
       and v.checks.get("defining_relation_group_closed") is True
       and v.checks.get("defining_relation_holds_in_design") is True, str(v))
+v = check_factorial(
+    frac_two, {**frac_two_args, "generators": [[1, 2], [1, 3]]},
+)
+check("fractional_multiple_requested_generators_are_bound_in_order",
+      v.passed and v.checks.get("requested_generators_honored") is True, str(v))
+v = check_factorial(
+    frac_two, {**frac_two_args, "generators": [[1, 2], [2, 1]]},
+)
+check("fractional_duplicate_generator_definitions_fail_closed",
+      not v.passed and v.checks.get("custom_generators_valid") is False, str(v))
 
 for label, mismatched_args, check_name in (
     ("n_factors", {"n_factors": 6, "fraction": 2},

@@ -565,6 +565,55 @@ check("factorial_public_dto_is_idempotent_for_one_to_twelve_factors",
       and factorial_views[9]["design"][0]["factor_10"] == 10
       and factorial_views[11]["design"][0]["factor_12"] == 12)
 
+custom_factorial_args = {
+    "n_factors": 4, "fraction": 1, "generators": [[1, 2]],
+}
+custom_factorial_raw = {
+    "type": "fractional_factorial", "n_factors": 4, "n_runs": 8,
+    "replicates": 1, "resolution": 3,
+    "generators": ["D = AB"], "defining_relation": "ABD",
+    "aliases": [{"effect": "A", "aliased_with": "BD"}],
+    "design": [
+        {"A": a, "B": b, "C": c, "D": a * b}
+        for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)
+    ],
+}
+custom_factorial_public_args = public_arguments_view(
+    "factorial_design", custom_factorial_args,
+)
+custom_factorial_public = privacy_safe_view(
+    "factorial_design", custom_factorial_raw,
+)
+check("factorial_generator_argument_projection_is_normalized_and_hash_bound",
+      custom_factorial_public_args == {
+          "fraction": 1,
+          "generators": [{
+              "generated_factor_index": 4,
+              "source_factor_indices": [1, 2],
+          }],
+          "n_factors": 4,
+      }
+      and public_arguments_view(
+          "factorial_design", custom_factorial_public_args,
+      ) == custom_factorial_public_args
+      and public_arguments_hash("factorial_design", custom_factorial_args)
+      != public_arguments_hash("factorial_design", {
+          "n_factors": 4, "fraction": 1, "generators": [[1, 2, 3]],
+      }))
+check("factorial_result_metadata_is_structured_label_free_and_idempotent",
+      custom_factorial_public.get("generators") == [{
+          "generated_factor_index": 4,
+          "source_factor_indices": [1, 2],
+      }]
+      and custom_factorial_public.get("defining_relation") == [[1, 2, 4]]
+      and {"effects": [[1], [2, 4]]}
+      in custom_factorial_public.get("alias_structure", {}).get("classes", [])
+      and custom_factorial_public.get("alias_structure", {}).get("scope")
+      == "main_and_two_factor"
+      and "D = AB" not in json.dumps(custom_factorial_public)
+      and privacy_safe_view("factorial_design", custom_factorial_public)
+      == custom_factorial_public)
+
 ten_factor_args = {"n_factors": 10, "fraction": 5}
 ten_factor_raw = {
     "n_factors": 10,
@@ -751,6 +800,61 @@ check("master_aggregate_tables_are_complete_and_label_safe",
       }}
       and privacy_safe_view("master_simulate", master_completeness)
       == master_completeness)
+
+platform_public = privacy_safe_view("master_simulate", {"result": {
+    "arm_results": [{
+        "arm": 1, "reject_rate": 5, "mean_n": 100,
+        "requested_ncc_method": "regression",
+        "actual_analysis_method": "exact_stratified_cmh",
+        "reject_mcse_pct": 0.69, "reject_ci_lower_pct": 3.8,
+        "reject_ci_upper_pct": 6.6, "reject_precision_met": True,
+    }],
+    "oc_table": [{
+        "metric": "FWER (%)", "value": 5, "mcse": 0.69,
+        "ci_lower": 3.8, "ci_upper": 6.6, "precision_met": True,
+        "n_simulations": 1000,
+    }],
+    "interim_futility_enabled": False,
+    "interim_efficacy_enabled": False,
+    "interim_stopping_applied": False,
+    "interim_stopping_reason": (
+        "Disabled: no NCC-consistent interim model for endpoint_type='binary' "
+        "with ncc_method='regression'"
+    ),
+    "requested_ncc_method": "regression",
+    "actual_analysis_methods": ["exact_stratified_cmh"],
+    "mc_precision_target_probability_half_width": 0.02,
+}})
+check("platform_actual_method_futility_and_precision_contract_is_public",
+      platform_public == {"result": {
+          "actual_analysis_methods": ["exact_stratified_cmh"],
+          "arm_results": [{
+              "actual_analysis_methods": ["exact_stratified_cmh"],
+              "arm": 1, "mean_n": 100, "reject_ci_lower_pct": 3.8,
+              "reject_ci_upper_pct": 6.6, "reject_mcse_pct": 0.69,
+              "reject_precision_met": True, "reject_rate": 5,
+              "requested_ncc_method": "regression",
+          }],
+          "interim_efficacy_enabled": False,
+          "interim_futility_enabled": False,
+          "interim_stopping_applied": False,
+          "interim_stopping_reason": "disabled_no_ncc_consistent_interim_model",
+          "mc_precision_target_probability_half_width": 0.02,
+          "oc_table": [{
+              "ci_lower": 3.8, "ci_upper": 6.6, "mcse": 0.69,
+              "metric": "fwer_percent", "n_simulations": 1000,
+              "precision_met": True, "value": 5,
+          }],
+          "requested_ncc_method": "regression",
+      }}
+      and privacy_safe_view("master_simulate", platform_public) == platform_public)
+unsafe_platform_labels = privacy_safe_view("master_simulate", {"result": {
+    "actual_analysis_methods": ["private_method_label"],
+    "interim_stopping_reason": "participant-specific reason",
+    "arm_results": [{"actual_analysis_method": "private_method_label"}],
+}})
+check("platform_free_text_method_and_reason_labels_remain_private",
+      unsafe_platform_labels == {"result": {"arm_results": [{}]}})
 
 check("master_decision_reasons_collapse_to_fixed_codes",
       privacy_safe_view("master_simulate", {"result": {

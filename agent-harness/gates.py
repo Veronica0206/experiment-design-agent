@@ -28,7 +28,8 @@ from statistics import NormalDist
 from typing import Any
 
 from artifact_download import MAX_ARTIFACT_BYTES
-from verification import VerificationStatus
+from verification import (VerificationStatus, normalize_platform_analysis_methods,
+                          platform_interim_reason_code)
 
 MANUAL_CHECKS = [
     "#5 boundary exactness (not automated)",
@@ -1021,18 +1022,11 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
                 # Only hashable strings enter the set: a malformed payload such
                 # as [{}] must fail the contract below, not raise before this
                 # check can return a verdict.
-                actual_methods_valid = (
-                    isinstance(actual_methods, list) and bool(actual_methods)
-                    and all(isinstance(method, str) and bool(method.strip())
-                            for method in actual_methods)
+                normalized_actual_methods = normalize_platform_analysis_methods(
+                    actual_methods,
                 )
-                declared_methods = (
-                    set(actual_methods) if actual_methods_valid else set()
-                )
-                actual_methods_valid = (
-                    actual_methods_valid
-                    and len(declared_methods) == len(actual_methods)
-                )
+                actual_methods_valid = normalized_actual_methods is not None
+                declared_methods = set(normalized_actual_methods or [])
                 # Each arm reports the ";"-joined set of methods it actually
                 # used, and the declared list is the union of those sets over
                 # every arm and period. Requiring exact set equality rejects both
@@ -1046,12 +1040,8 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
                 arm_tokens: set[str] = set()
                 arm_labels_valid = bool(per_arm_methods)
                 for method in per_arm_methods:
-                    if not isinstance(method, str) or not method.strip():
-                        arm_labels_valid = False
-                        continue
-                    tokens = method.split(";")
-                    if (not all(token.strip() == token and token for token in tokens)
-                            or len(set(tokens)) != len(tokens)):
+                    tokens = normalize_platform_analysis_methods(method)
+                    if tokens is None:
                         arm_labels_valid = False
                         continue
                     arm_tokens.update(tokens)
@@ -1061,8 +1051,9 @@ def check_master_result(result: dict, config: dict | None = None) -> GateVerdict
                     and inner.get("interim_efficacy_enabled") is False
                     and inner.get("interim_stopping_applied")
                     == inner.get("interim_futility_enabled")
-                    and isinstance(inner.get("interim_stopping_reason"), str)
-                    and bool(inner.get("interim_stopping_reason"))
+                    and platform_interim_reason_code(
+                        inner.get("interim_stopping_reason")
+                    ) is not None
                     and actual_methods_valid
                     and methods_reconciled
                 )
@@ -1601,15 +1592,30 @@ def check_meta(result: dict, args: dict) -> GateVerdict:
 def _integer_allocation_weights(values: list[int | float]) -> list[int] | None:
     """Normalize positive JSON weights to their smallest integer allocation.
 
+    Allocation weights describe proportions, so their common magnitude must
+    not affect the verified quota.  Convert the JSON decimal spellings to exact
+    fractions, divide by the smallest weight, and only then apply the bounded
+    rational approximation.  This makes ``[1, 2]`` and
+    ``[0.00001, 0.00002]`` equivalent while retaining the 10,000-run public
+    block-size ceiling.
+
     Decimal JSON numbers such as 1.3333333333 are transport approximations to
-    simple requested ratios (4/3 here). A denominator cap at the public maximum
-    block size recovers that intent without creating unbounded integer quotas
-    inside the verifier.
+    simple requested ratios (4/3 here). The denominator cap recovers that
+    intent without creating unbounded integer quotas inside the verifier.
     """
     if not values or not all(_num(value) and value > 0 for value in values):
         return None
-    fractions = [Fraction(str(value)).limit_denominator(10_000)
-                 for value in values]
+    try:
+        exact = [Fraction(Decimal(str(value))) for value in values]
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return None
+    scale = min(exact)
+    if scale <= 0:
+        return None
+    fractions = [
+        (value / scale).limit_denominator(10_000)
+        for value in exact
+    ]
     if any(value.numerator <= 0 for value in fractions):
         return None
     denominator = math.lcm(*(value.denominator for value in fractions))
@@ -1898,6 +1904,31 @@ def _factor_columns(rows: list[dict]) -> list[str]:
             and _num(rows[0].get(k))]
 
 
+def _requested_factorial_generators(
+    args: dict, n_factors: int, fraction: int,
+) -> tuple[bool, list[list[int]] | None]:
+    """Validate custom generators in their documented one-based request order."""
+    raw = args.get("generators")
+    if raw is None:
+        return False, []
+    basic_count = n_factors - fraction
+    if not isinstance(raw, list) or len(raw) != fraction:
+        return True, None
+    normalized: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for generator in raw:
+        if (not isinstance(generator, list) or len(generator) < 2
+                or any(not isinstance(index, int) or isinstance(index, bool)
+                       or not 1 <= index <= basic_count for index in generator)):
+            return True, None
+        source_key = tuple(sorted(generator))
+        if len(set(source_key)) != len(source_key) or source_key in seen:
+            return True, None
+        seen.add(source_key)
+        normalized.append(list(source_key))
+    return True, normalized
+
+
 def check_factorial(result: dict, args: dict) -> GateVerdict:
     """Invariants of 2-level factorial designs: run count matches the notation,
     ±1 factor columns are pairwise ORTHOGONAL (center rows contribute 0), and
@@ -2173,6 +2204,10 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
     is_fractional = (
         design_type == "fractional_factorial" or requested_fraction is not None
     )
+    raw_requested_generators = (args or {}).get("generators")
+    if raw_requested_generators is not None and requested_fraction is None:
+        checks["custom_generators_require_fraction"] = False
+        failures.append("custom factorial generators require a positive fraction")
 
     # A half fraction (p=1) has exactly one defining word, which the dispatcher
     # unboxes to a bare string. Every word must still be a real relation over
@@ -2205,6 +2240,23 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
             failures.append(
                 "fractional factorial output requires an exact requested fraction "
                 "p with 1 <= p < n_factors"
+            )
+
+        generators_supplied = False
+        requested_generators: list[list[int]] | None = None
+        if fraction_valid:
+            generators_supplied, requested_generators = _requested_factorial_generators(
+                args or {}, len(cols), requested_fraction,
+            )
+        custom_generators_valid = (
+            fraction_valid and (not generators_supplied
+                                or requested_generators is not None)
+        )
+        checks["custom_generators_valid"] = custom_generators_valid
+        if not custom_generators_valid:
+            failures.append(
+                "custom generators must define exactly p unique generated columns "
+                "using unique one-based indices of the k-p basic factors"
             )
 
         fractional_levels_match = (
@@ -2295,6 +2347,28 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
             failures.append(
                 "fractional factorial does not contain exactly the requested "
                 "number of all-zero center rows"
+            )
+
+        generators_honored = not generators_supplied
+        if generators_supplied:
+            generators_honored = bool(
+                requested_generators is not None and runs_match and base_rows
+            )
+            if generators_honored:
+                basic_count = len(cols) - requested_fraction
+                for offset, sources in enumerate(requested_generators or []):
+                    generated_column = cols[basic_count + offset]
+                    if any(
+                        row[generated_column]
+                        != math.prod(row[cols[source - 1]] for source in sources)
+                        for row in base_rows
+                    ):
+                        generators_honored = False
+                        break
+        checks["requested_generators_honored"] = generators_honored
+        if not generators_honored:
+            failures.append(
+                "fractional factorial matrix does not honor the requested generators"
             )
 
         checks["defining_relation_well_formed"] = words_well_formed

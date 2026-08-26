@@ -44,7 +44,12 @@ import {
   createManagedArtifactDir,
   releaseManagedArtifactDir,
 } from "./artifacts.js";
+import {
+  InvalidRequestToolError,
+  publicToolErrorResponse,
+} from "./tool-errors.js";
 import { PINNED_RUNTIME_SUPERVISOR_COMMITMENT } from "./runtime-supervisor.js";
+import { normalizedAllocationWeights } from "./allocation-ratio.js";
 
 const SERVER_VERSION = "1.1.0";
 const PRIVATE_PROVENANCE_META_KEY = "experiment-design/private-provenance";
@@ -352,9 +357,11 @@ export function assertFiniteNumericInputs(value: unknown): void {
   const seen = new WeakSet<object>();
   const visit = (item: unknown): void => {
     if (typeof item === "number") {
-      if (!Number.isFinite(item)) throw new Error("All numeric inputs must be finite");
+      if (!Number.isFinite(item)) {
+        throw new InvalidRequestToolError("All numeric inputs must be finite");
+      }
       if (Number.isInteger(item) && !Number.isSafeInteger(item)) {
-        throw new Error(
+        throw new InvalidRequestToolError(
           "Integral numeric inputs must be within JavaScript's safe-integer range",
         );
       }
@@ -379,9 +386,13 @@ const registerStrictTool = (
 ) => server.registerTool(name, {
   description,
   inputSchema: z.object(shape).strict(),
-}, (params, extra) => {
-  assertFiniteNumericInputs(params);
-  return handler(params, extra.signal);
+}, async (params, extra) => {
+  try {
+    assertFiniteNumericInputs(params);
+    return await handler(params, extra.signal);
+  } catch (error) {
+    return publicToolErrorResponse(name, error);
+  }
 });
 
 function domainParams(params: Record<string, unknown>): Record<string, unknown> {
@@ -712,6 +723,18 @@ function within(root: string, target: string): boolean {
 }
 
 export async function readAllowedFile(rawPath: string): Promise<Buffer> {
+  try {
+    return await readAllowedFileAuthorized(rawPath);
+  } catch (error) {
+    if (error instanceof InvalidRequestToolError) throw error;
+    throw new InvalidRequestToolError(
+      `Read path could not be authorized safely: ${rawPath}`,
+      error,
+    );
+  }
+}
+
+async function readAllowedFileAuthorized(rawPath: string): Promise<Buffer> {
   const candidate = resolve(rawPath);
   // Resolve and authorize before opening. In particular, do not open FIFOs,
   // devices, or outside-root paths merely to discover that they are forbidden.
@@ -759,12 +782,22 @@ function boundedCsvRows(bytes: Buffer, maximum: number, label: string): number {
   let lines = bytes.length ? 1 : 0;
   for (const byte of bytes) if (byte === 0x0a) lines += 1;
   const dataRows = Math.max(0, lines - 1);
-  if (dataRows > maximum) throw new Error(`${label} exceeds the ${maximum}-row limit`);
+  if (dataRows > maximum) {
+    throw new InvalidRequestToolError(`${label} exceeds the ${maximum}-row limit`);
+  }
   return dataRows;
 }
 
 async function persistentOutputDir(rawPath: string | undefined, prefix: string): Promise<string> {
-  return createManagedArtifactDir(prefix, rawPath);
+  try {
+    return await createManagedArtifactDir(prefix, rawPath);
+  } catch (error) {
+    if (rawPath === undefined || error instanceof InvalidRequestToolError) throw error;
+    throw new InvalidRequestToolError(
+      `The requested output directory could not be authorized safely: ${rawPath}`,
+      error,
+    );
+  }
 }
 
 // Truth-in-advertising at the TOOL BOUNDARY: only the implemented method values
@@ -850,24 +883,28 @@ const strictPath = z.string().min(1).max(4096).refine(
 function assertSingleEndpointParams(params: Record<string, unknown>): void {
   const go = Number(params.go_threshold ?? 0.90);
   const consider = Number(params.consider_threshold ?? 0.60);
-  if (!(consider < go)) throw new Error("consider_threshold must be below go_threshold");
+  if (!(consider < go)) {
+    throw new InvalidRequestToolError("consider_threshold must be below go_threshold");
+  }
   const endpoint = params.endpoint_type;
   const nullParam = Number(params.null_param);
   const altParam = Number(params.alt_param);
   if ((endpoint === "binary" || endpoint === "continuous") && !(altParam > nullParam)) {
-    throw new Error("alt_param > null_param is required for this endpoint");
+    throw new InvalidRequestToolError("alt_param > null_param is required for this endpoint");
   }
   if (params.design === "single_arm" && params.p2_data_ctrl !== undefined) {
-    throw new Error("p2_data_ctrl is not valid for a single-arm design");
+    throw new InvalidRequestToolError("p2_data_ctrl is not valid for a single-arm design");
   }
   if (params.go_target !== undefined) {
     const target = Number(params.go_target);
     if (params.endpoint_type === "binary" && (target < 0 || target > 1)) {
-      throw new Error("binary go_target must lie in [0,1]");
+      throw new InvalidRequestToolError("binary go_target must lie in [0,1]");
     }
-    if (params.endpoint_type === "tte" && target <= 0) throw new Error("tte go_target must be positive");
+    if (params.endpoint_type === "tte" && target <= 0) {
+      throw new InvalidRequestToolError("tte go_target must be positive");
+    }
     if (params.endpoint_type === "incidence_rate" && target < 0) {
-      throw new Error("incidence-rate go_target must be non-negative");
+      throw new InvalidRequestToolError("incidence-rate go_target must be non-negative");
     }
   }
 }
@@ -945,25 +982,27 @@ registerStrictTool(
     const config = params.config as Record<string, unknown>;
     assertSingleEndpointParams(config);
     if (config.design === "controlled" && config.p2_data && !config.p2_data_ctrl) {
-      throw new Error("controlled confirmatory PPOS requires p2_data_ctrl");
+      throw new InvalidRequestToolError("controlled confirmatory PPOS requires p2_data_ctrl");
     }
     if (params.n_oc !== undefined) {
       if (config.design === "controlled" && typeof params.n_oc === "number") {
-        throw new Error("controlled OC requires n_oc={n_trt,n_ctrl}; scalar n_oc is single-arm only");
+        throw new InvalidRequestToolError(
+          "controlled OC requires n_oc={n_trt,n_ctrl}; scalar n_oc is single-arm only",
+        );
       }
       const units = typeof params.n_oc === "number"
         ? params.n_oc
         : Number(params.n_oc.n_trt) + Number(params.n_oc.n_ctrl);
       const replicates = Number(params.B_oc ?? 5000);
       if (units * replicates > MAX_SIMULATED_UNITS) {
-        throw new Error(
+        throw new InvalidRequestToolError(
           `requested OC workload=${units * replicates} (= ${units} units × ` +
           `${replicates} replicates) exceeds the ${MAX_SIMULATED_UNITS} limit; ` +
           "reduce B_oc or n_oc",
         );
       }
       if (config.design === "single_arm" && typeof params.n_oc === "object") {
-        throw new Error("single-arm OC requires scalar n_oc");
+        throw new InvalidRequestToolError("single-arm OC requires scalar n_oc");
       }
     }
     return runTool("simulate_design", params, signal);
@@ -1106,7 +1145,7 @@ registerStrictTool(
       if (PLATFORM_REQUIRED_MASTER_FIELDS.some(
         (field) => cfgForBudget[field] === undefined,
       )) {
-        throw new Error(
+        throw new InvalidRequestToolError(
           "platform designs require n_periods, n_per_period, and arms_schedule",
         );
       }
@@ -1118,7 +1157,7 @@ registerStrictTool(
       };
       if (schedule.enter.length !== nSubgroups ||
           schedule.leave.length !== nSubgroups) {
-        throw new Error(
+        throw new InvalidRequestToolError(
           "arms_schedule enter and leave must each contain exactly n_subgroups values",
         );
       }
@@ -1128,7 +1167,7 @@ registerStrictTool(
           enter >= 1 && enter <= leave && leave <= nPeriods;
       });
       if (!scheduleIsValid) {
-        throw new Error(
+        throw new InvalidRequestToolError(
           "arms_schedule must satisfy 1 <= enter[i] <= leave[i] <= n_periods for every subgroup",
         );
       }
@@ -1138,13 +1177,13 @@ registerStrictTool(
         ["binary", "continuous"].includes(String(cfgForBudget.endpoint_type)) &&
         cfgForBudget.ncc_method === "none";
       if (hasInterimSettings && !interimSettingsSupported) {
-        throw new Error(PLATFORM_INTERIM_UNAVAILABLE_MESSAGE);
+        throw new InvalidRequestToolError(PLATFORM_INTERIM_UNAVAILABLE_MESSAGE);
       }
       platformBudget = { nPeriods, nPerPeriod };
     } else if (PLATFORM_ONLY_MASTER_FIELDS.some(
       (field) => cfgForBudget[field] !== undefined,
     )) {
-      throw new Error(
+      throw new InvalidRequestToolError(
         "platform-only configuration fields require master_design_type='platform'",
       );
     }
@@ -1160,25 +1199,25 @@ registerStrictTool(
         ? nSims * (nSubgroups + 1) * nPerArmStage * nStages
         : nSims * platformBudget!.nPeriods * platformBudget!.nPerPeriod;
     if (!Number.isFinite(workload) || workload > MAX_SIMULATED_UNITS) {
-      throw new Error(
+      throw new InvalidRequestToolError(
         `requested ${designType} workload=${workload} simulated units exceeds the ` +
         `${MAX_SIMULATED_UNITS} limit (n_sims=${nSims}, n_subgroups=${nSubgroups}); ` +
         "reduce n_sims or the per-subgroup/per-stage/per-period sample size",
       );
     }
     if (designType === "basket" && Number(cfgForBudget.nogo_threshold ?? 0.10) >= Number(cfgForBudget.go_threshold ?? 0.90)) {
-      throw new Error("nogo_threshold must be below go_threshold");
+      throw new InvalidRequestToolError("nogo_threshold must be below go_threshold");
     }
     if (cfgForBudget.endpoint_type === "binary") {
       const nulls = Array.isArray(cfgForBudget.null_params) ? cfgForBudget.null_params : [cfgForBudget.null_params];
       const alts = cfgForBudget.alt_params as number[];
       if ([...nulls, ...alts].some((value) => Number(value) < 0 || Number(value) > 1)) {
-        throw new Error("binary endpoint parameters must lie in [0,1]");
+        throw new InvalidRequestToolError("binary endpoint parameters must lie in [0,1]");
       }
     }
     const borrowingMethod = String(cfgForBudget.borrowing_method ?? "");
     if (["snti", "sep_gibbs", "wathen_sti"].includes(borrowingMethod)) {
-      throw new Error(
+      throw new InvalidRequestToolError(
         `borrowing_method='${borrowingMethod}' is disabled because the available treatment-only likelihood does not identify a treatment effect`,
       );
     }
@@ -1191,37 +1230,47 @@ registerStrictTool(
       const heterogeneous = (values: number[]) =>
         values.some((value) => Math.abs(value - values[0]) > tolerance);
       if (borrowingMethod === "complete" && heterogeneous(nulls)) {
-        throw new Error("complete borrowing requires identical null_params across subgroups");
+        throw new InvalidRequestToolError(
+          "complete borrowing requires identical null_params across subgroups",
+        );
       }
       if (borrowingMethod === "simons_bayesian" &&
           (heterogeneous(nulls) || heterogeneous(alts))) {
-        throw new Error("simons_bayesian requires identical null_params and alt_params across subgroups");
+        throw new InvalidRequestToolError(
+          "simons_bayesian requires identical null_params and alt_params across subgroups",
+        );
       }
     }
     if (designType === "basket" && cfgForBudget.n_per_interim !== undefined &&
         Number(cfgForBudget.n_per_interim) * Number(cfgForBudget.n_interims ?? 1) >=
           Number(cfgForBudget.n_per_subgroup ?? 25)) {
-      throw new Error("n_per_interim * n_interims must be below n_per_subgroup so the final look has participants");
+      throw new InvalidRequestToolError(
+        "n_per_interim * n_interims must be below n_per_subgroup so the final look has participants",
+      );
     }
     if (designType === "umbrella") {
       const stages = Number(cfgForBudget.n_stages ?? 2);
       const arms = Number(cfgForBudget.n_arms ?? nSubgroups);
       const boundaries = cfgForBudget.futility_boundaries as number[] | undefined;
       if (boundaries && boundaries.length !== stages) {
-        throw new Error("futility_boundaries must contain exactly one value per stage");
+        throw new InvalidRequestToolError(
+          "futility_boundaries must contain exactly one value per stage",
+        );
       }
       if (boundaries) {
         const alpha = Number(cfgForBudget.alpha ?? 0.025);
         // R performs the authoritative normal-quantile check; this structural
         // check keeps obviously malformed arrays from reaching the engine.
         if (!Number.isFinite(boundaries[stages - 1]) || alpha <= 0 || arms < 2) {
-          throw new Error("invalid final boundary, alpha, or arm count");
+          throw new InvalidRequestToolError("invalid final boundary, alpha, or arm count");
         }
       }
       const drops = cfgForBudget.n_drop_per_stage as number[] | undefined;
       if (drops && (drops.length !== Math.max(0, stages - 1) ||
           drops.reduce((sum, value) => sum + value, 0) >= arms)) {
-        throw new Error("n_drop_per_stage must cover every interim and leave at least one arm");
+        throw new InvalidRequestToolError(
+          "n_drop_per_stage must cover every interim and leave at least one arm",
+        );
       }
     }
     const executionFingerprint = await engineFingerprint(signal);
@@ -1325,7 +1374,7 @@ registerStrictTool(
     try {
       if (domain.method === "maic") {
         if (typeof domain.ipd_file !== "string" || typeof domain.targets_file !== "string") {
-          throw new Error("maic requires ipd_file and targets_file");
+          throw new InvalidRequestToolError("maic requires ipd_file and targets_file");
         }
         const [ipdBytes, targetsBytes] = await Promise.all([
           readAllowedFile(domain.ipd_file),
@@ -1339,7 +1388,7 @@ registerStrictTool(
           const replicates = Number(domain.bootstrap_replicates ?? 200);
           const workload = ipdRows * replicates;
           if (workload > MAX_MAIC_BOOTSTRAP_ROW_OPERATIONS) {
-            throw new Error(
+            throw new InvalidRequestToolError(
               `requested MAIC bootstrap workload=${workload} row-replicates exceeds the ` +
               `${MAX_MAIC_BOOTSTRAP_ROW_OPERATIONS} limit; reduce the IPD rows or ` +
               "bootstrap_replicates",
@@ -1461,7 +1510,7 @@ registerStrictTool(
 
 registerStrictTool(
   "factorial_design",
-  "Construct a factorial design matrix. fraction=0 gives a full factorial (2^k or mixed-level); fraction=p gives a 2^(k-p) fractional factorial with its resolution, generators, defining relation, and alias structure. Standard minimum-aberration generators are used for common designs; supply your own via 'generators'.",
+  "Construct a factorial design matrix. fraction=0 gives a full factorial (2^k or mixed-level); fraction=p gives a 2^(k-p) fractional factorial with its resolution, generators, defining relation, and alias structure. Standard minimum-aberration generators are used for common designs; supply exactly p custom generators via 'generators'. Public generator/relation metadata uses one-based public factor-column indices, and public alias classes are bounded to main and two-factor effects.",
   {
     ...verificationMeta,
     n_factors: z.number().int().min(1).max(12),
@@ -1481,26 +1530,59 @@ registerStrictTool(
   async (params, signal) => {
     const fraction = Number(params.fraction ?? 0);
     const nFactors = Number(params.n_factors);
-    if (fraction >= nFactors) throw new Error("fraction must be below n_factors");
+    if (fraction >= nFactors) {
+      throw new InvalidRequestToolError("fraction must be below n_factors");
+    }
+    const generators = params.generators as number[][] | undefined;
+    if (generators !== undefined) {
+      if (fraction === 0) {
+        throw new InvalidRequestToolError("custom generators require a positive fraction");
+      }
+      if (generators.length !== fraction) {
+        throw new InvalidRequestToolError(
+          "custom generators must contain exactly fraction definitions",
+        );
+      }
+      const basicFactors = nFactors - fraction;
+      const generatorKeys = new Set<string>();
+      for (const generator of generators) {
+        const normalized = [...generator].sort((left, right) => left - right);
+        if (new Set(normalized).size !== normalized.length ||
+            normalized.some((index) => index > basicFactors)) {
+          throw new InvalidRequestToolError(
+            "each custom generator must contain unique indices of the k-p basic factors",
+          );
+        }
+        const key = normalized.join(",");
+        if (generatorKeys.has(key)) {
+          throw new InvalidRequestToolError("custom generator definitions must be unique");
+        }
+        generatorKeys.add(key);
+      }
+    }
     const requestedLevels: number[] = Array.isArray(params.levels)
       ? params.levels.map((value: unknown) => Number(value))
       : [Number(params.levels ?? 2)];
     const levels: number[] = requestedLevels.length === 1
       ? Array<number>(nFactors).fill(requestedLevels[0]) : requestedLevels;
     if (levels.length !== nFactors) {
-      throw new Error("levels must have length 1 or n_factors");
+      throw new InvalidRequestToolError("levels must have length 1 or n_factors");
     }
     let baseRuns: number;
     if (fraction === 0) {
       baseRuns = levels.reduce((product: number, value: number) => product * value, 1);
     } else {
       if (levels.some((value) => value !== 2)) {
-        throw new Error("fractional factorial designs require two levels per factor");
+        throw new InvalidRequestToolError(
+          "fractional factorial designs require two levels per factor",
+        );
       }
       baseRuns = 2 ** (nFactors - fraction);
     }
     const runs = baseRuns * Number(params.replicates ?? 1) + Number(params.center_points ?? 0);
-    if (!Number.isFinite(runs) || runs > 10000) throw new Error("factorial design exceeds the 10,000-run limit");
+    if (!Number.isFinite(runs) || runs > 10000) {
+      throw new InvalidRequestToolError("factorial design exceeds the 10,000-run limit");
+    }
     return runTool("factorial_design", params, signal);
   }
 );
@@ -1546,9 +1628,17 @@ registerStrictTool(
   async (params, signal) => {
     const method = String(params.method ?? "simple");
     const ratio = params.ratio as number[] | undefined;
-    if (method === "simple" && ratio &&
-        ratio.some((weight) => weight !== ratio[0])) {
-      throw new Error(
+    const normalizedRatio = ratio
+      ? normalizedAllocationWeights(ratio)
+      : undefined;
+    if (ratio && normalizedRatio === null) {
+      throw new InvalidRequestToolError(
+        "allocation ratio cannot be represented within the 10,000-run base-block limit",
+      );
+    }
+    if (method === "simple" && normalizedRatio &&
+        normalizedRatio.some((weight) => weight !== normalizedRatio[0])) {
+      throw new InvalidRequestToolError(
         "method='simple' supports only equal allocation; use method='block' or " +
         "'stratified' for a non-equal ratio",
       );

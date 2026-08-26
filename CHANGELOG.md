@@ -4,6 +4,27 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## Unreleased — 2026-08-26 second-round public-interface review
+
+- Made the standalone MCP smoke suite fail closed: every executed check is
+  registered centrally, any failure produces a nonzero process status, and a
+  meta-test rejects direct result printing or scattered exit paths.
+- Bound custom fractional-factorial generators to both the effective request
+  and the returned design matrix. Public reports now use label-free,
+  one-based structures for generators, defining relations, and bounded
+  main/two-factor alias classes. Platform reports now distinguish requested,
+  enabled, applied, and fallback analysis behavior.
+- Made allocation-ratio validation invariant to common positive scaling in
+  both TypeScript preflight and Python gates, while continuing to reject
+  ratios whose normalized integer quotas exceed the supported bound.
+- Added a fixed, path-free public MCP error taxonomy and bounded binary stdout
+  and stderr capture. Arbitrary server messages, invalid-output previews,
+  local paths, and stack details remain confined to the private diagnostic
+  stream.
+- Pinned the exact public assurance workflow before `make public-check` trusts
+  it, and regenerated the fractional-factorial canonical report example from
+  the reviewed complete installation after the reporting contract changed.
+
 ## Unreleased — 2026-08-25 independent public-interface review
 
 - Reconciled the master-protocol MCP schema with its verifier: unsupported

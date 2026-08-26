@@ -86,12 +86,38 @@ def run_public(root: Path, *args: str, env: dict[str, str] | None = None) -> sub
     )
 
 
+def run_public_workflow(path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(PUBLIC_GUARD), "--public-workflow", str(path)],
+        capture_output=True,
+        text=True,
+        env=publication_env(),
+    )
+
+
 def git(root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [GIT, "-C", str(root), *args],
         check=True,
         capture_output=True,
         env=env,
+    )
+
+
+reviewed_workflow = TOOLS.parent / ".github" / "workflows" / "public-assurance.yml"
+check(
+    "reviewed_public_workflow_pin_passes",
+    run_public_workflow(reviewed_workflow).returncode == 0,
+)
+with tempfile.TemporaryDirectory() as directory:
+    changed_workflow = Path(directory) / "public-assurance.yml"
+    changed_workflow.write_bytes(
+        reviewed_workflow.read_bytes().replace(b"contents: read", b"contents: write")
+    )
+    changed = run_public_workflow(changed_workflow)
+    check(
+        "changed_public_workflow_pin_fails_closed",
+        changed.returncode == 1 and "structurally reviewed pin" in changed.stderr,
     )
 
 

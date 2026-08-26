@@ -34,6 +34,15 @@ CONTROL_TIMEOUT_S = 30
 # Leave bounded transport overhead so the client never preempts server policy.
 TOOL_TIMEOUT_S = 450
 STOP_GRACE_S = 5
+MAX_JSONRPC_MESSAGE_BYTES = 5 * 1024 * 1024
+MAX_SERVER_STDERR_BYTES = 64 * 1024
+_STREAM_CHUNK_BYTES = 64 * 1024
+
+PUBLIC_TOOL_ERROR_MESSAGES = {
+    "request_cancelled": "The tool request was cancelled.",
+    "invalid_request": "The tool request is invalid.",
+    "internal_error": "The tool could not complete safely.",
+}
 
 _EOF = object()  # sentinel: server closed stdout
 
@@ -468,7 +477,8 @@ class MCPClient:
     def __init__(self):
         self._proc: subprocess.Popen | None = None
         self._id_counter = 0
-        self._stderr_buf: list[str] = []
+        self._stderr_buf = bytearray()
+        self._stderr_lock = threading.Lock()
         self._stderr_thread: threading.Thread | None = None
         self._stdout_thread: threading.Thread | None = None
         self._waiters: dict[int, queue.Queue] = {}
@@ -488,9 +498,7 @@ class MCPClient:
 
     def _start_locked(self) -> dict:
         if not SERVER_ENTRY.is_file() or not SERVER_LAUNCHER.is_file():
-            raise FileNotFoundError(
-                f"MCP server or launcher is unavailable. Run 'npm run build' in {MCP_SERVER_DIR}"
-            )
+            raise FileNotFoundError("MCP server or launcher is unavailable")
         # Fully retire a prior generation before publishing new shared state.
         if self._proc is not None or self._runtime_registry is not None or any(
             thread is not None and thread.is_alive()
@@ -530,8 +538,8 @@ class MCPClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
                 cwd=str(MCP_SERVER_DIR),
                 env=server_env,
                 start_new_session=True,
@@ -544,9 +552,8 @@ class MCPClient:
                 target=self._drain_stderr, args=(proc, generation), daemon=True,
             )
             self._stderr_thread.start()
-            # Read stdout in a thread (blocking readline on the raw stream) and feed
-            # parsed messages into a queue — avoids select() on a buffered text
-            # stream, where buffered bytes are invisible to select (V-1).
+            # Read bounded binary chunks and feed complete JSON-RPC messages into
+            # queues. Never let a text readline allocate an unbounded message.
             self._stdout_thread = threading.Thread(
                 target=self._read_stdout, args=(proc, generation), daemon=True,
             )
@@ -667,11 +674,11 @@ class MCPClient:
         content = resp.get("content") or []
         text = content[0].get("text", "") if content else ""
 
-        # The SDK reports a thrown handler error as isError=true with the error
-        # message (plain text, not JSON) in the content — surface it as-is
-        # rather than blindly json.loads()-ing it into an opaque decode error.
+        # Only the fixed public error taxonomy may cross from the server. Never
+        # reflect arbitrary SDK/handler text, which may contain local paths.
         if resp.get("isError"):
-            raise MCPToolError(f"Tool '{name}' failed: {text.strip() or '(no message)'}")
+            code, message = self._validated_public_tool_error(text)
+            raise MCPToolError(f"Tool request failed [{code}]: {message}")
 
         if not content:
             return resp
@@ -693,9 +700,29 @@ class MCPClient:
                     parsed["_private_resources"] = resources
             return parsed
         except json.JSONDecodeError as e:
-            raise MCPToolError(
-                f"Tool '{name}' returned non-JSON output: {text[:500]!r} ({e})"
-            ) from e
+            raise MCPToolError("Tool returned an invalid response") from e
+
+    @staticmethod
+    def _validated_public_tool_error(text: str) -> tuple[str, str]:
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        if (
+            isinstance(payload, dict)
+            and set(payload) == {"error"}
+            and isinstance(error, dict)
+            and set(error) == {"code", "message"}
+            and isinstance(code, str)
+            and code in PUBLIC_TOOL_ERROR_MESSAGES
+            and isinstance(message, str)
+            and message == PUBLIC_TOOL_ERROR_MESSAGES[code]
+        ):
+            return code, message
+        return "internal_error", PUBLIC_TOOL_ERROR_MESSAGES["internal_error"]
 
     @staticmethod
     def _digest_map(value: Any, label: str) -> dict[str, str]:
@@ -929,64 +956,98 @@ class MCPClient:
             and "error" not in msg
         )
 
+    @staticmethod
+    def _binary_chunks(stream):
+        """Yield bounded byte chunks from a production pipe or a small test fake."""
+        reader = getattr(stream, "read1", None)
+        if not callable(reader):
+            reader = getattr(stream, "read", None)
+        if callable(reader):
+            while True:
+                chunk = reader(_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                yield bytes(chunk)
+            return
+        # Existing protocol-order tests use finite iterables. Production stdio
+        # always takes the bounded read/read1 path above.
+        for chunk in stream:
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            yield bytes(chunk)
+
     def _read_stdout(self, proc, generation: int):
         if not proc or not proc.stdout:
             return
         responded_ids: set[int] = set()
         protocol_failed = False
-        try:
-            for line in proc.stdout:      # blocking readline loop on the raw stream
-                line = line.strip()
-                if not line:
-                    continue
+
+        def fail(message: str) -> bool:
+            nonlocal protocol_failed
+            self._fail_protocol(generation, proc, message)
+            protocol_failed = True
+            return False
+
+        def dispatch(raw_line: bytes) -> bool:
+            if len(raw_line) > MAX_JSONRPC_MESSAGE_BYTES:
+                return fail(
+                    "MCP protocol violation: JSON-RPC message exceeds "
+                    f"{MAX_JSONRPC_MESSAGE_BYTES} bytes"
+                )
+            raw_line = raw_line.strip()
+            if not raw_line:
+                return True
+            try:
+                line = raw_line.decode("utf-8", errors="strict")
+                msg = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return fail("MCP protocol violation: malformed JSON-RPC message")
+            if isinstance(msg, dict) and "id" not in msg:
+                if self._valid_server_notification(msg):
+                    return True
+                return fail("MCP protocol violation: malformed JSON-RPC envelope")
+            if not self._valid_response_envelope(msg):
+                return fail("MCP protocol violation: malformed JSON-RPC envelope")
+            response_id = msg["id"]
+            if response_id in responded_ids:
+                return fail("MCP protocol violation: duplicate response id")
+            with self._waiters_lock:
+                waiter = self._waiters.get(response_id)
+            if waiter is not None:
+                responded_ids.add(response_id)
                 try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    self._fail_protocol(
-                        generation, proc,
-                        "MCP protocol violation: malformed JSON-RPC message",
-                    )
-                    protocol_failed = True
-                    break
-                if isinstance(msg, dict) and "id" not in msg:
-                    if self._valid_server_notification(msg):
-                        continue
-                    self._fail_protocol(
-                        generation, proc,
-                        "MCP protocol violation: malformed JSON-RPC envelope",
-                    )
-                    protocol_failed = True
-                    break
-                if not self._valid_response_envelope(msg):
-                    self._fail_protocol(
-                        generation, proc,
-                        "MCP protocol violation: malformed JSON-RPC envelope",
-                    )
-                    protocol_failed = True
-                    break
-                response_id = msg["id"]
-                if response_id in responded_ids:
-                    self._fail_protocol(
-                        generation, proc,
-                        "MCP protocol violation: duplicate response id",
-                    )
-                    protocol_failed = True
-                    break
-                with self._waiters_lock:
-                    waiter = self._waiters.get(response_id)
-                if waiter is not None:
-                    responded_ids.add(response_id)
-                    try:
-                        waiter.put_nowait(msg)
-                    except queue.Full:
-                        self._fail_protocol(
-                            generation, proc,
-                            "MCP protocol violation: duplicate response id",
-                        )
-                        protocol_failed = True
+                    waiter.put_nowait(msg)
+                except queue.Full:
+                    return fail("MCP protocol violation: duplicate response id")
+            return True
+
+        pending = bytearray()
+        try:
+            for chunk in self._binary_chunks(proc.stdout):
+                pending.extend(chunk)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
                         break
-        except (ValueError, OSError):
-            pass
+                    raw_line = bytes(pending[:newline])
+                    del pending[:newline + 1]
+                    if not dispatch(raw_line):
+                        break
+                if protocol_failed:
+                    break
+                if len(pending) > MAX_JSONRPC_MESSAGE_BYTES:
+                    fail(
+                        "MCP protocol violation: JSON-RPC message exceeds "
+                        f"{MAX_JSONRPC_MESSAGE_BYTES} bytes"
+                    )
+                    break
+            if not protocol_failed and pending:
+                dispatch(bytes(pending))
+        except (TypeError, ValueError, OSError):
+            if not protocol_failed:
+                fail("MCP protocol violation: failed to read JSON-RPC stream")
         finally:
             if generation != self._generation:
                 return
@@ -1001,16 +1062,20 @@ class MCPClient:
         if not proc or not proc.stderr:
             return
         try:
-            for line in proc.stderr:
+            for chunk in self._binary_chunks(proc.stderr):
                 if generation == self._generation:
-                    self._stderr_buf.append(line)
-                    if len(self._stderr_buf) > 500:
-                        del self._stderr_buf[:250]
-        except (ValueError, OSError):
+                    with self._stderr_lock:
+                        self._stderr_buf.extend(chunk)
+                        excess = len(self._stderr_buf) - MAX_SERVER_STDERR_BYTES
+                        if excess > 0:
+                            del self._stderr_buf[:excess]
+        except (TypeError, ValueError, OSError):
             pass
 
-    def _recent_stderr(self) -> str:
-        return "".join(self._stderr_buf[-20:]).strip()
+    def _private_recent_stderr(self) -> str:
+        """Return bounded private diagnostics; never include this in MCP errors."""
+        with self._stderr_lock:
+            return bytes(self._stderr_buf).decode("utf-8", errors="replace").strip()
 
     def _next_id(self) -> int:
         self._id_counter += 1
@@ -1018,20 +1083,14 @@ class MCPClient:
 
     def _send(self, msg: dict):
         if not self._proc or not self._proc.stdin or self._closed:
-            raise MCPToolError(
-                f"MCP server is not running (stderr: {self._recent_stderr() or 'none'})"
-            )
-        line = json.dumps(msg) + "\n"
+            raise MCPToolError("MCP server is not running")
+        line = (json.dumps(msg) + "\n").encode("utf-8")
         try:
             with self._write_lock:
                 self._proc.stdin.write(line)
                 self._proc.stdin.flush()
         except OSError as e:
-            # Server died between calls: surface a clean error with diagnostics
-            # instead of a raw BrokenPipeError (F-1).
-            raise MCPToolError(
-                f"MCP server write failed ({e}); stderr: {self._recent_stderr() or 'none'}"
-            ) from e
+            raise MCPToolError("MCP server write failed") from e
 
     def _cancel_request(self, expected_id: int) -> None:
         """Best-effort MCP cancellation after the local request budget expires."""
@@ -1060,10 +1119,7 @@ class MCPClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._cancel_request(expected_id)
-                    raise TimeoutError(
-                        f"MCP call timed out after {timeout_s:g}s "
-                        f"(server stderr: {self._recent_stderr() or 'none'})"
-                    )
+                    raise TimeoutError(f"MCP call timed out after {timeout_s:g}s")
                 # The reader thread does the blocking read; we wait on the queue
                 # with a bounded timeout, so the deadline is always enforced.
                 try:
@@ -1072,16 +1128,10 @@ class MCPClient:
                     if self._reader_error is not None:
                         raise MCPToolError(self._reader_error)
                     if self._closed or proc.poll() is not None:
-                        raise MCPToolError(
-                            f"MCP server exited (code {proc.returncode}); "
-                            f"stderr: {self._recent_stderr() or 'none'}"
-                        )
+                        raise MCPToolError("MCP server exited before returning a response")
                     continue
                 if msg is _EOF:
-                    raise MCPToolError(
-                        f"MCP server closed stdout; stderr: "
-                        f"{self._recent_stderr() or 'none'}"
-                    )
+                    raise MCPToolError("MCP server closed stdout")
                 if isinstance(msg, _ReaderFailure):
                     raise MCPToolError(msg.message)
                 return self._result_from_message(msg)
@@ -1093,10 +1143,7 @@ class MCPClient:
     @staticmethod
     def _result_from_message(msg: dict) -> dict:
         if "error" in msg:
-            err = msg["error"]
-            raise MCPToolError(
-                f"MCP error {err.get('code')}: {err.get('message')}"
-            )
+            raise MCPToolError("MCP request failed")
         return msg.get("result", {})
 
     def _call(

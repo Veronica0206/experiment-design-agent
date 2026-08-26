@@ -548,6 +548,9 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r"^release-check:\s*$",
         r"^public-check:\s*$",
         r'^\s*@tools/run-publication-python\.sh "\$\(CURDIR\)/tools/'
+        r'validate_public_distribution\.py" --public-workflow '
+        r'"\$\(CURDIR\)/\.github/workflows/public-assurance\.yml"\s*$',
+        r'^\s*@tools/run-publication-python\.sh "\$\(CURDIR\)/tools/'
         r'validate_public_distribution\.py" --public-clone "\$\(CURDIR\)"\s*$',
         r"^\s*@cd mcp-server && npm run test:public-lifecycle\s*$",
         r"^\s*@\$\(MAKE\) check-claude-version\s*$",
@@ -581,11 +584,15 @@ def valid_release_entrypoints(makefile: str) -> bool:
         and "check-claude-live" not in harness_release.group("body")
         and all(
             "$(PYTHON_RUN)" in line
-            or line.strip() == (
+            or line.strip() in {
                 '@tools/run-publication-python.sh '
                 '"$(CURDIR)/tools/validate_public_distribution.py" '
-                '--public-clone "$(CURDIR)"'
-            )
+                '--public-clone "$(CURDIR)"',
+                '@tools/run-publication-python.sh '
+                '"$(CURDIR)/tools/validate_public_distribution.py" '
+                '--public-workflow '
+                '"$(CURDIR)/.github/workflows/public-assurance.yml"',
+            }
             for line in makefile.splitlines()
             if line.startswith("\t") and ".py" in line
         )
@@ -824,6 +831,8 @@ def valid_publish_sync_guards(
         'part.casefold().startswith("vera-")',
         'path.name.casefold().endswith(".skill.enc")',
         'mode.add_argument("--public-clone", type=Path)',
+        'mode.add_argument("--public-workflow", type=Path)',
+        "EXPECTED_PUBLIC_ASSURANCE_SHA256",
         'root, "status", "--porcelain=v1", "--untracked-files=all"',
         '"--ignored=matching"',
         'PurePosixPath("mcp-server/node_modules")',

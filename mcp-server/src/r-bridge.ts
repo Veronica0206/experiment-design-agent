@@ -126,8 +126,9 @@ export async function callR(
 
     if (parsed && typeof parsed === "object" && "error" in parsed) {
       // R diagnostics can contain CSV-derived labels, values, or paths. Keep
-      // them outside the MCP/model boundary; schema-level TypeScript errors
-      // remain specific and safe because they never inspect private files.
+      // them outside the MCP/model boundary. Request preflights use the
+      // explicit invalid-request type; an undifferentiated R failure remains
+      // an internal error because this bridge cannot safely infer its cause.
       throw new Error("R analysis rejected the supplied inputs");
     }
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pwd
@@ -25,6 +26,9 @@ EXPECTED_BRANCH = "main"
 EXPECTED_AUTHOR_NAME = "VERA Public Release"
 EXPECTED_AUTHOR_EMAIL = "Veronica0206@users.noreply.github.com"
 EXPECTED_COMMIT_MESSAGE = "Sync reviewed public portfolio distribution"
+EXPECTED_PUBLIC_ASSURANCE_SHA256 = (
+    "898c0bd0347b9967f1f4ac95eef15632e86af778cb6cb0aea6efdc3e0788dbb5"
+)
 APPROVED_GIT_PATHS = {
     "/usr/bin/git",
     "/opt/homebrew/bin/git",
@@ -411,6 +415,32 @@ def _validate_public_clone(root: Path) -> int:
     return status
 
 
+def _validate_public_workflow(path: Path) -> int:
+    """Pin the exact least-privilege public workflow using stdlib only.
+
+    The private release validator still parses and checks the workflow's YAML
+    structure. This public check makes that reviewed structure self-attesting
+    in GitHub Actions without installing a YAML parser: any byte change must be
+    reviewed by the structural validator and accompanied by an explicit pin
+    update here.
+    """
+    try:
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            return fail("public assurance workflow must be a real absolute file")
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024:
+            return fail("public assurance workflow has an invalid file shape")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception as exc:
+        return fail(f"could not inspect public assurance workflow: {exc}")
+    if digest != EXPECTED_PUBLIC_ASSURANCE_SHA256:
+        return fail(
+            "public assurance workflow differs from the structurally reviewed pin"
+        )
+    print("Pinned public assurance workflow passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
@@ -419,6 +449,7 @@ def main() -> int:
     mode.add_argument("--github-metadata", type=Path)
     mode.add_argument("--repository-state", type=Path)
     mode.add_argument("--public-clone", type=Path)
+    mode.add_argument("--public-workflow", type=Path)
     mode.add_argument("--owner-home", action="store_true")
     parser.add_argument("--expected-head")
     parser.add_argument("--expected-origin-head")
@@ -447,6 +478,15 @@ def main() -> int:
         ):
             return fail("public-clone mode accepts only its clone root")
         return _validate_public_clone(args.public_clone)
+    if args.public_workflow is not None:
+        if (
+            args.source is not None
+            or args.expected_head is not None
+            or args.expected_origin_head is not None
+            or args.require_public_commit_metadata
+        ):
+            return fail("public-workflow mode accepts only its workflow path")
+        return _validate_public_workflow(args.public_workflow)
     if args.github_metadata is not None:
         if args.source is not None or args.expected_head is not None:
             return fail("GitHub metadata mode accepts only its metadata directory")

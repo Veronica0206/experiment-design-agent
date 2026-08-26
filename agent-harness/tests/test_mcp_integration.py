@@ -19,7 +19,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "hooks"))
 
-from mcp_client import MCPClient, MCPToolError  # noqa: E402
+from mcp_client import (  # noqa: E402
+    MCPClient,
+    MCPToolError,
+    PUBLIC_TOOL_ERROR_MESSAGES,
+)
 from final_report import public_arguments_view  # noqa: E402
 from gates import combined_gate, design_checks_for  # noqa: E402
 from gates import check_reproducibility  # noqa: E402
@@ -49,11 +53,15 @@ def expect_tool_error(name, fn):
         check(name, False, "call unexpectedly succeeded")
 
 
-def expect_tool_error_message(name, fn, expected):
+def expect_invalid_request(name, fn):
     try:
         fn()
     except MCPToolError as exc:
-        check(name, expected in str(exc), str(exc))
+        expected = (
+            "Tool request failed [invalid_request]: "
+            + PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"]
+        )
+        check(name, str(exc) == expected, str(exc))
     else:
         check(name, False, "call unexpectedly succeeded")
 
@@ -187,7 +195,10 @@ with MCPClient() as client:
         })
         safe_error = False
     except MCPToolError as exc:
-        safe_error = "alt_param > null_param" in str(exc) and "results" not in str(exc)
+        safe_error = str(exc) == (
+            "Tool request failed [invalid_request]: "
+            + PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"]
+        )
     check("invalid_design_returns_error_without_result_payload", safe_error)
 
     expect_tool_error(
@@ -216,6 +227,24 @@ with MCPClient() as client:
         "noninteger_factor_levels_rejected",
         lambda: client.call_tool("factorial_design", {
             "n_factors": 2, "levels": 2.5,
+        }),
+    )
+    expect_invalid_request(
+        "custom_factorial_generator_count_rejected_before_r",
+        lambda: client.call_tool("factorial_design", {
+            "n_factors": 4, "fraction": 1, "generators": [],
+        }),
+    )
+    expect_invalid_request(
+        "custom_factorial_generator_must_use_basic_factors",
+        lambda: client.call_tool("factorial_design", {
+            "n_factors": 4, "fraction": 1, "generators": [[1, 4]],
+        }),
+    )
+    expect_invalid_request(
+        "custom_factorial_generator_requires_fraction",
+        lambda: client.call_tool("factorial_design", {
+            "n_factors": 4, "generators": [[1, 2]],
         }),
     )
     expect_tool_error(
@@ -377,6 +406,25 @@ with MCPClient() as client:
     )
     check("live_half_fraction_passes_stop_hook", hook_ok, hook_detail)
 
+    custom_fraction_args = {
+        "n_factors": 4, "fraction": 1, "generators": [[1, 2]],
+    }
+    custom_fraction = client.call_tool("factorial_design", custom_fraction_args)
+    check("live_custom_fraction_reports_bound_generator_metadata",
+          custom_fraction.get("generators") == [{
+              "generated_factor_index": 4,
+              "source_factor_indices": [1, 2],
+          }]
+          and custom_fraction.get("defining_relation") == [[1, 2, 4]]
+          and custom_fraction.get("alias_structure", {}).get("scope")
+          == "main_and_two_factor"
+          and custom_fraction.get("_verification", {}).get("presentable") is True,
+          custom_fraction.get("_verification", {}).get("failures"))
+    hook_ok, hook_detail = live_hook_allows(
+        "factorial_design", custom_fraction_args, custom_fraction, tests,
+    )
+    check("live_custom_fraction_passes_stop_hook", hook_ok, hook_detail)
+
     replicated_fraction_args = {
         "n_factors": 5, "fraction": 2, "replicates": 2,
         "center_points": 1,
@@ -522,28 +570,25 @@ if os.name == "posix":
                 for required_field in ("n_periods", "n_per_period", "arms_schedule"):
                     incomplete_platform = dict(platform_base)
                     incomplete_platform.pop(required_field)
-                    expect_tool_error_message(
+                    expect_invalid_request(
                         f"platform_requires_{required_field}_before_r",
                         lambda config=incomplete_platform: contract_client.call_tool(
                             "master_simulate", {"config": config},
                         ),
-                        "platform designs require n_periods, n_per_period, and arms_schedule",
                     )
-                expect_tool_error_message(
+                expect_invalid_request(
                     "platform_schedule_length_fails_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base,
                         "arms_schedule": {"enter": [1, 1, 1], "leave": [2, 2, 2]},
                     }}),
-                    "arms_schedule enter and leave must each contain exactly n_subgroups values",
                 )
-                expect_tool_error_message(
+                expect_invalid_request(
                     "platform_schedule_range_fails_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base,
                         "arms_schedule": {"enter": [0, 2], "leave": [2, 3]},
                     }}),
-                    "arms_schedule must satisfy 1 <= enter[i] <= leave[i] <= n_periods",
                 )
                 expect_tool_error(
                     "platform_schedule_noninteger_fails_at_schema_before_r",
@@ -566,29 +611,26 @@ if os.name == "posix":
                     "futility_threshold": 0.05,
                 }
                 for field, value in platform_only_examples.items():
-                    expect_tool_error_message(
+                    expect_invalid_request(
                         f"nonplatform_rejects_{field}_before_r",
                         lambda key=field, item=value: contract_client.call_tool(
                             "master_simulate",
                             {"config": {**nonplatform_base, key: item}},
                         ),
-                        "platform-only configuration fields require master_design_type='platform'",
                     )
-                expect_tool_error_message(
+                expect_invalid_request(
                     "platform_interim_endpoint_combination_fails_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base, "endpoint_type": "tte", "null_params": 1,
                         "alt_params": [0.8, 0.8], "ncc_method": "none",
                         "interim_frequency": 1,
                     }}),
-                    "interim_frequency/futility_threshold are unavailable for this endpoint and NCC method",
                 )
-                expect_tool_error_message(
+                expect_invalid_request(
                     "platform_interim_ncc_combination_fails_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base, "futility_threshold": 0.05,
                     }}),
-                    "interim_frequency/futility_threshold are unavailable for this endpoint and NCC method",
                 )
                 expect_tool_error(
                     "legacy_effect_threshold_fails_at_schema_before_r",
@@ -596,12 +638,11 @@ if os.name == "posix":
                         **platform_base, "effect_threshold": 0.99,
                     }}),
                 )
-                expect_tool_error_message(
+                expect_invalid_request(
                     "simple_randomization_rejects_nonequal_ratio_before_r",
                     lambda: contract_client.call_tool("randomize", {
                         "n": 12, "ratio": [1, 2], "seed": 42,
                     }),
-                    "method='simple' supports only equal allocation",
                 )
             check("invalid_master_and_randomize_contract_requests_never_reach_r",
                   not r_marker.exists(), r_marker)

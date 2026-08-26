@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
-import os
+import ast
+import io
 import json
+import os
 import queue
 import signal
 import sys
@@ -14,21 +16,125 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-if "EXPDESIGN_PUBLIC_ONLY" in os.environ:
-    print("EXPDESIGN_PUBLIC_ONLY is forbidden; use --public-only", file=sys.stderr)
+
+CHECK_RESULTS: dict[str, bool] = {}
+
+
+def _usage_error(message: str) -> None:
+    print(message, file=sys.stderr)
     raise SystemExit(2)
+
+
+def _record_check(name: str, passed: bool) -> None:
+    if name in CHECK_RESULTS:
+        raise AssertionError(f"duplicate MCP-client test result: {name}")
+    if not isinstance(passed, bool):
+        raise TypeError(f"MCP-client test result is not boolean: {name}")
+    CHECK_RESULTS[name] = passed
+    print(f"TEST {name} : {'PASS' if passed else 'FAIL'}")
+
+
+def _record_skip(name: str) -> None:
+    if name in CHECK_RESULTS:
+        raise AssertionError(f"executed MCP-client test was also skipped: {name}")
+    print(f"TEST {name} : SKIP")
+
+
+def _result_exit_code(results: dict[str, bool]) -> int:
+    return 0 if results and all(results.values()) else 1
+
+
+def _finish_checks(summary_name: str | None = None) -> None:
+    exit_code = _result_exit_code(CHECK_RESULTS)
+    if summary_name is not None:
+        print(f"TEST {summary_name} : {'PASS' if exit_code == 0 else 'FAIL'}")
+    raise SystemExit(exit_code)
+
+
+def _runner_structure_is_centralized(source: str) -> bool:
+    """Reject test output or terminal exits outside the shared result boundary."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    functions = {
+        node.name: (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def inside(function_names: set[str], line: int) -> bool:
+        return any(
+            name in functions and functions[name][0] <= line <= functions[name][1]
+            for name in function_names
+        )
+
+    output_functions = {"_record_check", "_record_skip", "_finish_checks"}
+    exit_functions = {"_usage_error", "_finish_checks"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            is_print = isinstance(node.func, ast.Name) and node.func.id == "print"
+            contains_test_output = any(
+                isinstance(part, ast.Constant)
+                and isinstance(part.value, str)
+                and "TEST " in part.value
+                for part in ast.walk(node)
+            )
+            if is_print and contains_test_output and not inside(
+                output_functions, node.lineno,
+            ):
+                return False
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "sys"
+                and node.func.attr == "exit"
+            ):
+                return False
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            if (
+                isinstance(node.exc.func, ast.Name)
+                and node.exc.func.id == "SystemExit"
+                and not inside(exit_functions, node.lineno)
+            ):
+                return False
+    return True
+
+
+if "EXPDESIGN_PUBLIC_ONLY" in os.environ:
+    _usage_error("EXPDESIGN_PUBLIC_ONLY is forbidden; use --public-only")
 
 if sys.argv[1:] not in ([], ["--public-only"]):
-    print("Usage: test_mcp_client.py [--public-only]", file=sys.stderr)
-    raise SystemExit(2)
+    _usage_error("Usage: test_mcp_client.py [--public-only]")
 
 PUBLIC_ONLY = sys.argv[1:] == ["--public-only"]
+
+runner_source = Path(__file__).read_text(encoding="utf-8")
+registry_meta_ok = (
+    _result_exit_code({"passing": True}) == 0
+    and _result_exit_code({"passing": True, "failing": False}) == 1
+    and _result_exit_code({}) == 1
+)
+_record_check("result_registry_fails_closed", registry_meta_ok)
+structure_meta_ok = (
+    _runner_structure_is_centralized(runner_source)
+    and not _runner_structure_is_centralized(
+        runner_source + '\nprint("TEST unregistered_result : FAIL")\n'
+    )
+    and not _runner_structure_is_centralized(runner_source + "\nsys.exit(0)\n")
+)
+_record_check("test_runner_structure_is_centralized", structure_meta_ok)
+if not registry_meta_ok or not structure_meta_ok:
+    _finish_checks()
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 import mcp_client as mcp_client_module  # noqa: E402
-from mcp_client import (CONTROL_TIMEOUT_S, MCP_SERVER_DIR, PRIVATE_ARTIFACT_META_KEY,
-                        PRIVATE_PROVENANCE_META_KEY, SERVER_LAUNCHER,
+from mcp_client import (CONTROL_TIMEOUT_S, MAX_JSONRPC_MESSAGE_BYTES,
+                        MAX_SERVER_STDERR_BYTES, MCP_SERVER_DIR,
+                        PRIVATE_ARTIFACT_META_KEY, PRIVATE_PROVENANCE_META_KEY,
+                        PUBLIC_TOOL_ERROR_MESSAGES, SERVER_LAUNCHER,
                         TOOL_TIMEOUT_S, MCPClient, MCPToolError)  # noqa: E402
 
 client = MCPClient()
@@ -40,7 +146,7 @@ client._waiters[1].put({"jsonrpc": "2.0", "id": 1, "result": {"value": "first"}}
 first = client._recv(1)
 second = client._recv(2)
 ok = first == {"value": "first"} and second == {"value": "second"}
-print(f"TEST out_of_order_responses_are_dispatched_by_id : {'PASS' if ok else 'FAIL'}")
+_record_check("out_of_order_responses_are_dispatched_by_id", ok)
 
 restart_client = MCPClient()
 restart_client._generation = 2
@@ -50,10 +156,10 @@ restart_client._waiters = {1: restart_waiter}
 old_proc = SimpleNamespace(stdout=[])
 restart_client._read_stdout(old_proc, 1)
 restart_ok = not restart_client._closed and restart_waiter.empty()
-print(f"TEST old_reader_cannot_poison_new_generation : {'PASS' if restart_ok else 'FAIL'}")
+_record_check("old_reader_cannot_poison_new_generation", restart_ok)
 
 budget_ok = TOOL_TIMEOUT_S >= 390 and CONTROL_TIMEOUT_S < TOOL_TIMEOUT_S
-print(f"TEST tool_timeout_covers_valid_server_budget : {'PASS' if budget_ok else 'FAIL'}")
+_record_check("tool_timeout_covers_valid_server_budget", budget_ok)
 
 timeout_client = MCPClient()
 timeout_client._proc = SimpleNamespace(poll=lambda: None, returncode=None)
@@ -75,7 +181,7 @@ cancel_ok = (
         "params": {"requestId": 9, "reason": "client timeout"},
     }]
 )
-print(f"TEST timeout_cancels_request_and_cleans_waiter : {'PASS' if cancel_ok else 'FAIL'}")
+_record_check("timeout_cancels_request_and_cleans_waiter", cancel_ok)
 
 late_client = MCPClient()
 late_client._generation = 3
@@ -94,7 +200,7 @@ late_client._proc = late_proc
 late_client._read_stdout(late_proc, 3)
 next_result = late_client._recv(10)
 late_ok = next_result == {"value": "next"}
-print(f"TEST late_cancelled_reply_cannot_contaminate_next_request : {'PASS' if late_ok else 'FAIL'}")
+_record_check("late_cancelled_reply_cannot_contaminate_next_request", late_ok)
 
 duplicate_client = MCPClient()
 duplicate_client._generation = 4
@@ -140,10 +246,7 @@ duplicate_ok = (
         "MCP protocol violation: duplicate response id",
     ]
 )
-print(
-    "TEST duplicate_response_fails_generation_without_blocking_reader : "
-    f"{'PASS' if duplicate_ok else 'FAIL'}"
-)
+_record_check("duplicate_response_fails_generation_without_blocking_reader", duplicate_ok)
 
 eof_client = MCPClient()
 eof_client._generation = 5
@@ -162,10 +265,7 @@ eof_reader.start()
 eof_reader.join(timeout=1)
 eof_result = eof_client._recv(41, timeout_s=0.1) if not eof_reader.is_alive() else None
 eof_ok = not eof_reader.is_alive() and eof_result == {"value": "complete"}
-print(
-    "TEST eof_never_blocks_or_overwrites_queued_response : "
-    f"{'PASS' if eof_ok else 'FAIL'}"
-)
+_record_check("eof_never_blocks_or_overwrites_queued_response", eof_ok)
 
 
 def malformed_response_error(raw_message: str) -> str | None:
@@ -196,10 +296,177 @@ malformed_errors = [malformed_response_error(raw) for raw in malformed_envelopes
 malformed_ok = malformed_errors == [
     "MCP protocol violation: malformed JSON-RPC envelope"
 ] * len(malformed_envelopes)
-print(
-    "TEST malformed_jsonrpc_envelopes_fail_closed : "
-    f"{'PASS' if malformed_ok else 'FAIL'}"
+_record_check("malformed_jsonrpc_envelopes_fail_closed", malformed_ok)
+
+
+def sized_response(response_id: int, size: int) -> tuple[bytes, int]:
+    prefix = (
+        b'{"jsonrpc":"2.0","id":' + str(response_id).encode("ascii")
+        + b',"result":{"blob":"'
+    )
+    suffix = b'"}}'
+    fill = size - len(prefix) - len(suffix)
+    if fill < 0:
+        raise ValueError("requested JSON-RPC test message is too small")
+    return prefix + (b"x" * fill) + suffix, fill
+
+
+exact_line, exact_fill = sized_response(71, MAX_JSONRPC_MESSAGE_BYTES)
+exact_client = MCPClient()
+exact_client._generation = 61
+exact_client._closed = False
+exact_client._waiters = {71: queue.Queue(maxsize=1)}
+exact_proc = SimpleNamespace(
+    stdout=io.BytesIO(exact_line), poll=lambda: None, returncode=None,
 )
+exact_client._proc = exact_proc
+exact_client._schedule_protocol_shutdown = lambda generation, proc: None
+exact_client._read_stdout(exact_proc, 61)
+try:
+    exact_result = exact_client._recv(71, timeout_s=0.1)
+except MCPToolError:
+    exact_result = None
+exact_limit_ok = (
+    exact_result is not None
+    and len(exact_result.get("blob", "")) == exact_fill
+    and exact_client._reader_error is None
+)
+_record_check("jsonrpc_message_at_byte_limit_is_accepted", exact_limit_ok)
+
+over_line, _over_fill = sized_response(72, MAX_JSONRPC_MESSAGE_BYTES + 1)
+over_client = MCPClient()
+over_client._generation = 62
+over_client._closed = False
+over_client._waiters = {72: queue.Queue(maxsize=1)}
+over_proc = SimpleNamespace(
+    stdout=io.BytesIO(over_line), poll=lambda: None, returncode=None,
+)
+over_client._proc = over_proc
+over_cleanup_calls = []
+over_client._schedule_protocol_shutdown = (
+    lambda generation, proc: over_cleanup_calls.append((generation, proc))
+)
+over_client._read_stdout(over_proc, 62)
+try:
+    over_client._recv(72, timeout_s=0.1)
+except MCPToolError as error:
+    over_error = str(error)
+else:
+    over_error = None
+over_limit_ok = (
+    over_error == (
+        "MCP protocol violation: JSON-RPC message exceeds "
+        f"{MAX_JSONRPC_MESSAGE_BYTES} bytes"
+    )
+    and over_client._closed
+    and over_cleanup_calls == [(62, over_proc)]
+)
+_record_check("jsonrpc_message_one_byte_over_limit_fails_generation", over_limit_ok)
+
+private_path = b"/private/runtime/install/diagnostic-sentinel"
+stderr_client = MCPClient()
+stderr_client._generation = 63
+stderr_proc = SimpleNamespace(
+    stderr=io.BytesIO(b"x" * (MAX_SERVER_STDERR_BYTES + 17) + private_path),
+)
+stderr_client._drain_stderr(stderr_proc, 63)
+stderr_bound_ok = (
+    len(stderr_client._stderr_buf) == MAX_SERVER_STDERR_BYTES
+    and private_path.decode("ascii") in stderr_client._private_recent_stderr()
+)
+_record_check("stderr_diagnostics_are_strictly_byte_bounded", stderr_bound_ok)
+
+hostile_error_client = MCPClient()
+hostile_error_client._call = lambda *_args, **_kwargs: {
+    "isError": True,
+    "content": [{
+        "type": "text",
+        "text": "handler failed at /private/runtime/install/diagnostic-sentinel",
+    }],
+}
+try:
+    hostile_error_client.call_tool("indirect_compare", {})
+except MCPToolError as error:
+    hostile_error = str(error)
+else:
+    hostile_error = ""
+hostile_error_ok = (
+    private_path.decode("ascii") not in hostile_error
+    and hostile_error == (
+        "Tool request failed [internal_error]: "
+        + PUBLIC_TOOL_ERROR_MESSAGES["internal_error"]
+    )
+)
+_record_check("arbitrary_server_error_text_is_not_reflected", hostile_error_ok)
+
+public_error_client = MCPClient()
+public_error_client._call = lambda *_args, **_kwargs: {
+    "isError": True,
+    "content": [{
+        "type": "text",
+        "text": json.dumps({"error": {
+            "code": "request_cancelled",
+            "message": PUBLIC_TOOL_ERROR_MESSAGES["request_cancelled"],
+        }}),
+    }],
+}
+try:
+    public_error_client.call_tool("sample_size", {})
+except MCPToolError as error:
+    public_error = str(error)
+else:
+    public_error = ""
+public_error_ok = public_error == (
+    "Tool request failed [request_cancelled]: "
+    + PUBLIC_TOOL_ERROR_MESSAGES["request_cancelled"]
+)
+_record_check("fixed_public_error_taxonomy_is_preserved", public_error_ok)
+
+invalid_request_client = MCPClient()
+invalid_request_client._call = lambda *_args, **_kwargs: {
+    "isError": True,
+    "content": [{
+        "type": "text",
+        "text": json.dumps({"error": {
+            "code": "invalid_request",
+            "message": PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"],
+        }}),
+    }],
+}
+try:
+    invalid_request_client.call_tool("factorial_design", {})
+except MCPToolError as error:
+    invalid_request_error = str(error)
+else:
+    invalid_request_error = ""
+invalid_request_ok = invalid_request_error == (
+    "Tool request failed [invalid_request]: "
+    + PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"]
+)
+_record_check("fixed_invalid_request_taxonomy_is_preserved", invalid_request_ok)
+
+unknown_code_client = MCPClient()
+unknown_code_client._call = lambda *_args, **_kwargs: {
+    "isError": True,
+    "content": [{
+        "type": "text",
+        "text": json.dumps({"error": {
+            "code": "private_diagnostic",
+            "message": None,
+        }}),
+    }],
+}
+try:
+    unknown_code_client.call_tool("sample_size", {})
+except MCPToolError as error:
+    unknown_code_error = str(error)
+else:
+    unknown_code_error = ""
+unknown_code_ok = unknown_code_error == (
+    "Tool request failed [internal_error]: "
+    + PUBLIC_TOOL_ERROR_MESSAGES["internal_error"]
+)
+_record_check("unknown_public_error_codes_fail_closed", unknown_code_ok)
 
 
 generation_client = MCPClient()
@@ -211,10 +478,7 @@ old_cleanup_calls = []
 generation_client._stop_locked = lambda: old_cleanup_calls.append(True)
 generation_client._cleanup_protocol_generation(7, old_generation_proc)
 old_generation_ok = old_cleanup_calls == [] and generation_client._proc is new_generation_proc
-print(
-    "TEST delayed_old_generation_cleanup_cannot_stop_restart : "
-    f"{'PASS' if old_generation_ok else 'FAIL'}"
-)
+_record_check("delayed_old_generation_cleanup_cannot_stop_restart", old_generation_ok)
 
 
 class CountingRegistry:
@@ -267,10 +531,7 @@ serialized_ok = (
     ]
     and serialized_client._runtime_registry is None
 )
-print(
-    "TEST concurrent_stop_serializes_registry_cleanup : "
-    f"{'PASS' if serialized_ok else 'FAIL'}"
-)
+_record_check("concurrent_stop_serializes_registry_cleanup", serialized_ok)
 
 analysis_id = "analysis-private-meta"
 input_digest = "1" * 64
@@ -323,7 +584,7 @@ metadata_ok = (
     and not metadata_response["content"][1]["uri"].startswith("file:")
     and artifact_path not in metadata_response["content"][1]["uri"]
 )
-print(f"TEST private_metadata_is_recovered_outside_model_text : {'PASS' if metadata_ok else 'FAIL'}")
+_record_check("private_metadata_is_recovered_outside_model_text", metadata_ok)
 
 hostile_client = MCPClient()
 hostile_client._call = lambda *_args, **_kwargs: {
@@ -337,7 +598,7 @@ except MCPToolError:
     hostile_ok = True
 else:
     hostile_ok = False
-print(f"TEST model_visible_private_provenance_is_rejected : {'PASS' if hostile_ok else 'FAIL'}")
+_record_check("model_visible_private_provenance_is_rejected", hostile_ok)
 
 
 class CleanupProcess:
@@ -370,16 +631,10 @@ except RuntimeError:
 else:
     cleanup_failed_closed = False
 cleanup_ok = cleanup_failed_closed and cleanup_client._proc is cleanup_process
-print(f"TEST failed_process_cleanup_retains_handle : {'PASS' if cleanup_ok else 'FAIL'}")
+_record_check("failed_process_cleanup_retains_handle", cleanup_ok)
 
 if PUBLIC_ONLY:
-    public_ok = all((
-        ok, restart_ok, budget_ok, cancel_ok, late_ok, duplicate_ok, eof_ok,
-        metadata_ok, hostile_ok, cleanup_ok,
-    ))
-    print("TEST public_only_protocol_boundary : PASS" if public_ok else
-          "TEST public_only_protocol_boundary : FAIL")
-    raise SystemExit(0 if public_ok else 1)
+    _finish_checks("public_only_protocol_boundary")
 
 
 class PartialStartupProcess:
@@ -453,6 +708,8 @@ partial_cleanup_ok = (
     and spawn_calls[0][0] == ["/bin/sh", str(SERVER_LAUNCHER)]
     and spawn_calls[0][1].get("cwd") == str(MCP_SERVER_DIR)
     and spawn_calls[0][1].get("start_new_session") is True
+    and spawn_calls[0][1].get("text") is False
+    and spawn_calls[0][1].get("bufsize") == 0
     and spawn_calls[0][0][0] != "node"
     and spawn_calls[0][1].get("env", {}).get("PATH") == "/private/hostile-path"
     and "NODE_OPTIONS" not in spawn_calls[0][1].get("env", {})
@@ -461,10 +718,7 @@ partial_cleanup_ok = (
     and "EXPDESIGN_RUNTIME_REGISTRY_TOKEN" in spawn_calls[0][1].get("env", {})
     and partial_client._runtime_registry is None
 )
-print(
-    "TEST partial_startup_cleans_process_and_ignores_hostile_node_path : "
-    f"{'PASS' if partial_cleanup_ok else 'FAIL'}"
-)
+_record_check("partial_startup_cleans_process_and_ignores_hostile_node_path", partial_cleanup_ok)
 
 
 def identity_probe_available() -> bool:
@@ -621,12 +875,12 @@ if os.name == "posix" and identity_probe_available():
                 pass
             if frozen_worker is not None:
                 frozen_worker.join(timeout=2)
-    print(
-        "TEST frozen_node_forced_fallback_reaps_registered_runtime_group : "
-        f"{'PASS' if forced_fallback_ok else 'FAIL'}"
+    _record_check(
+        "frozen_node_forced_fallback_reaps_registered_runtime_group",
+        forced_fallback_ok,
     )
 else:
-    print("TEST frozen_node_forced_fallback_reaps_registered_runtime_group : SKIP")
+    _record_skip("frozen_node_forced_fallback_reaps_registered_runtime_group")
 
 
 natural_descendant_ok = True
@@ -690,14 +944,11 @@ if os.name == "posix" and identity_probe_available():
                 descendant_client.stop()
             except RuntimeError:
                 pass
-    print(
-        "TEST natural_target_exit_reaps_background_descendant_and_drains_lease : "
-        f"{'PASS' if natural_descendant_ok else 'FAIL'}"
+    _record_check(
+        "natural_target_exit_reaps_background_descendant_and_drains_lease",
+        natural_descendant_ok,
     )
 else:
-    print("TEST natural_target_exit_reaps_background_descendant_and_drains_lease : SKIP")
+    _record_skip("natural_target_exit_reaps_background_descendant_and_drains_lease")
 
-sys.exit(0 if all((ok, restart_ok, budget_ok, cancel_ok, late_ok,
-                   duplicate_ok, eof_ok,
-                   metadata_ok, hostile_ok, cleanup_ok, partial_cleanup_ok,
-                   forced_fallback_ok, natural_descendant_ok)) else 1)
+_finish_checks()

@@ -53,6 +53,7 @@ deps:
 # lifecycle checks that stop at the missing-engine preflight. It does not claim
 # that the omitted statistical engines or full release suite exist.
 public-check:
+	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-workflow "$(CURDIR)/.github/workflows/public-assurance.yml"
 	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-clone "$(CURDIR)"
 	@cd mcp-server && npm ci
 	@cd mcp-server && npm run test:public-lifecycle
