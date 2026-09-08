@@ -833,7 +833,7 @@ print(json.dumps({
   const outcome = await runRuntimeProbe(
     PYTHON_EXECUTABLE,
     [
-      "-E", "-s", "-S", "-c", expression,
+      "-E", "-s", "-S", "-B", "-c", expression,
       canonicalVerifier, dirname(canonicalVerifier),
     ],
     sanitizedPythonChildEnvironment(),
@@ -901,6 +901,7 @@ export const ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES = {
   governance: [
     "governance/__init__.py",
     "governance/agents.json",
+    "governance/single-endpoint-result-contract.json",
     "governance/registry.py",
     "governance/runtime-profiles.json",
     "governance/runtime_profile.py",

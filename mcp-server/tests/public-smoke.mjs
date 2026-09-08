@@ -32,10 +32,12 @@ const check = (name, condition) => {
   console.log(`TEST ${name} : PASS`);
 };
 const call = async (name, args) => {
+  const started = performance.now();
   const response = await client.callTool({ name, arguments: args }, undefined, { timeout: 180_000 });
   assert.notEqual(response.isError, true, JSON.stringify(response));
   const content = response.content.find((item) => item.type === "text");
   assert.ok(content);
+  console.log(`TIMING ${name} ${(performance.now() - started).toFixed(0)} ms (includes verification and any replay)`);
   return JSON.parse(content.text);
 };
 const verified = (result) => result._verification?.presentable === true
@@ -84,6 +86,57 @@ try {
   const serialized = JSON.stringify({ sizing, simulation });
   check("public_results_do_not_expose_installation_paths", !serialized.includes(suiteRoot)
     && !serialized.includes("/Users/") && !serialized.includes("/private/tmp/"));
+
+  const anchoredConfig = { ...config, null_param: 0.21, alt_param: 0.29, alphas: [0.025] };
+  const anchored = await call("simulate_design", { config: anchoredConfig, seed: 31415, B_oc: 32 });
+  check("public_non_aligned_binary_grid_is_verified", verified(anchored)
+    && anchored._verification.checks.output_contract === true);
+  check("public_non_aligned_binary_grid_preserves_exact_anchors", [0.21, 0.29].every(
+    value => anchored.oc.some(row => row.true_param === value)));
+  check("public_exact_binomial_counterexample_retains_achieved_power", anchored.sample_size[0].n_total === 225
+    && anchored.sample_size[0].power_achieved >= 0.8);
+  check("public_oc_uncertainty_survives_projection", anchored.result_contract_version === 1
+    && anchored.oc.every(row => row.mc_replicates === 32 && typeof row.mc_precision_ok === "boolean"
+      && Number.isFinite(row.p_go_mcse) && Number.isFinite(row.p_go_mc_lower)
+      && Number.isFinite(row.p_go_mc_upper) && typeof row.inner_precision_ok === "boolean"));
+  check("public_oc_operation_budget_is_explicit", anchored.workload.scenario_count === anchored.oc.length
+    && anchored.workload.simulated_units === 225 * 32 * anchored.oc.length);
+
+  const continuousConfig = { endpoint_type: "continuous", study_type: "confirmatory", design: "controlled",
+    null_param: 0, alt_param: 0.4, sd: 1, alloc_ratio: 2, alphas: [0.025], powers: [0.8] };
+  const continuousValidation = await call("validate_config", continuousConfig);
+  check("public_continuous_prior_contract_is_explicit", continuousValidation.resolved_config.prior_method === "normal_jeffreys_joint"
+    && continuousValidation.resolved_config.prior_params.kappa0 === 0
+    && continuousValidation.resolved_config.prior_params.beta0 === 0);
+  const continuousSizing = await call("sample_size", continuousConfig);
+  check("public_current_continuous_method_label_survives", verified(continuousSizing)
+    && continuousSizing.results.some(row => row.test === "two_sample_z_normal_approximation"
+      && row.n_trt >= 2 && row.n_ctrl >= 2 && row.power_achieved >= row.power_target)
+    && continuousSizing._verification.report.includes("two_sample_z_normal_approximation"));
+
+  for (const endpoint of ["tte", "incidence_rate"]) {
+    const endpointFields = endpoint === "tte"
+      ? { accrual_time: 12, followup_time: 6, p2_data: { events: 3, person_time: 100 },
+          p2_data_ctrl: { events: 0, person_time: 100 } }
+      : { exposure_time: 1, p2_data: { count: 3, exposure: 100 },
+          p2_data_ctrl: { count: 0, exposure: 100 } };
+    const request = { endpoint_type: endpoint, study_type: "confirmatory", design: "controlled",
+      null_param: 0.2, alt_param: 0.1, alphas: [0.025], powers: [0.8], p3_n: 100, ...endpointFields };
+    const value = await call("simulate_design", { config: request, n_oc: { n_trt: 40, n_ctrl: 40 }, B_oc: 32, seed: 1701 });
+    const ratio = endpoint === "tte" ? "hr" : "rr";
+    check(`public_${endpoint}_ppos_uncertainty_and_method_survive`, verified(value)
+      && typeof value.ppos.confirmatory_test === "string" && value.ppos.n_mc === 100000
+      && Number.isFinite(value.ppos.ppos_mcse) && Number.isFinite(value.ppos.ppos_mc_lower)
+      && typeof value.ppos.mc_precision_ok === "boolean");
+    check(`public_${endpoint}_nonexistent_ratio_mean_is_disclosed`, value.ppos[`${ratio}_post_mean`] === null
+      && value.ppos[`${ratio}_post_mean_status`] === "does_not_exist"
+      && Number.isFinite(value.ppos[`${ratio}_post_median`])
+      && value.ppos[`${ratio}_post_ci`].length === 2
+      && value._verification.report.includes("does_not_exist"));
+    if (endpoint === "incidence_rate") check("public_current_poisson_method_label_survives",
+      value.sample_size.some(row => row.test === "poisson_rate_difference_wald")
+      && value._verification.report.includes("poisson_rate_difference_wald"));
+  }
 } finally {
   await client.close();
 }

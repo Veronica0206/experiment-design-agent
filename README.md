@@ -48,8 +48,8 @@ budgets and is not a study-planning recommendation.
 
 ## Run the agent
 
-Install Node.js 20 or newer and Python 3.9–3.12 (the locked dependency set is
-exercised locally with 3.9 and in public CI with 3.11). Create the locked Python
+Install Node.js 20 or newer and Python 3.10–3.12 (the locked dependency set is
+exercised locally with 3.12 and in public CI with 3.11). Create the locked Python
 environment and build the MCP server:
 
 ```sh
@@ -106,6 +106,12 @@ required checks because an engine happens to be missing.
 Reports retain **Partially verified** status where method-boundary checks or
 complete assessment of study assumptions still require human review. Passing
 software checks does not establish suitability for a particular study.
+
+Reports preserve method labels and uncertainty and distinguish calculation
+checks from design performance. See [statistical assurance](docs/STATISTICAL-ASSURANCE.md)
+for prior definitions, boundary cases, workload limits and the host trust model.
+CI also checks known advisories for locked Python and CRAN packages through OSV,
+separately from package hash integrity and the Node dependency audit.
 
 ## Public and complete installations
 

@@ -38,9 +38,14 @@ power_binomial_single_arm <- function(n, p0, p1, alpha = 0.025) {
 # =============================================================================
 
 power_z_unpooled <- function(n_trt, n_ctrl, p0, p1, alpha = 0.025) {
+  # The planned confirmatory test is the one-sided unpooled Wald statistic.
+  # Use this same normal approximation for sizing, fixed-N power, and PPOS.
+  if (any(!is.finite(c(n_trt, n_ctrl))) || any(c(n_trt, n_ctrl) < 1))
+    stop("binary power requires at least one participant per arm", call. = FALSE)
   se <- sqrt(p1 * (1 - p1) / n_trt + p0 * (1 - p0) / n_ctrl)
+  if (se == 0) return(as.numeric(p1 > p0))
   ncp <- (p1 - p0) / se
-  z_crit <- qnorm(1 - alpha)
+  z_crit <- qnorm(alpha, lower.tail = FALSE)
   return(pnorm(ncp - z_crit))
 }
 
@@ -51,7 +56,7 @@ ss_z_unpooled <- function(p0, p1, alpha = 0.025, power = 0.80,
     pwr <- power_z_unpooled(n_trt, n_ctrl, p0, p1, alpha)
     if (pwr >= power) {
       return(list(n_total = n_trt + n_ctrl, n_trt = n_trt,
-                  n_ctrl = n_ctrl, power = round(pwr, 4),
+                  n_ctrl = n_ctrl, power = pwr,
                   test = "z_unpooled"))
     }
   }
@@ -116,22 +121,71 @@ power_unconditional_exact <- function(n_trt, n_ctrl, p0, p1, alpha = 0.025,
 # CONTINUOUS: SINGLE-ARM (One-sample t-test)
 # =============================================================================
 
+# R's documented noncentral-t range is |ncp| <= 37.62; its upper tail can
+# additionally suffer cancellation. Outside that range, or on a warning, use
+# T = (Z + ncp) / sqrt(V / df), Z~N(0,1), V~chi-square(df), independently.
+# For q>0 integrate phi(z) * P(V < df*((z+ncp)/q)^2), z > -ncp.
+# The omitted |Z|>10 mass is below 1.6e-23. Quadrature has checked absolute
+# error <=1e-9; numerical failure is explicit rather than a fabricated 0/1.
+# Reference: https://stat.ethz.ch/R-manual/R-devel/library/stats/html/TDist.html
+noncentral_t_upper_tail <- function(q, df, ncp) {
+  if (any(lengths(list(q, df, ncp)) != 1L) ||
+      any(!is.finite(c(q, df, ncp))) || df <= 0)
+    stop("noncentral-t power requires finite q/ncp and positive finite df", call. = FALSE)
+  if (q == 0) return(pnorm(ncp))
+  if (q < 0) return(1 - noncentral_t_upper_tail(-q, df, -ncp))
+  if (abs(ncp) <= 37.62) {
+    value <- tryCatch(pt(q, df = df, ncp = ncp, lower.tail = FALSE),
+                      warning = function(w) NA_real_)
+    if (is.finite(value) && value >= 0 && value <= 1) return(value)
+  }
+  lower <- max(-10, -ncp)
+  if (lower >= 10) return(0) # bounded by P(Z>10), independently of q and df
+  integrand <- function(z) {
+    dnorm(z) * pchisq(df * ((z + ncp) / q)^2, df = df)
+  }
+  # Split near the chi-square transition so very large df cannot hide a narrow
+  # transition from adaptive quadrature.
+  cuts <- sort(unique(c(lower, 10, max(lower, min(10, q - ncp)))))
+  values <- vapply(seq_len(length(cuts) - 1L), function(i) {
+    estimate <- integrate(integrand, cuts[i], cuts[i + 1L], subdivisions = 1000L,
+                          rel.tol = 1e-10, abs.tol = 1e-10, stop.on.error = FALSE)
+    if (estimate$message != "OK" || !is.finite(estimate$value) ||
+        !is.finite(estimate$abs.error) || estimate$abs.error > 1e-9)
+      stop("noncentral-t conditional-power quadrature did not converge", call. = FALSE)
+    estimate$value
+  }, numeric(1))
+  min(1, max(0, sum(values)))
+}
+
+minimum_power_size <- function(power_at_n, minimum = 2L, maximum = 10000000L,
+                               target = 0.8) {
+  lower <- minimum
+  upper <- minimum
+  while (power_at_n(upper) < target) {
+    if (upper >= maximum) stop("sample-size search exceeded its supported limit", call. = FALSE)
+    lower <- upper + 1L
+    upper <- min(maximum, upper * 2L)
+  }
+  while (lower < upper) {
+    middle <- floor((lower + upper) / 2)
+    if (power_at_n(middle) >= target) upper <- middle else lower <- middle + 1L
+  }
+  upper
+}
+
 power_ttest_single_arm <- function(n, delta, sd, alpha = 0.025) {
-  res <- power.t.test(n = n, delta = delta, sd = sd,
-                      sig.level = alpha,
-                      type = "one.sample",
-                      alternative = "one.sided")
-  return(res$power)
+  if (!is.finite(n) || n < 2) stop("continuous power requires at least two participants", call. = FALSE)
+  noncentral_t_upper_tail(qt(alpha, df = n - 1, lower.tail = FALSE),
+                         n - 1, delta * sqrt(n) / sd)
 }
 
 ss_ttest_single_arm <- function(delta, sd, alpha = 0.025, power = 0.80) {
-  res <- power.t.test(delta = delta, sd = sd,
-                      sig.level = alpha,
-                      power = power,
-                      type = "one.sample",
-                      alternative = "one.sided")
-  return(list(n = ceiling(res$n), delta = delta, sd = sd,
-              alpha = alpha, power = power, test = "one_sample_t"))
+  n <- minimum_power_size(function(n) power_ttest_single_arm(n, delta, sd, alpha),
+                          target = power)
+  return(list(n = n, delta = delta, sd = sd,
+              alpha = alpha, power = power_ttest_single_arm(n, delta, sd, alpha),
+              test = "one_sample_t"))
 }
 
 # =============================================================================
@@ -139,12 +193,12 @@ ss_ttest_single_arm <- function(delta, sd, alpha = 0.025, power = 0.80) {
 # =============================================================================
 
 power_ttest_two_arm <- function(n_trt, n_ctrl, delta, sd, alpha = 0.025) {
+  if (any(!is.finite(c(n_trt, n_ctrl))) || any(c(n_trt, n_ctrl) < 2))
+    stop("continuous power requires at least two participants per arm", call. = FALSE)
   if (n_trt == n_ctrl) {
-    res <- power.t.test(n = n_trt, delta = delta, sd = sd,
-                        sig.level = alpha,
-                        type = "two.sample",
-                        alternative = "one.sided")
-    return(res$power)
+    df <- n_trt + n_ctrl - 2
+    return(noncentral_t_upper_tail(qt(alpha, df, lower.tail = FALSE), df,
+                                  delta / (sd * sqrt(1/n_trt + 1/n_ctrl))))
   } else {
     za <- qnorm(1 - alpha)
     se <- sd * sqrt(1 / n_trt + 1 / n_ctrl)
@@ -156,21 +210,23 @@ power_ttest_two_arm <- function(n_trt, n_ctrl, delta, sd, alpha = 0.025) {
 ss_ttest_two_arm <- function(delta, sd, alpha = 0.025, power = 0.80,
                              alloc_ratio = 1) {
   if (alloc_ratio == 1) {
-    res <- power.t.test(delta = delta, sd = sd,
-                        sig.level = alpha,
-                        power = power,
-                        type = "two.sample",
-                        alternative = "one.sided")
-    n_per <- ceiling(res$n)
+    n_per <- minimum_power_size(function(n) power_ttest_two_arm(n, n, delta, sd, alpha),
+                                target = power)
     return(list(n_total = 2 * n_per, n_trt = n_per, n_ctrl = n_per,
+                power = power_ttest_two_arm(n_per, n_per, delta, sd, alpha),
                 test = "two_sample_t"))
   }
   r <- alloc_ratio
-  za <- qnorm(1 - alpha); zb <- qnorm(power)
-  n_ctrl <- ceiling(((za + zb)^2 * sd^2 * (1 + 1/r)) / delta^2)
-  n_trt  <- ceiling(r * n_ctrl)
+  # Integer rounding can make a near-equal requested allocation exactly
+  # balanced. Search against the actual fixed-N method instead of returning a
+  # normal-approximation size that then fails its t-based postcondition.
+  n_ctrl <- minimum_power_size(function(n) {
+    power_ttest_two_arm(max(2L, ceiling(r * n)), n, delta, sd, alpha)
+  }, minimum = max(2L, ceiling(2/r)), target = power)
+  n_trt <- max(2L, ceiling(r * n_ctrl))
   return(list(n_total = n_trt + n_ctrl, n_trt = n_trt, n_ctrl = n_ctrl,
-              test = "two_sample_z_normal_approximation",
+              power = power_ttest_two_arm(n_trt, n_ctrl, delta, sd, alpha),
+              test = if (n_trt == n_ctrl) "two_sample_t" else "two_sample_z_normal_approximation",
               legacy_test = "two_sample_t"))
 }
 
@@ -230,10 +286,11 @@ ss_logrank_single_arm <- function(lambda0, lambda1, accrual_time, followup_time,
   log_hr <- log(lambda0 / lambda1)
   d <- ceiling((za + zb)^2 / log_hr^2)
   p_event <- prob_event_exponential(lambda1, accrual_time, followup_time)
-  if (p_event <= 0) return(list(n = NA, events = d, p_event = 0, test = "exponential_rate"))
-  n <- ceiling(d / p_event)
+  if (p_event <= 0) return(list(n = NA, events = d, p_event = 0, power = NA_real_, test = "exponential_rate"))
+  n <- max(1L, ceiling(d / p_event))
   return(list(n = n, events = d, p_event = round(p_event, 4),
-              power = round(power, 4), alpha = alpha,
+              power = power_logrank_single_arm(n, lambda0, lambda1, accrual_time,
+                                                followup_time, alpha), alpha = alpha,
               lambda0 = lambda0, lambda1 = lambda1,
               median0 = log(2) / lambda0, median1 = log(2) / lambda1,
               test = "exponential_rate"))
@@ -267,13 +324,23 @@ ss_logrank_two_arm <- function(lambda0, lambda1, accrual_time, followup_time,
   p_event_trt  <- prob_event_exponential(lambda1, accrual_time, followup_time)
   p_event_ctrl <- prob_event_exponential(lambda0, accrual_time, followup_time)
   p_event_avg  <- (r * p_event_trt + p_event_ctrl) / (r + 1)
-  if (p_event_avg <= 0) return(list(n_total = NA, events = d, test = "logrank"))
+  if (p_event_avg <= 0) return(list(n_total = NA, n_trt = NA, n_ctrl = NA,
+                                  power = NA_real_, events = d, test = "logrank"))
   n_total <- ceiling(d / p_event_avg)
-  n_ctrl  <- ceiling(n_total / (1 + r))
-  n_trt   <- n_total - n_ctrl
+  n_ctrl  <- max(1L, ceiling(1/r), ceiling(n_total / (1 + r)))
+  n_trt   <- max(1L, ceiling(r * n_ctrl))
+  pwr <- power_logrank_two_arm(n_trt, n_ctrl, lambda0, lambda1,
+                               accrual_time, followup_time, alpha)
+  # Integer allocation changes both expected events and information fraction.
+  while (pwr < power) {
+    n_ctrl <- n_ctrl + 1L
+    n_trt <- ceiling(r * n_ctrl)
+    pwr <- power_logrank_two_arm(n_trt, n_ctrl, lambda0, lambda1,
+                                 accrual_time, followup_time, alpha)
+  }
   return(list(n_total = n_trt + n_ctrl, n_trt = n_trt, n_ctrl = n_ctrl,
               events = d, p_event_avg = round(p_event_avg, 4),
-              HR = round(HR, 4), power = round(power, 4),
+              HR = round(HR, 4), power = pwr,
               test = "logrank"))
 }
 
@@ -362,9 +429,9 @@ ss_poisson_two_arm <- function(lambda0, lambda1, exposure_time,
   za <- qnorm(1 - alpha); zb <- qnorm(power)
   r <- alloc_ratio; T_exp <- exposure_time
   # Normal approx: N_ctrl = (za + zb)^2 * (lambda0/T + lambda1/(r*T)) / (lambda1 - lambda0)^2
-  n_ctrl <- ceiling((za + zb)^2 * (lambda0 / T_exp + lambda1 / (r * T_exp)) /
-                    (lambda1 - lambda0)^2)
-  n_trt  <- ceiling(r * n_ctrl)
+  n_ctrl <- max(1L, ceiling(1/r), ceiling((za + zb)^2 *
+    (lambda0 / T_exp + lambda1 / (r * T_exp)) / (lambda1 - lambda0)^2))
+  n_trt  <- max(1L, ceiling(r * n_ctrl))
   # Verify power
   se <- sqrt(lambda0 / (n_ctrl * T_exp) + lambda1 / (n_trt * T_exp))
   z_pwr <- abs(lambda1 - lambda0) / se - za

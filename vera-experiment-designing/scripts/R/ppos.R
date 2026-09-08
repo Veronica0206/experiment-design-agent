@@ -140,31 +140,17 @@ ppos_binary_two_arm <- function(config, n_mc = 100000) {
   n_trt_p3  <- p3_n - n_ctrl_p3
   p3_alpha  <- config$p3_alpha
 
-  # For each draw, compute approximate power via normal approximation
-  # Power of two-proportion z-test: P(Z > z_alpha | true rates)
-  z_alpha <- qnorm(1 - p3_alpha)
-
+  # The same unpooled Wald rejection-rule approximation used by sizing and
+  # fixed-N power. Posterior integration changes the rates, not the test.
   cond_power <- sapply(1:n_mc, function(i) {
-    p_t <- theta_trt[i]; p_c <- theta_ctrl[i]
-    delta <- p_t - p_c
-    # SE under null
-    p_pool <- (n_trt_p3 * p_t + n_ctrl_p3 * p_c) / (n_trt_p3 + n_ctrl_p3)
-    se_null <- sqrt(p_pool * (1 - p_pool) * (1/n_trt_p3 + 1/n_ctrl_p3))
-
-    # SE under alternative
-    se_alt <- sqrt(p_t * (1 - p_t) / n_trt_p3 + p_c * (1 - p_c) / n_ctrl_p3)
-
-    if (se_alt == 0 || se_null == 0) return(as.numeric(delta > 0))
-
-    # Power
-    pnorm((delta - z_alpha * se_null) / se_alt)
+    power_z_unpooled(n_trt_p3, n_ctrl_p3, theta_ctrl[i], theta_trt[i], p3_alpha)
   })
 
   ppos <- mean(cond_power)
 
   list(
     ppos           = round(ppos, 4),
-    confirmatory_test = "two_proportion_z_normal_approximation",
+    confirmatory_test = "z_unpooled",
     p3_n           = p3_n,
     p3_n_trt       = n_trt_p3,
     p3_n_ctrl      = n_ctrl_p3,
@@ -209,17 +195,11 @@ ppos_continuous_single_arm <- function(config, n_mc = 100000) {
   # Conditional power for each draw: power of one-sample t-test
   # Noncentrality parameter: ncp = (mu_true - mu0) / (sigma / sqrt(n))
   # Power = P(T > t_crit | ncp)
-  t_crit <- qt(1 - p3_alpha, df = p3_n - 1)
+  t_crit <- qt(p3_alpha, df = p3_n - 1, lower.tail = FALSE)
 
   cond_power <- sapply(1:n_mc, function(i) {
     ncp <- (mu_draws[i] - mu0) / (sigma_draws[i] / sqrt(p3_n))
-    # Extreme noncentralities are numerically indistinguishable from tail
-    # probabilities 0/1 and can make R's pnt routine emit precision warnings.
-    if (ncp <= -40) return(0)
-    if (ncp >= 40) return(1)
-    value <- suppressWarnings(1 - pt(t_crit, df = p3_n - 1, ncp = ncp))
-    if (!is.finite(value)) stop("non-finite continuous conditional power", call. = FALSE)
-    min(1, max(0, value))
+    noncentral_t_upper_tail(t_crit, p3_n - 1, ncp)
   })
 
   ppos <- mean(cond_power)
@@ -275,24 +255,21 @@ ppos_continuous_two_arm <- function(config, n_mc = 100000) {
   cond_power <- sapply(1:n_mc, function(i) {
     delta <- mu_t[i] - mu_c[i]
     se    <- sqrt(sig_t[i]^2 / n_t3 + sig_c[i]^2 / n_c3)
-    if (se == 0) return(1)
+    if (!is.finite(se) || se <= 0)
+      stop("continuous conditional-power standard error must be positive and finite", call. = FALSE)
     # Welch df
     v_t <- sig_t[i]^2 / n_t3; v_c <- sig_c[i]^2 / n_c3
     df_w <- (v_t + v_c)^2 / (v_t^2 / (n_t3 - 1) + v_c^2 / (n_c3 - 1))
-    t_crit <- qt(1 - p3_alpha, df = max(df_w, 1))
+    t_crit <- qt(p3_alpha, df = df_w, lower.tail = FALSE)
     ncp <- delta / se
-    if (ncp <= -40) return(0)
-    if (ncp >= 40) return(1)
-    value <- suppressWarnings(1 - pt(t_crit, df = max(df_w, 1), ncp = ncp))
-    if (!is.finite(value)) stop("non-finite continuous conditional power", call. = FALSE)
-    min(1, max(0, value))
+    noncentral_t_upper_tail(t_crit, df_w, ncp)
   })
 
   ppos <- mean(cond_power)
 
   list(
     ppos           = round(ppos, 4),
-    confirmatory_test = "welch_t_normal_approximation",
+    confirmatory_test = "welch_noncentral_t_approximation",
     p3_n           = p3_n,
     p3_n_trt       = n_t3,
     p3_n_ctrl      = n_c3,
@@ -392,6 +369,9 @@ ppos_tte_two_arm <- function(config, n_mc = 100000) {
 
   lam_t <- rgamma(n_mc, pr$shape + p2_trt$events, pr$rate + p2_trt$person_time)
   lam_c <- rgamma(n_mc, pr$shape + p2_ctrl$events, pr$rate + p2_ctrl$person_time)
+  ratio_summary <- gamma_ratio_summary(pr$shape + p2_trt$events,
+    pr$rate + p2_trt$person_time, pr$shape + p2_ctrl$events,
+    pr$rate + p2_ctrl$person_time)
 
   p3_n <- config$p3_n; r <- config$p3_alloc_ratio; p3_alpha <- config$p3_alpha
   n_ctrl_p3 <- floor(p3_n / (r + 1)); n_trt_p3 <- p3_n - n_ctrl_p3
@@ -406,7 +386,11 @@ ppos_tte_two_arm <- function(config, n_mc = 100000) {
   list(
     ppos = round(ppos, 4), p3_n = p3_n, p3_alpha = p3_alpha,
     confirmatory_test = "exponential_event_normal_approximation",
-    hr_post_mean = round(mean(lam_t / lam_c), 4),
+    hr_post_mean = ratio_summary$mean,
+    hr_post_mean_status = ratio_summary$mean_status,
+    hr_post_median = ratio_summary$median,
+    hr_post_ci = ratio_summary$ci,
+    ratio_summary_method = ratio_summary$method,
     cond_power_mean = round(mean(cond_power), 4),
     cond_power_draws = cond_power
   )
@@ -470,6 +454,9 @@ ppos_rate_two_arm <- function(config, n_mc = 100000) {
 
   lam_t <- rgamma(n_mc, pr$shape + p2_trt$count, pr$rate + p2_trt$exposure)
   lam_c <- rgamma(n_mc, pr$shape + p2_ctrl$count, pr$rate + p2_ctrl$exposure)
+  ratio_summary <- gamma_ratio_summary(pr$shape + p2_trt$count,
+    pr$rate + p2_trt$exposure, pr$shape + p2_ctrl$count,
+    pr$rate + p2_ctrl$exposure)
 
   p3_n <- config$p3_n; r <- config$p3_alloc_ratio; p3_alpha <- config$p3_alpha
   T_exp <- config$exposure_time
@@ -490,7 +477,11 @@ ppos_rate_two_arm <- function(config, n_mc = 100000) {
   list(
     ppos = round(ppos, 4), p3_n = p3_n, p3_alpha = p3_alpha,
     confirmatory_test = "poisson_rate_difference_wald",
-    rr_post_mean = round(mean(lam_t / lam_c), 4),
+    rr_post_mean = ratio_summary$mean,
+    rr_post_mean_status = ratio_summary$mean_status,
+    rr_post_median = ratio_summary$median,
+    rr_post_ci = ratio_summary$ci,
+    ratio_summary_method = ratio_summary$method,
     rate_difference_post_mean = round(mean(lam_t - lam_c), 6),
     cond_power_mean = round(mean(cond_power), 4),
     cond_power_median = round(median(cond_power), 4),
@@ -541,6 +532,7 @@ compute_ppos <- function(config, n_mc = 100000) {
   } else {
     stop("Unsupported endpoint_type for PPOS: ", config$endpoint_type, call. = FALSE)
   }
+  result$prior_method <- config$prior_method
   append_ppos_mc_diagnostics(result, result$cond_power_draws, n_mc)
 }
 

@@ -215,7 +215,7 @@ function main() {
     const input = JSON.stringify(data);
     const path = join(hookDirectory, script);
     const executable = resolvePython();
-    const result = spawnSync(executable, ["-E", "-s", "-S", path], {
+    const result = spawnSync(executable, ["-E", "-s", "-S", "-B", path], {
       input, encoding: "utf8", env: sanitizedEnvironment(executable),
     });
     if (result.stdout) process.stdout.write(result.stdout);

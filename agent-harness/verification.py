@@ -144,7 +144,7 @@ def public_check_summary(checks: dict[str, bool] | None) -> dict[str, bool]:
             category = "reproducibility"
         elif name == "seed_echoed":
             category = "seed_disclosure"
-        elif name in {"nonempty_object", "no_tool_error", "no_nan_inf"}:
+        elif name in {"nonempty_object", "no_tool_error", "no_nan_inf", "result_contract"}:
             category = "output_contract"
         elif name.startswith("has:") or name.endswith("_supported") or name in {
             "direction", "params_present", "requested_design_present",
@@ -182,6 +182,7 @@ def public_note_codes(items: list[str] | tuple[str, ...] | None) -> list[str]:
     public_codes = {
         "additional_verification_note", "distribution_assumption_warning",
         "low_power_warning", "studies_dropped_warning",
+        "oc_direction_criterion_not_met", "oc_separation_criterion_not_met",
     }
     for item in items or []:
         text = str(item)

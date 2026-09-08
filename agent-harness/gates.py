@@ -213,59 +213,26 @@ def check_single_endpoint(result: dict, config: dict) -> GateVerdict:
     notes: list[str] = []
     blocked: list[str] = []
 
-    # Sample-size sanity. Scope to the REQUESTED design and skip legitimate
-    # n=NA rows (search-cap exhaustion; compute_sample_size also emits auxiliary
-    # single_arm rows for controlled configs) — same NA semantics as
-    # check_sample_size: only a numeric non-positive n is a hard failure.
-    ss = result.get("sample_size")
-    if isinstance(ss, list) and ss:
-        req = (config or {}).get("design")
-        rows = [r for r in ss if isinstance(r, dict)
-                and (req is None or r.get("design") == req)]
-        sized = [r for r in rows
-                 if isinstance(r.get("n_total"), (int, float))
-                 and not isinstance(r.get("n_total"), bool)]
-        if sized:
-            row = sized[0]
-            n = row["n_total"]
-            checks["n_positive"] = n > 0
-            if n <= 0:
-                failures.append(f"n_total={n}, expected positive")
-            power = row.get("power_achieved")
-            target = row.get("power_target")
-            power_ok = (_num(power) and _num(target)
-                        and power >= target - 0.05)
-            checks["power_meets_target"] = power_ok
-            if not power_ok:
-                failures.append(
-                    f"power_achieved={power!r} does not meet power_target={target!r}"
-                )
-            # PARTIAL exhaustion must also be surfaced (mirrors check_sample_size):
-            # some alpha/power cells sized, others hit the search cap — the agent
-            # must report those cells as infeasible, not present the table as
-            # uniformly feasible.
-            exhausted = sum(1 for r in rows if r.get("n_total") is None)
-            if exhausted:
-                blocked.append(
-                    f"{exhausted} requested-design sizing cell(s) hit the engine "
-                    "search cap (n=NA) — report those alpha/power cells as "
-                    "infeasible within engine limits."
-                )
-        elif rows:
-            blocked.append(
-                "sample-size: every row for the requested design hit the engine "
-                "search cap (n=NA) — sizing infeasible within engine limits; "
-                "report that honestly"
-            )
-        else:
-            checks["sample_size_present"] = False
-            failures.append("no sample_size rows for the requested design")
-    else:
-        checks["sample_size_present"] = False
-        failures.append("no sample_size table in result")
+    # Sizing promises a design meeting its requested target. Validate every
+    # row, including integer allocation and honest search-limit statuses.
+    sizing = check_sample_size({"results": result.get("sample_size")}, config)
+    checks.update(sizing.checks)
+    failures.extend(sizing.failures)
+    notes.extend(sizing.notes)
+    blocked.extend(sizing.blocked)
 
     # #1 Direction + #2 Power separation from the OC curve.
     rows = _oc_rows(result.get("oc"))
+    if rows:
+        valid_probabilities = all(
+            _num(row.get("true_param")) and _num(row.get("p_go"))
+            and 0 <= row["p_go"] <= 1 for row in rows
+        )
+        checks["oc_probabilities_valid"] = valid_probabilities
+        if not valid_probabilities:
+            return GateVerdict(passed=False, checks=checks,
+                               failures=failures + ["OC probabilities are invalid"],
+                               notes=notes, blocked=blocked)
 
     # Any engine-generated OC payload that declares its simulation budget must
     # also carry uncertainty. Low precision is a transparent partial result,
@@ -339,19 +306,15 @@ def check_single_endpoint(result: dict, config: dict) -> GateVerdict:
         else:
             p_null = row_null["p_go"]
             p_alt = row_alt["p_go"]
-            # The effective scenario must Go more often than the null scenario.
-            checks["direction"] = p_alt > p_null
+            # These criteria describe design performance, not calculation
+            # correctness. Unfavorable seeded output remains reportable; it
+            # must never trigger retries until a favorable random result occurs.
+            checks["oc_performance_evaluated"] = True
             if p_alt <= p_null:
-                failures.append(
-                    f"direction wrong: p_go(alt={alt_p})={p_alt} <= p_go(null={null_p})={p_null}"
-                )
-            # Spec rule: p_go(alt) >= 3x p_go(null).
+                notes.append("oc_direction_criterion_not_met")
             sep_ok = p_alt >= 3 * p_null if p_null > 0 else p_alt > 0
-            checks["power_separation"] = sep_ok
             if not sep_ok:
-                failures.append(
-                    f"weak separation: p_go(alt)={p_alt} not >= 3x p_go(null)={p_null}"
-                )
+                notes.append("oc_separation_criterion_not_met")
             if p_alt < 0.2:
                 notes.append(f"p_go at the alternative is low ({p_alt}); design may be underpowered")
 
@@ -640,10 +603,9 @@ def check_sample_size(result: dict, config: dict) -> GateVerdict:
     PASS_PARTIAL and the agent reports infeasibility honestly instead of
     being told to "correct" a correct config.
 
-    Note: continuous/t-test rows echo power_achieved = power_target, so the
-    power check is structurally vacuous for that endpoint (documented, not a
-    defect). Combine with check_config_completeness(config) for the
-    direction/required-param check."""
+    Achieved power must describe the returned integer design, independently
+    of the requested target. Combine with check_config_completeness(config)
+    for the favorable-direction and required-parameter checks."""
     checks: dict[str, bool] = {}
     failures: list[str] = []
     blocked: list[str] = []
@@ -670,13 +632,31 @@ def check_sample_size(result: dict, config: dict) -> GateVerdict:
             continue
         n = r.get("n_total")
         is_req = requested is None or r.get("design") == requested
+        status = r.get("sizing_status")
+        if status is not None and (
+            status not in {"target_met", "search_limit_reached"}
+            or (status == "target_met" and n is None)
+            or (status == "search_limit_reached" and any(
+                r.get(field) is not None for field in
+                ("n_total", "n_trt", "n_ctrl", "power_achieved")
+            ))
+        ):
+            malformed += 1
+            continue
         if n is None:
             if is_req:
                 exhausted_req += 1
             else:
                 exhausted_aux += 1
             continue
-        if not (isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0):
+        minimum = 2 if (config or {}).get("endpoint_type") == "continuous" else 1
+        valid_n = _num(n) and n >= minimum and n == int(n)
+        if r.get("design") == "controlled" and (config or {}).get("endpoint_type"):
+            arms = (r.get("n_trt"), r.get("n_ctrl"))
+            valid_n = valid_n and all(
+                _num(arm) and arm >= minimum and arm == int(arm) for arm in arms
+            ) and sum(arms) == n
+        if not valid_n:
             bad_n += 1
             continue
         if is_req:
@@ -685,8 +665,8 @@ def check_sample_size(result: dict, config: dict) -> GateVerdict:
         tgt = r.get("power_target")
         # Only flag a row that falls short of ITS OWN target (a real defect), so a
         # deliberately low power target never false-fails.
-        if isinstance(pwr, (int, float)) and isinstance(tgt, (int, float)):
-            if pwr < tgt - 0.05:
+        if _num(pwr) and _num(tgt) and 0 <= pwr <= 1 and 0 < tgt < 1:
+            if pwr < tgt - 1e-6:
                 short_pwr += 1
         else:
             power_unchecked += 1
@@ -696,7 +676,7 @@ def check_sample_size(result: dict, config: dict) -> GateVerdict:
         failures.append(f"{malformed} malformed (non-dict) row(s) in the sample-size table")
     checks["n_positive_where_sized"] = bad_n == 0
     if bad_n:
-        failures.append(f"{bad_n} row(s) with non-positive numeric n_total (engine defect)")
+        failures.append(f"{bad_n} row(s) with invalid integer sample size or arm allocation (engine defect)")
     checks["power_meets_target"] = short_pwr == 0
     if short_pwr:
         failures.append(f"{short_pwr} row(s) where achieved power fell short of its target")

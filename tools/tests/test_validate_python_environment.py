@@ -129,11 +129,11 @@ with patch.object(module.platform, "system", return_value="Darwin"):
     darwin_pins = module.parse_hash_lock(real_lock)
 with patch.object(module.platform, "system", return_value="Linux"):
     linux_pins = module.parse_hash_lock(real_lock)
-checks["real_lock_keeps_51_darwin_requirements"] = (
-    len(darwin_pins) == 51 and "watchdog" not in darwin_pins
+checks["real_lock_keeps_50_darwin_requirements"] = (
+    len(darwin_pins) == 50 and "watchdog" not in darwin_pins
 )
 checks["real_lock_adds_only_pinned_watchdog_on_linux"] = (
-    len(linux_pins) == 52 and linux_pins == {**darwin_pins, "watchdog": "6.0.0"}
+    len(linux_pins) == 51 and linux_pins == {**darwin_pins, "watchdog": "6.0.0"}
 )
 
 for host in ("Darwin", "Linux"):
@@ -187,6 +187,14 @@ with tempfile.TemporaryDirectory() as directory:
         {"example": "1.0"}, distributions=[app, pip], environment_prefix=prefix,
     )
     checks["exact_lock_plus_explicit_toolchain_passes"] = result[0] == 1
+    with patch.object(module.metadata, "distributions", return_value=[app, pip]) as discover:
+        implicit = module.validate_installed_distributions(
+            {"example": "1.0"}, environment_prefix=prefix,
+        )
+        checks["default_distribution_discovery_omits_invalid_none_path"] = (
+            implicit == result and discover.call_args.args == ()
+            and discover.call_args.kwargs == {}
+        )
 
 with tempfile.TemporaryDirectory() as directory:
     prefix = Path(directory) / "venv"

@@ -128,6 +128,13 @@ v = check_sample_size({"results": [na_row]}, {"design": "single_arm"})
 check("ss_all_na_partial_not_fail", v.passed and v.blocked, str(v))
 v = check_sample_size({"results": [ok_row, na_row]}, {"design": "single_arm"})
 check("ss_partial_na_surfaced", v.passed and v.blocked, str(v))
+v = check_sample_size({"results": [dict(na_row, sizing_status="search_limit_reached")]},
+                      {"design": "single_arm"})
+check("ss_explicit_search_limit_is_reportable_partial", v.passed and v.blocked, str(v))
+for case, row in enumerate([dict(na_row, sizing_status="target_met"),
+                            dict(ok_row, sizing_status="search_limit_reached")]):
+    v = check_sample_size({"results": [row]}, {"design": "single_arm"})
+    check(f"ss_contradictory_sizing_status_{case}_rejected", not v.passed, str(v))
 
 short_row = dict(ok_row, power_achieved=0.5)
 v = check_sample_size({"results": [short_row]}, {"design": "single_arm"})
@@ -153,7 +160,27 @@ sim_bad = {"sample_size": [ok_row],
                   {"true_param": 0.4, "p_go": 0.1}]}
 v = check_single_endpoint(sim_bad, {"design": "single_arm",
                                     "null_param": 0.2, "alt_param": 0.4})
-check("se_inverted_oc_fails", not v.passed, str(v))
+check("se_unfavorable_oc_is_reportable_with_explicit_criteria", v.passed
+      and "oc_direction_criterion_not_met" in v.notes
+      and "oc_separation_criterion_not_met" in v.notes, str(v))
+for label, values in (("weak", (0.2, 0.4)), ("zero", (0, 0))):
+    poor = {"sample_size": [ok_row], "oc": [
+        {"true_param": 0.2, "p_go": values[0]},
+        {"true_param": 0.4, "p_go": values[1]}]}
+    verdict = check_single_endpoint(poor, good_bin)
+    check("se_" + label + "_design_does_not_trigger_retry", verdict.passed
+          and "oc_separation_criterion_not_met" in verdict.notes, str(verdict))
+for invalid in (-0.1, 1.1, "0.8", float("nan")):
+    broken = {"sample_size": [ok_row], "oc": [
+        {"true_param": 0.2, "p_go": 0.05}, {"true_param": 0.4, "p_go": invalid}]}
+    check("se_malformed_probability_still_fails_" + str(invalid),
+          not check_single_endpoint(broken, good_bin).passed)
+for counts in ((1, 2, 3), (2, 2, 5), (2.5, 3, 5.5)):
+    malformed = dict(ok_row, design="controlled", n_ctrl=counts[0],
+                     n_trt=counts[1], n_total=counts[2])
+    check("continuous_sizing_requires_valid_integer_arms_" + str(counts),
+          not check_sample_size({"results": [malformed]},
+                                {"design": "controlled", "endpoint_type": "continuous"}).passed)
 
 sim_partial = {"sample_size": [ok_row, na_row], "oc": sim_ok["oc"]}
 v = check_single_endpoint(sim_partial, {"design": "single_arm",

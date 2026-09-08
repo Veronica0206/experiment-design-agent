@@ -12,6 +12,119 @@ simulate_qdf_tte_data <- function(n, lambda, accrual_time, followup_time) {
 # Generic Quantitative Decision Framework — Bayesian Inference & Go/No-Go
 ###############################################################################
 
+# A bounded deterministic inner probability calculation is separate from outer
+# simulation uncertainty. QUADPACK error estimates are numerical diagnostics.
+QDF_POSTERIOR_MAX_EVALUATIONS <- 8192L
+QDF_POSTERIOR_ABS_TOL <- 1e-8
+
+.qdf_probability <- function(value, method, abs_error = 0, evaluations = 1L) {
+  if (!is.numeric(value) || length(value) != 1L || !is.finite(value) ||
+      value < -abs_error || value > 1 + abs_error)
+    stop("Posterior probability calculation is invalid", call. = FALSE)
+  list(probability = min(1, max(0, value)), method = method,
+       abs_error = abs_error, evaluations = as.integer(evaluations))
+}
+
+.qdf_integrate_probability <- function(f, thresholds = numeric(0)) {
+  evaluations <- 0L
+  bounded <- function(u) {
+    evaluations <<- evaluations + length(u)
+    if (evaluations > QDF_POSTERIOR_MAX_EVALUATIONS)
+      stop("Posterior quadrature exceeded its evaluation budget", call. = FALSE)
+    value <- f(u)
+    if (length(value) != length(u) || any(!is.finite(value)) || any(value < 0 | value > 1))
+      stop("Posterior quadrature integrand is invalid", call. = FALSE)
+    value
+  }
+  tolerance <- QDF_POSTERIOR_ABS_TOL
+  for (limit in c(64L, 128L)) {
+    result <- integrate(bounded, 0, 1, subdivisions = limit,
+                        rel.tol = tolerance, abs.tol = tolerance,
+                        stop.on.error = FALSE)
+    valid <- identical(result$message, "OK") && is.finite(result$abs.error) &&
+      result$abs.error <= tolerance
+    separated <- !length(thresholds) ||
+      all(abs(result$value - thresholds) > result$abs.error)
+    if (valid && separated)
+      return(.qdf_probability(result$value, "adaptive_quadrature", result$abs.error, evaluations))
+    tolerance <- 1e-11
+  }
+  stop("Posterior decision is unresolved at the bounded numerical precision", call. = FALSE)
+}
+
+beta_difference_probability <- function(a_trt, b_trt, a_ctrl, b_ctrl, delta = 0,
+                                        thresholds = numeric(0)) {
+  if (delta <= -1) return(.qdf_probability(1, "adaptive_quadrature", evaluations = 0L))
+  if (delta >= 1) return(.qdf_probability(0, "adaptive_quadrature", evaluations = 0L))
+  if (delta == 0 && a_trt == a_ctrl && b_trt == b_ctrl)
+    return(.qdf_probability(0.5, "adaptive_quadrature", evaluations = 0L))
+  # Average the wider posterior's CDF over the narrower posterior. The reverse
+  # direction can hide an almost discontinuous step near u=0/1 from QUADPACK.
+  width_t <- qbeta(.75, a_trt, b_trt) - qbeta(.25, a_trt, b_trt)
+  width_c <- qbeta(.75, a_ctrl, b_ctrl) - qbeta(.25, a_ctrl, b_ctrl)
+  if (width_t < width_c) {
+    return(.qdf_integrate_probability(function(u) {
+      pbeta(qbeta(u, a_trt, b_trt) - delta, a_ctrl, b_ctrl)
+    }, thresholds))
+  }
+  .qdf_integrate_probability(function(u) {
+    pbeta(qbeta(u, a_ctrl, b_ctrl) + delta, a_trt, b_trt, lower.tail = FALSE)
+  }, thresholds)
+}
+
+student_difference_probability <- function(post_trt, post_ctrl, delta = 0,
+                                           thresholds = numeric(0)) {
+  if (delta == 0 && identical(post_trt, post_ctrl))
+    return(.qdf_probability(0.5, "adaptive_quadrature", evaluations = 0L))
+  # Interquartile widths also exist when a Student posterior has no variance.
+  width_t <- post_trt$scale * qt(.75, post_trt$df)
+  width_c <- post_ctrl$scale * qt(.75, post_ctrl$df)
+  if (width_t < width_c) {
+    return(.qdf_integrate_probability(function(u) {
+      treatment <- post_trt$mu_n + post_trt$scale * qt(u, post_trt$df)
+      pt((treatment - delta - post_ctrl$mu_n) / post_ctrl$scale, post_ctrl$df)
+    }, thresholds))
+  }
+  .qdf_integrate_probability(function(u) {
+    control <- post_ctrl$mu_n + post_ctrl$scale * qt(u, post_ctrl$df)
+    pt((control + delta - post_trt$mu_n) / post_trt$scale,
+       post_trt$df, lower.tail = FALSE)
+  }, thresholds)
+}
+
+# Independent Gamma(shape, rate) variables have a scaled beta-prime ratio.
+# Its first moment exists iff the denominator shape is greater than one.
+gamma_ratio_probability <- function(shape_trt, rate_trt, shape_ctrl, rate_ctrl,
+                                    target = 1, lower.tail = TRUE) {
+  values <- c(shape_trt, rate_trt, shape_ctrl, rate_ctrl)
+  if (length(values) != 4L || any(!is.finite(values)) || any(values <= 0) ||
+      !is.numeric(target) || length(target) != 1L || !is.finite(target) || target < 0 ||
+      !is.logical(lower.tail) || length(lower.tail) != 1L || is.na(lower.tail))
+    stop("Gamma ratio requires positive finite shapes/rates and a nonnegative target", call. = FALSE)
+  boundary <- plogis(log(target) + log(rate_trt) - log(rate_ctrl))
+  .qdf_probability(pbeta(boundary, shape_trt, shape_ctrl, lower.tail = lower.tail), "scaled_beta_prime")
+}
+
+gamma_ratio_summary <- function(shape_trt, rate_trt, shape_ctrl, rate_ctrl,
+                                target = 1, lower.tail = TRUE) {
+  probability <- gamma_ratio_probability(shape_trt, rate_trt, shape_ctrl, rate_ctrl,
+                                         target, lower.tail)
+  log_scale <- log(rate_ctrl) - log(rate_trt)
+  # qf avoids the loss of the upper beta tail when qbeta rounds to one.
+  quantiles <- exp(log_scale + log(shape_trt) - log(shape_ctrl) +
+                     log(qf(c(0.025, 0.5, 0.975), 2 * shape_trt, 2 * shape_ctrl)))
+  if (any(!is.finite(quantiles)))
+    stop("Gamma ratio quantiles exceed the numerical range", call. = FALSE)
+  mean_status <- if (shape_ctrl > 1) "finite" else "does_not_exist"
+  ratio_mean <- if (shape_ctrl > 1)
+    exp(log(shape_trt) + log_scale - log(shape_ctrl - 1)) else NA_real_
+  if (shape_ctrl > 1 && !is.finite(ratio_mean))
+    stop("Gamma ratio mean exceeds the numerical range", call. = FALSE)
+  list(mean = ratio_mean, mean_status = mean_status, median = quantiles[2],
+       ci = quantiles[c(1, 3)], probability = probability$probability,
+       method = "scaled_beta_prime", abs_error = 0, evaluations = 1L)
+}
+
 # =============================================================================
 # BETA-BINOMIAL: SINGLE-ARM POSTERIOR
 # =============================================================================
@@ -38,22 +151,25 @@ bayes_binary_single_arm <- function(x, n, target, prior_a = 0.5, prior_b = 0.5) 
 
 bayes_binary_two_arm <- function(x_trt, n_trt, x_ctrl, n_ctrl, delta = 0,
                                  prior_a = 0.5, prior_b = 0.5,
-                                 n_mc = 100000, seed = NULL) {
+                                 n_mc = 100000, seed = NULL, decision_thresholds = numeric(0)) {
   if (!is.null(seed)) set.seed(seed)
   a_t <- prior_a + x_trt;  b_t <- prior_b + n_trt - x_trt
   a_c <- prior_a + x_ctrl; b_c <- prior_b + n_ctrl - x_ctrl
   theta_trt  <- rbeta(n_mc, a_t, b_t)
   theta_ctrl <- rbeta(n_mc, a_c, b_c)
   diff_draws <- theta_trt - theta_ctrl
+  probability <- beta_difference_probability(a_t, b_t, a_c, b_c, delta, decision_thresholds)
 
   list(
     x_trt = x_trt, n_trt = n_trt,
     x_ctrl = x_ctrl, n_ctrl = n_ctrl,
     delta = delta,
-    diff_mean   = round(mean(diff_draws), 4),
+    diff_mean   = round(a_t / (a_t + b_t) - a_c / (a_c + b_c), 4),
     diff_median = round(median(diff_draws), 4),
     diff_ci     = round(quantile(diff_draws, c(0.025, 0.975)), 4),
-    prob_above_delta = mean(diff_draws > delta)
+    prob_above_delta = probability$probability,
+    probability_method = probability$method,
+    probability_abs_error = probability$abs_error
   )
 }
 
@@ -62,15 +178,28 @@ bayes_binary_two_arm <- function(x_trt, n_trt, x_ctrl, n_ctrl, delta = 0,
 # =============================================================================
 
 nig_update <- function(x_bar, s2, n,
-                       mu0 = 0, kappa0 = 0.01,
-                       alpha0 = 0.5, beta0 = 0.5) {
+                       mu0 = 0, kappa0 = 0,
+                       alpha0 = 0, beta0 = 0) {
+  objective <- kappa0 == 0 && alpha0 == 0 && beta0 == 0
+  if (!is.finite(n) || n < 2 || n != floor(n) || !is.finite(s2) || s2 < 0 ||
+      !is.finite(x_bar) || any(!is.finite(c(mu0, kappa0, alpha0, beta0))) ||
+      (!objective && any(c(kappa0, alpha0, beta0) <= 0)))
+    stop("Normal posterior requires valid data and an objective or proper NIG prior", call. = FALSE)
+  if (objective && s2 <= 0)
+    stop("Joint Jeffreys normal posterior requires positive sample variance", call. = FALSE)
   kappa_n <- kappa0 + n
-  mu_n    <- (kappa0 * mu0 + n * x_bar) / kappa_n
+  mu_n    <- if (objective) x_bar else (kappa0 * mu0 + n * x_bar) / kappa_n
   alpha_n <- alpha0 + n / 2
   beta_n  <- beta0 + 0.5 * (n - 1) * s2 +
-             (kappa0 * n * (x_bar - mu0)^2) / (2 * kappa_n)
+             if (objective) 0 else (kappa0 * n * (x_bar - mu0)^2) / (2 * kappa_n)
+  if (any(!is.finite(c(mu_n, kappa_n, alpha_n, beta_n))) ||
+      any(c(kappa_n, alpha_n, beta_n) <= 0))
+    stop("Normal posterior exceeds the numerical range", call. = FALSE)
+  post_scale <- sqrt(beta_n / alpha_n / kappa_n)
+  if (!is.finite(post_scale) || post_scale <= 0 || !is.finite(2 * alpha_n))
+    stop("Normal posterior scale exceeds the numerical range", call. = FALSE)
   list(mu_n = mu_n, kappa_n = kappa_n, alpha_n = alpha_n, beta_n = beta_n,
-       df = 2 * alpha_n, scale = sqrt(beta_n / (alpha_n * kappa_n)))
+       df = 2 * alpha_n, scale = post_scale)
 }
 
 # =============================================================================
@@ -78,11 +207,11 @@ nig_update <- function(x_bar, s2, n,
 # =============================================================================
 
 bayes_continuous_single_arm <- function(x_bar, s2, n, target,
-                                        mu0 = 0, kappa0 = 0.01,
-                                        alpha0 = 0.5, beta0 = 0.5) {
+                                        mu0 = 0, kappa0 = 0,
+                                        alpha0 = 0, beta0 = 0) {
   post <- nig_update(x_bar, s2, n, mu0, kappa0, alpha0, beta0)
   t_stat  <- (target - post$mu_n) / post$scale
-  prob_go <- 1 - pt(t_stat, df = post$df)
+  prob_go <- pt(t_stat, df = post$df, lower.tail = FALSE)
   ci_lo <- post$mu_n + post$scale * qt(0.025, post$df)
   ci_hi <- post$mu_n + post$scale * qt(0.975, post$df)
 
@@ -102,21 +231,24 @@ bayes_continuous_single_arm <- function(x_bar, s2, n, target,
 bayes_continuous_two_arm <- function(x_bar_trt, s2_trt, n_trt,
                                      x_bar_ctrl, s2_ctrl, n_ctrl,
                                      delta = 0,
-                                     mu0 = 0, kappa0 = 0.01,
-                                     alpha0 = 0.5, beta0 = 0.5,
-                                     n_mc = 100000, seed = NULL) {
+                                     mu0 = 0, kappa0 = 0,
+                                     alpha0 = 0, beta0 = 0,
+                                     n_mc = 100000, seed = NULL, decision_thresholds = numeric(0)) {
   if (!is.null(seed)) set.seed(seed)
   post_t <- nig_update(x_bar_trt, s2_trt, n_trt, mu0, kappa0, alpha0, beta0)
   post_c <- nig_update(x_bar_ctrl, s2_ctrl, n_ctrl, mu0, kappa0, alpha0, beta0)
   mu_t <- post_t$mu_n + post_t$scale * rt(n_mc, df = post_t$df)
   mu_c <- post_c$mu_n + post_c$scale * rt(n_mc, df = post_c$df)
   diff_draws <- mu_t - mu_c
+  probability <- student_difference_probability(post_t, post_c, delta, decision_thresholds)
 
   list(
-    diff_mean   = round(mean(diff_draws), 4),
+    diff_mean   = round(post_t$mu_n - post_c$mu_n, 4),
     diff_median = round(median(diff_draws), 4),
     diff_ci     = round(quantile(diff_draws, c(0.025, 0.975)), 4),
-    prob_above_delta = mean(diff_draws > delta)
+    prob_above_delta = probability$probability,
+    probability_method = probability$method,
+    probability_abs_error = probability$abs_error
   )
 }
 
@@ -152,21 +284,15 @@ bayes_tte_two_arm <- function(events_trt, pt_trt, events_ctrl, pt_ctrl,
                               target_HR = 1,
                               prior_shape = 0.5, prior_rate = 1e-6,
                               n_mc = 100000, seed = NULL) {
-  if (!is.null(seed)) set.seed(seed)
-  lam_t <- rgamma(n_mc, prior_shape + events_trt, prior_rate + pt_trt)
-  lam_c <- rgamma(n_mc, prior_shape + events_ctrl, prior_rate + pt_ctrl)
-  hr_draws <- lam_t / lam_c  # HR < 1 = treatment benefit
-  prob_go <- mean(hr_draws < target_HR)
+  summary <- gamma_ratio_summary(prior_shape + events_trt, prior_rate + pt_trt,
+                                 prior_shape + events_ctrl, prior_rate + pt_ctrl,
+                                 target_HR)
+  list(events_trt = events_trt, pt_trt = pt_trt, events_ctrl = events_ctrl, pt_ctrl = pt_ctrl,
+       target_HR = target_HR, hr_mean = round(summary$mean, 4),
+       hr_mean_status = summary$mean_status, hr_median = round(summary$median, 4),
+       hr_ci = round(summary$ci, 4), prob_hr_below_target = summary$probability,
+       probability_method = summary$method, probability_abs_error = 0)
 
-  list(
-    events_trt = events_trt, pt_trt = pt_trt,
-    events_ctrl = events_ctrl, pt_ctrl = pt_ctrl,
-    target_HR = target_HR,
-    hr_mean   = round(mean(hr_draws), 4),
-    hr_median = round(median(hr_draws), 4),
-    hr_ci     = round(quantile(hr_draws, c(0.025, 0.975)), 4),
-    prob_hr_below_target = prob_go
-  )
 }
 
 # =============================================================================
@@ -218,34 +344,19 @@ bayes_rate_two_arm <- function(count_trt, exp_trt, count_ctrl, exp_ctrl,
                                prior_shape = 0.5, prior_rate = 1e-6,
                                n_mc = 100000, seed = NULL,
                                direction = "less") {
-  if (!is.null(seed)) set.seed(seed)
-  lam_t <- rgamma(n_mc, prior_shape + count_trt, prior_rate + exp_trt)
-  lam_c <- rgamma(n_mc, prior_shape + count_ctrl, prior_rate + exp_ctrl)
-  rr_draws <- lam_t / lam_c
-  # direction "less" (protective): success = P(RR < target_RR).
-  # direction "greater" (harm detection): success = P(RR > target_RR).
-  prob_met <- if (direction == "greater") {
-    mean(rr_draws > target_RR)
-  } else {
-    mean(rr_draws < target_RR)
-  }
-
-  out <- list(
-    count_trt = count_trt, exp_trt = exp_trt,
-    count_ctrl = count_ctrl, exp_ctrl = exp_ctrl,
-    target_RR = target_RR,
-    direction = direction,
-    rr_mean   = round(mean(rr_draws), 4),
-    rr_median = round(median(rr_draws), 4),
-    rr_ci     = round(quantile(rr_draws, c(0.025, 0.975)), 4),
-    prob_target_met = prob_met
-  )
-  if (direction == "greater") {
-    out$prob_rr_above_target <- out$prob_target_met
-  } else {
-    out$prob_rr_below_target <- out$prob_target_met
-  }
+  summary <- gamma_ratio_summary(prior_shape + count_trt, prior_rate + exp_trt,
+                                 prior_shape + count_ctrl, prior_rate + exp_ctrl,
+                                 target_RR, lower.tail = direction != "greater")
+  out <- list(count_trt = count_trt, exp_trt = exp_trt, count_ctrl = count_ctrl, exp_ctrl = exp_ctrl,
+              target_RR = target_RR, direction = direction,
+              rr_mean = round(summary$mean, 4), rr_mean_status = summary$mean_status,
+              rr_median = round(summary$median, 4), rr_ci = round(summary$ci, 4),
+              prob_target_met = summary$probability, probability_method = summary$method,
+              probability_abs_error = 0)
+  if (direction == "greater") out$prob_rr_above_target <- out$prob_target_met
+  else out$prob_rr_below_target <- out$prob_target_met
   out
+
 }
 
 # =============================================================================
@@ -300,7 +411,8 @@ compute_decision <- function(config, data, delta = NULL) {
       post <- bayes_binary_two_arm(data$x_trt, data$n_trt,
                                    data$x_ctrl, data$n_ctrl,
                                    delta = controlled_delta,
-                                   prior_a = pr$a, prior_b = pr$b)
+                                   prior_a = pr$a, prior_b = pr$b,
+                                   decision_thresholds = c(config$go_threshold, config$consider_threshold))
       dec <- classify_decision(post$prob_above_delta,
                                config$go_threshold, config$consider_threshold)
       return(c(post, dec))
@@ -319,7 +431,8 @@ compute_decision <- function(config, data, delta = NULL) {
                                        data$x_bar_ctrl, data$s2_ctrl, data$n_ctrl,
                                        delta = controlled_delta,
                                        mu0 = pr$mu0, kappa0 = pr$kappa0,
-                                       alpha0 = pr$alpha0, beta0 = pr$beta0)
+                                       alpha0 = pr$alpha0, beta0 = pr$beta0,
+                                       decision_thresholds = c(config$go_threshold, config$consider_threshold))
       dec <- classify_decision(post$prob_above_delta,
                                config$go_threshold, config$consider_threshold)
       return(c(post, dec))
@@ -374,27 +487,19 @@ compute_decision <- function(config, data, delta = NULL) {
 # OPERATING CHARACTERISTICS
 # =============================================================================
 
-#' Compute operating characteristics across a range of true parameter values
-#'
-#' @param config       A qdf_config object
-#' @param n            Sample size (single-arm) or list(n_trt=, n_ctrl=)
-#' @param true_params  Vector of true parameter values to evaluate
-#' @param B            Number of simulations per true value
-#' @return data.frame with decision probabilities and Monte Carlo uncertainty
-compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delta = NULL) {
-  if (!is.numeric(B) || length(B) != 1L || !is.finite(B) ||
-      B < 1 || B != floor(B)) {
-    stop("B must be one positive integer", call. = FALSE)
-  }
-  set.seed(seed)
-  pr <- config$prior_params
-  # Inner MC draws for two-arm posterior probability estimation.
-  # 5000 gives SE < 0.01 per replicate while keeping OC runtime manageable.
-  # For higher precision, increase B (outer replicates) rather than n_mc_oc.
-  n_mc_oc <- 5000
+validate_oc_grid <- function(config, true_params) {
+  if (!is.numeric(true_params) || !length(true_params) || length(true_params) > 64L ||
+      any(!is.finite(true_params)))
+    stop("OC grid requires 1 to 64 finite parameter values", call. = FALSE)
+  invalid <- switch(config$endpoint_type,
+    binary = any(true_params < 0 | true_params > 1),
+    continuous = FALSE, tte = any(true_params <= 0),
+    incidence_rate = any(true_params < 0), TRUE)
+  if (invalid) stop("OC grid is outside the endpoint domain", call. = FALSE)
+  sort(unique(true_params))
+}
 
-  # Default true_params grid
-  if (is.null(true_params)) {
+default_oc_grid <- function(config) {
     if (config$endpoint_type == "binary") {
       true_params <- seq(0.05, 0.95, by = 0.05)
     } else if (config$endpoint_type == "tte") {
@@ -415,7 +520,40 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
                          config$alt_param + rng * 0.5,
                          length.out = 20)
     }
+  validate_oc_grid(config, c(true_params, config$null_param, config$alt_param))
+}
+
+#' Compute operating characteristics across a range of true parameter values
+#'
+#' @param config       A qdf_config object
+#' @param n            Sample size (single-arm) or list(n_trt=, n_ctrl=)
+#' @param true_params  Vector of true parameter values to evaluate
+#' @param B            Number of simulations per true value
+#' @return data.frame with decision probabilities and Monte Carlo uncertainty
+compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delta = NULL) {
+  if (!is.numeric(B) || length(B) != 1L || !is.finite(B) ||
+      B < 1 || B != floor(B)) {
+    stop("B must be one positive integer", call. = FALSE)
   }
+  pr <- config$prior_params
+  if (!is.null(delta)) {
+    if (config$design != "controlled" || !config$endpoint_type %in% c("binary", "continuous"))
+      stop("delta is available only for controlled binary or continuous designs", call. = FALSE)
+    if (!is.numeric(delta) || length(delta) != 1L || !is.finite(delta) ||
+        (config$endpoint_type == "binary" && abs(delta) > 1))
+      stop("delta is outside the endpoint effect domain", call. = FALSE)
+  }
+  true_params <- if (is.null(true_params)) default_oc_grid(config) else validate_oc_grid(config, true_params)
+  inner_error_max <- 0
+  inner_evaluations_max <- 1L
+  record_probability <- function(result) {
+    inner_error_max <<- max(inner_error_max, result$abs_error)
+    inner_evaluations_max <<- max(inner_evaluations_max, result$evaluations)
+    result$probability
+  }
+  thresholds <- c(config$go_threshold, config$consider_threshold)
+  probability_cache <- new.env(parent = emptyenv(), hash = TRUE)
+  cache_size <- 0L
 
   results <- data.frame()
 
@@ -437,6 +575,7 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
          call. = FALSE)
   }
 
+  set.seed(seed)
   if (config$endpoint_type == "binary" && is_single_arm) {
     # Binary single-arm OC
     n_val <- if (is.list(n)) n$n_trt else n
@@ -468,8 +607,17 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
         x_c <- rbinom(1, n_ctrl_val, config$null_param)
         a_t <- pr$a + x_t; b_t <- pr$b + n_trt_val - x_t
         a_c <- pr$a + x_c; b_c <- pr$b + n_ctrl_val - x_c
-        diff <- rbeta(n_mc_oc, a_t, b_t) - rbeta(n_mc_oc, a_c, b_c)
-        prob <- mean(diff > go_delta)
+        key <- paste(x_t, x_c, sep = ":")
+        if (exists(key, probability_cache, inherits = FALSE)) {
+          probability <- get(key, probability_cache, inherits = FALSE)
+        } else {
+          probability <- beta_difference_probability(a_t, b_t, a_c, b_c, go_delta, thresholds)
+          if (cache_size < 10000L) {
+            assign(key, probability, probability_cache)
+            cache_size <- cache_size + 1L
+          }
+        }
+        prob <- record_probability(probability)
         decisions[b] <- if (prob >= config$go_threshold) "GO"
                         else if (prob >= config$consider_threshold) "CONSIDER"
                         else "NOGO"
@@ -498,11 +646,7 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
                              pr$mu0, pr$kappa0, pr$alpha0, pr$beta0)
         post_c <- nig_update(mean(y_ctrl), var(y_ctrl), n_ctrl_val,
                              pr$mu0, pr$kappa0, pr$alpha0, pr$beta0)
-        # MC draws from each posterior
-        mu_t_draws <- post_t$mu_n + post_t$scale * rt(n_mc_oc, df = post_t$df)
-        mu_c_draws <- post_c$mu_n + post_c$scale * rt(n_mc_oc, df = post_c$df)
-        diff_draws <- mu_t_draws - mu_c_draws
-        prob <- mean(diff_draws > go_delta)
+        prob <- record_probability(student_difference_probability(post_t, post_c, go_delta, thresholds))
         decisions[b] <- if (prob >= config$go_threshold) "GO"
                         else if (prob >= config$consider_threshold) "CONSIDER"
                         else "NOGO"
@@ -576,10 +720,8 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
                                        config$accrual_time, config$followup_time)
         d_t <- tte_t$events; pt_t <- sum(tte_t$time)
         d_c <- tte_c$events; pt_c <- sum(tte_c$time)
-        lam_t_draws <- rgamma(n_mc_oc, pr$shape + d_t, pr$rate + pt_t)
-        lam_c_draws <- rgamma(n_mc_oc, pr$shape + d_c, pr$rate + pt_c)
-        hr_draws <- lam_t_draws / lam_c_draws
-        prob <- mean(hr_draws < target_HR)
+        prob <- record_probability(gamma_ratio_probability(pr$shape + d_t, pr$rate + pt_t,
+                                    pr$shape + d_c, pr$rate + pt_c, target_HR))
         decisions[b] <- if (prob >= config$go_threshold) "GO"
                         else if (prob >= config$consider_threshold) "CONSIDER"
                         else "NOGO"
@@ -631,11 +773,9 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
         y_t <- sum(rpois(n_trt_val, lam_trt * T_exp))
         y_c <- sum(rpois(n_ctrl_val, config$null_param * T_exp))
         exp_t <- n_trt_val * T_exp; exp_c <- n_ctrl_val * T_exp
-        lam_t_draws <- rgamma(n_mc_oc, pr$shape + y_t, pr$rate + exp_t)
-        lam_c_draws <- rgamma(n_mc_oc, pr$shape + y_c, pr$rate + exp_c)
-        rr_draws <- lam_t_draws / lam_c_draws
-        prob <- if (rate_dir == "greater") mean(rr_draws > target_RR)
-                else mean(rr_draws < target_RR)
+        prob <- record_probability(gamma_ratio_probability(pr$shape + y_t, pr$rate + exp_t,
+                                    pr$shape + y_c, pr$rate + exp_c, target_RR,
+                                    lower.tail = rate_dir != "greater"))
         decisions[b] <- if (prob >= config$go_threshold) "GO"
                         else if (prob >= config$consider_threshold) "CONSIDER"
                         else "NOGO"
@@ -669,6 +809,16 @@ compute_oc <- function(config, n, true_params = NULL, B = 10000, seed = 42, delt
   results$mc_worst_case_se <- round(0.5 / sqrt(B), 6)
   results$mc_precision_target_se <- precision_target
   results$mc_precision_ok <- (0.5 / sqrt(B)) <= precision_target
+  quadrature <- !is_single_arm && config$endpoint_type %in% c("binary", "continuous")
+  results$inner_probability_method <- if (quadrature) "adaptive_quadrature" else
+    if (config$endpoint_type == "binary") "analytic_beta_cdf" else
+    if (config$endpoint_type == "continuous") "student_t_cdf" else
+    if (is_single_arm) "gamma_cdf" else "scaled_beta_prime"
+  results$inner_probability_abs_error_max <- inner_error_max
+  results$inner_probability_evaluations_max <- inner_evaluations_max
+  results$inner_probability_tolerance <- if (quadrature) QDF_POSTERIOR_ABS_TOL else 0
+  results$inner_probability_max_evaluations <- if (quadrature) QDF_POSTERIOR_MAX_EVALUATIONS else 1L
+  results$inner_precision_ok <- TRUE
 
   return(results)
 }

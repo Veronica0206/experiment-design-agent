@@ -21,6 +21,20 @@ params <- jsonlite::fromJSON(input_file, simplifyVector = TRUE)
 this_script <- sub("--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE)[1])
 suite_root <- normalizePath(file.path(dirname(this_script), "..", ".."), mustWork = TRUE)
 
+# This version is shared with the verifier/renderer and fingerprinted as
+# executable runtime input. Never emit an independently invented version.
+result_contract_version <- function() {
+  path <- file.path(suite_root, "governance", "single-endpoint-result-contract.json")
+  info <- file.info(path)
+  if (is.na(info$size) || info$isdir || info$size > 65536 || nzchar(Sys.readlink(path)))
+    stop("single-endpoint result contract is unavailable")
+  contract <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+  if (!identical(contract$schema_version, 1L) ||
+      !identical(contract$result_contract_version, 1L))
+    stop("single-endpoint result contract version is unsupported")
+  contract$result_contract_version
+}
+
 source_skill <- function(skill, ...) {
   if (!skill %in% runtime_profile$skills) stop("Statistical engine is unavailable in this runtime profile")
   skill_r <- file.path(suite_root, skill, "scripts", "R")
@@ -54,11 +68,13 @@ write_result <- function(result) {
       paste(utils::head(bad, 5), collapse = ", "),
       if (length(bad) > 5) paste0(" (+", length(bad) - 5, " more)") else "",
       " — computation is invalid"))
-    json <- jsonlite::toJSON(result, auto_unbox = TRUE, pretty = TRUE, na = "null")
+    json <- jsonlite::toJSON(result, auto_unbox = TRUE, pretty = TRUE, na = "null", digits = 17)
     writeLines(json, output_file)
     quit(status = 1)
   }
-  json <- jsonlite::toJSON(result, auto_unbox = TRUE, pretty = TRUE, na = "null")
+  # Preserve double precision through the public scientific contract, including
+  # small numerical-error diagnostics; jsonlite's default rounds decimals.
+  json <- jsonlite::toJSON(result, auto_unbox = TRUE, pretty = TRUE, na = "null", digits = 17)
   writeLines(json, output_file)
 }
 
@@ -184,6 +200,7 @@ tryCatch({
         alphas = cfg$alphas,
         powers = cfg$powers,
         prior_params = cfg$prior_params,
+        prior_method = cfg$prior_method,
         go_threshold = cfg$go_threshold,
         consider_threshold = cfg$consider_threshold,
         go_target = cfg$go_target,
@@ -205,7 +222,7 @@ tryCatch({
     source_skill("vera-experiment-designing", "config.R", "sample_size.R", "run_framework.R")
     cfg <- do.call(create_config, params)
     ss <- compute_sample_size(cfg)
-    write_result(list(results = ss))
+    write_result(list(results = ss, result_contract_version = result_contract_version()))
 
   } else if (tool_name == "simulate_design") {
     source_skill("vera-experiment-designing",
@@ -244,10 +261,30 @@ tryCatch({
       stop("requested OC workload exceeds the 10,000,000 simulated-unit limit",
            call. = FALSE)
     }
-    oc <- compute_oc(cfg, n = n_oc, B = B_used, seed = seed, delta = delta)
+    grid <- default_oc_grid(cfg)
+    scenario_count <- length(grid)
+    simulated_units <- n_units * B_used * scenario_count
+    posterior_cost <- if (cfg$design == "controlled" &&
+                          cfg$endpoint_type %in% c("binary", "continuous")) {
+      QDF_POSTERIOR_MAX_EVALUATIONS
+    } else 1
+    posterior_work <- scenario_count * B_used * posterior_cost
+    if (!is.finite(simulated_units) || simulated_units > 100000000 ||
+        !is.finite(posterior_work) || posterior_work > 1000000000) {
+      stop("requested OC workload exceeds the bounded scenario or posterior evaluation budget",
+           call. = FALSE)
+    }
+    oc <- compute_oc(cfg, n = n_oc, true_params = grid,
+                     B = B_used, seed = seed, delta = delta)
 
     result <- list(sample_size = ss, oc = oc, seed = seed,
-                   B_used = B_used, n_oc_used = n_oc)
+                   result_contract_version = result_contract_version(),
+                   B_used = B_used, n_oc_used = n_oc,
+                   workload = list(scenario_count = scenario_count, replicates = B_used,
+                     simulated_units = simulated_units,
+                     posterior_evaluation_upper_bound = posterior_work,
+                     max_simulated_units = 100000000,
+                     max_posterior_evaluations = 1000000000))
 
     if (cfg$study_type == "confirmatory" && !is.null(cfg$p2_data)) {
       source(file.path(suite_root, "vera-experiment-designing", "scripts", "R", "ppos.R"))

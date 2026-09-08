@@ -30,7 +30,7 @@ EXPECTED_AUTHOR_NAME = "VERA Public Release"
 EXPECTED_AUTHOR_EMAIL = "Veronica0206@users.noreply.github.com"
 EXPECTED_COMMIT_MESSAGE = "Sync reviewed public portfolio distribution"
 EXPECTED_PUBLIC_ASSURANCE_SHA256 = (
-    "f5f0ef80ef31a52e13d35c5cf159438645797cee6b7d12f8e5cd3b508c949e25"
+    '138518ce02c74b207c91eaef8b3c872cc7b4176c2aa4e668ed19c1b09cd5afee'
 )
 APPROVED_GIT_PATHS = {
     "/usr/bin/git",

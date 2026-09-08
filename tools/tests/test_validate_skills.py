@@ -38,7 +38,7 @@ def make_skill(root: Path, r_source: str, prompts: object | None = None) -> Path
 
 def run(skill: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(VALIDATOR), str(skill)],
+        [sys.executable, "-B", str(VALIDATOR), str(skill)],
         capture_output=True, text=True, check=False,
     )
 

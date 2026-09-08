@@ -2,4 +2,4 @@
 # `requirements.lock` contains the fully resolved, hash-locked environment.
 anthropic==0.116.0
 pyyaml==6.0.3
-streamlit==1.50.0
+streamlit==1.63.0

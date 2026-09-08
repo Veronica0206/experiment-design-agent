@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 from itertools import combinations
+from pathlib import Path
 from typing import Any, Iterable
 
 from verification import (PUBLIC_LIMITATION_MESSAGES, canonical_value,
@@ -28,6 +29,22 @@ from verification import (PUBLIC_LIMITATION_MESSAGES, canonical_value,
 # Matching is case-insensitive at the private boundary; public output always
 # uses these canonical lowercase names.
 DESIGN_METADATA_COLUMNS = frozenset({"point_type", "run", "std_order"})
+
+SINGLE_ENDPOINT_CONTRACT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "governance" / "single-endpoint-result-contract.json"
+)
+SINGLE_ENDPOINT_RESULT_CONTRACT = json.loads(
+    SINGLE_ENDPOINT_CONTRACT_PATH.read_text(encoding="utf-8")
+)
+if (
+    type(SINGLE_ENDPOINT_RESULT_CONTRACT.get("schema_version")) is not int
+    or SINGLE_ENDPOINT_RESULT_CONTRACT["schema_version"] != 1
+    or SINGLE_ENDPOINT_RESULT_CONTRACT.get("result_contract_version") != 1
+    or set(SINGLE_ENDPOINT_RESULT_CONTRACT.get("result_types", {}))
+    != {"sample_size_row", "oc_row", "ppos_result"}
+):
+    raise ValueError("unsupported single-endpoint result contract")
 
 
 def normalized_design_metadata_column(value: Any) -> str | None:
@@ -87,15 +104,19 @@ _ENUM_VALUES = {
     "type": {"full_factorial", "fractional_factorial", "central_composite", "box_behnken"},
     "umbrella_method": {"mams", "drop_the_losers", "bayesian_adaptive_randomization"},
 }
+for _field, _values in SINGLE_ENDPOINT_RESULT_CONTRACT["enums"].items():
+    _ENUM_VALUES.setdefault(_field, set()).update(_values)
 
 _BOOLEAN_FIELDS = {
     "interim_efficacy_enabled", "interim_futility_enabled",
     "interim_stopping_applied", "orthogonal", "power_precision_met",
     "precision_met", "random", "randomize", "rar_enabled",
     "reject_precision_met", "shared_control", "truly_active",
+    "mc_precision_ok", "inner_precision_ok",
 }
 
 _PRIOR_NAMES = {"jeffreys", "flat", "skeptical"}
+_ENUM_VALUES["prior"] = set(_PRIOR_NAMES)
 _CUSTOM_PRIOR_FIELDS = {
     "a", "b", "mu0", "kappa0", "alpha0", "beta0", "shape", "rate",
 }
@@ -155,7 +176,7 @@ _SINGLE_CONFIG = {
     "endpoint_type", "study_type", "design", "null_param", "alt_param", "sd",
     "alloc_ratio", "alphas", "powers", "go_threshold", "consider_threshold",
     "go_target", "accrual_time", "followup_time", "exposure_time", "tte_method",
-    "rate_method", "prior",
+    "rate_method", "prior", "prior_method", "prior_params",
 }
 _SAMPLE_ROW = {
     "design", "test", "alpha", "power_target", "power_achieved", "n", "n_total",
@@ -174,6 +195,11 @@ _PPOS_FIELDS = {
     "cond_power_mean", "cond_power_median", "cond_power_q25",
     "cond_power_q75",
 }
+_SAMPLE_ROW.update(SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"]["sample_size_row"]["required"])
+_SAMPLE_ROW.update(SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"]["sample_size_row"]["optional"])
+_OC_ROW.update(SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"]["oc_row"]["required"])
+_PPOS_FIELDS.update(SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"]["ppos_result"]["required"])
+_PPOS_FIELDS.update(SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"]["ppos_result"]["optional"])
 _MASTER_ROW = {
     "subgroup", "arm", "scenario", "estimate", "se", "lower", "upper", "power",
     "reject_rate", "fwer", "type1_error", "n", "n_total", "decision", "stage",
@@ -201,14 +227,24 @@ _SOURCE_EFFECT_ROW = _BUCHER_ROW | {
 # Mapping path -> exact fields permitted at that mapping.  List rows use the
 # same path as the containing list (for example ("results",)).
 _RESULT_FIELDS_BY_PATH: dict[str, dict[tuple[str, ...], set[str]]] = {
-    "validate_config": {(): set(_SINGLE_CONFIG)},
-    "sample_size": {(): {"results"}, ("results",): set(_SAMPLE_ROW)},
+    "validate_config": {
+        (): set(_SINGLE_CONFIG), ("prior_params",): set(_CUSTOM_PRIOR_FIELDS),
+    },
+    "sample_size": {
+        (): {"results", "result_contract_version"}, ("results",): set(_SAMPLE_ROW),
+    },
     "simulate_design": {
-        (): {"sample_size", "oc", "ppos", "seed", "b_used", "n_oc_used"},
+        (): {"sample_size", "oc", "ppos", "seed", "b_used", "n_oc_used",
+             "result_contract_version", "workload"},
         ("sample_size",): set(_SAMPLE_ROW),
         ("oc",): set(_OC_ROW),
         ("ppos",): set(_PPOS_FIELDS),
         ("n_oc_used",): {"n", "n_trt", "n_ctrl"},
+        ("workload",): {
+            "scenario_count", "replicates", "simulated_units",
+            "posterior_evaluation_upper_bound", "max_simulated_units",
+            "max_posterior_evaluations",
+        },
     },
     "master_simulate": {
         (): {"result"},
@@ -339,6 +375,8 @@ _NUMERIC_SEQUENCE_PATHS = {
     ("simulate_design", "result", ("ppos", "p2_post_ci")),
     ("simulate_design", "result", ("ppos", "p2_trt_post")),
     ("simulate_design", "result", ("ppos", "p2_ctrl_post")),
+    ("simulate_design", "result", ("ppos", "hr_post_ci")),
+    ("simulate_design", "result", ("ppos", "rr_post_ci")),
 }
 
 _SUMMARY_PATHS = {
@@ -388,6 +426,203 @@ def _number(value: Any) -> Any:
     if isinstance(value, float) and (value != value or value in {float("inf"), float("-inf")}):
         return _DROP
     return value
+
+
+def _contract_value_valid(field: str, value: Any, kind: str) -> bool:
+    if kind == "enum":
+        return (
+            isinstance(value, str)
+            and value in SINGLE_ENDPOINT_RESULT_CONTRACT["enums"].get(field, [])
+        )
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind.startswith("nullable_"):
+        return value is None or _contract_value_valid(field, value, kind[9:])
+    if kind == "nonnegative_pair":
+        return (
+            isinstance(value, list) and len(value) == 2
+            and all(_contract_value_valid(field, item, "nonnegative") for item in value)
+            and value[0] <= value[1]
+        )
+    number = _number(value)
+    if number is _DROP:
+        return False
+    if kind == "number":
+        return True
+    if kind == "probability":
+        return 0 <= number <= 1
+    if kind == "open_probability":
+        return 0 < number < 1
+    if kind == "nonnegative":
+        return number >= 0
+    if kind == "positive":
+        return number > 0
+    if kind in {"positive_integer", "nonnegative_integer"}:
+        return (
+            number >= (1 if kind == "positive_integer" else 0)
+            and number == math.floor(number)
+        )
+    return False
+
+
+def single_endpoint_contract_errors(
+    tool: str, result: Any, arguments: dict[str, Any] | None = None,
+) -> list[str]:
+    """Validate complete scientific DTOs without interpreting private text.
+
+    Unlike privacy_safe_view(), this is a presentation admission check, not a
+    generic partial-object projection. Its fixed errors contain no result values,
+    labels or unapproved field names. Unrelated tool contracts are unaffected.
+    """
+    if tool not in {"sample_size", "simulate_design"}:
+        return []
+    errors: set[str] = set()
+    if (
+        not isinstance(result, dict)
+        or type(result.get("result_contract_version")) is not int
+        or result["result_contract_version"]
+        != SINGLE_ENDPOINT_RESULT_CONTRACT["result_contract_version"]
+    ):
+        return ["single_endpoint_contract:version"]
+
+    def record(value: Any, name: str) -> bool:
+        definition = SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"][name]
+        if not isinstance(value, dict):
+            errors.add(f"single_endpoint_contract:{name}_shape")
+            return False
+        valid = True
+        for field, kind in definition["required"].items():
+            if field not in value or not _contract_value_valid(field, value[field], kind):
+                errors.add(f"single_endpoint_contract:{name}_required")
+                valid = False
+        for field, kind in definition["optional"].items():
+            if field in value and not _contract_value_valid(field, value[field], kind):
+                errors.add(f"single_endpoint_contract:{name}_optional")
+                valid = False
+        return valid
+
+    sample_key = "results" if tool == "sample_size" else "sample_size"
+    samples = result.get(sample_key)
+    if not isinstance(samples, list) or not 1 <= len(samples) <= 200:
+        errors.add("single_endpoint_contract:sample_size_rows")
+    else:
+        for row in samples:
+            if not record(row, "sample_size_row"):
+                continue
+            if row["sizing_status"] == "search_limit_reached":
+                if any(row.get(field) is not None for field in (
+                    "n_total", "n_trt", "n_ctrl", "power_achieved",
+                )):
+                    errors.add("single_endpoint_contract:unavailable_sample_size")
+                continue
+            if any(not _contract_value_valid(field, row[field], kind) for field, kind in (
+                ("n_total", "positive_integer"), ("n_trt", "positive_integer"),
+                ("power_achieved", "probability"),
+            )):
+                errors.add("single_endpoint_contract:available_sample_size")
+            if row["design"] == "controlled" and not _contract_value_valid(
+                "n_ctrl", row.get("n_ctrl"), "positive_integer",
+            ):
+                errors.add("single_endpoint_contract:controlled_sample_size")
+
+    if tool == "simulate_design":
+        budgets = [result[key] for key in ("B_used", "b_used") if key in result]
+        budget = budgets[0] if len(budgets) == 1 else None
+        if not _contract_value_valid("b_used", budget, "positive_integer"):
+            errors.add("single_endpoint_contract:oc_budget")
+        rows = result.get("oc")
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 200:
+            errors.add("single_endpoint_contract:oc_rows")
+        else:
+            for row in rows:
+                if not record(row, "oc_row"):
+                    continue
+                if row["mc_replicates"] != budget:
+                    errors.add("single_endpoint_contract:oc_budget")
+                for probability in ("p_go", "p_consider", "p_nogo"):
+                    if not (
+                        row[f"{probability}_mc_lower"] - 1e-6
+                        <= row[probability]
+                        <= row[f"{probability}_mc_upper"] + 1e-6
+                    ):
+                        errors.add("single_endpoint_contract:oc_interval")
+        ppos = result.get("ppos")
+        if ppos is not None:
+            if record(ppos, "ppos_result"):
+                if ppos["n_mc"] < 2 or not (
+                    ppos["ppos_mc_lower"] - 1e-6
+                    <= ppos["ppos"] <= ppos["ppos_mc_upper"] + 1e-6
+                ):
+                    errors.add("single_endpoint_contract:ppos_interval")
+                draws = ppos.get("cond_power_draws")
+                if "cond_power_draws" in ppos and (
+                    not isinstance(draws, list) or len(draws) != ppos["n_mc"]
+                    or any(not _contract_value_valid("ppos", draw, "probability") for draw in draws)
+                ):
+                    errors.add("single_endpoint_contract:ppos_draws")
+                for ratio in ("hr", "rr"):
+                    mean = f"{ratio}_post_mean"
+                    status = f"{mean}_status"
+                    fields = {mean, status, f"{ratio}_post_median",
+                              f"{ratio}_post_ci", "ratio_summary_method"}
+                    if fields.intersection(ppos.keys()) - {"ratio_summary_method"}:
+                        if not fields <= ppos.keys() or (
+                            ppos.get(status) == "does_not_exist"
+                            and ppos.get(mean) is not None
+                        ) or (
+                            ppos.get(status) == "finite"
+                            and ppos.get(mean) is None
+                        ):
+                            errors.add("single_endpoint_contract:ratio_summary")
+        config = (arguments or {}).get("config") or {}
+        if (
+            isinstance(config, dict) and config.get("study_type") == "confirmatory"
+            and config.get("p2_data") is not None and config.get("p3_n") is not None
+            and ppos is None
+        ):
+            errors.add("single_endpoint_contract:missing_ppos")
+        workload = result.get("workload")
+        if workload is not None:
+            fields = _RESULT_FIELDS_BY_PATH["simulate_design"][("workload",)]
+            if (
+                not isinstance(workload, dict) or not fields <= workload.keys()
+                or any(not _contract_value_valid(
+                    field, workload[field], "nonnegative_integer",
+                ) for field in fields)
+                or not isinstance(rows, list)
+                or workload.get("scenario_count") != len(rows)
+                or workload.get("replicates") != budget
+            ):
+                errors.add("single_endpoint_contract:workload")
+    if not errors:
+        projected = privacy_safe_view(tool, result)
+        pairs = [
+            (raw, public, "sample_size_row")
+            for raw, public in zip(samples, projected.get(sample_key, []))
+        ]
+        if len(projected.get(sample_key, [])) != len(samples):
+            errors.add("single_endpoint_contract:projection_loss")
+        if tool == "simulate_design":
+            public_rows = projected.get("oc", [])
+            if len(public_rows) != len(result["oc"]):
+                errors.add("single_endpoint_contract:projection_loss")
+            pairs.extend(
+                (raw, public, "oc_row")
+                for raw, public in zip(result["oc"], public_rows)
+            )
+            if result.get("ppos") is not None:
+                pairs.append((result["ppos"], projected.get("ppos", {}), "ppos_result"))
+        for raw, public, name in pairs:
+            definition = SINGLE_ENDPOINT_RESULT_CONTRACT["result_types"][name]
+            scientific_fields = set(definition["required"]) | (
+                set(definition["optional"]) & raw.keys()
+            )
+            if any(
+                field not in public or canonical_value(public[field]) != canonical_value(raw[field])
+                for field in scientific_fields
+            ):
+                errors.add("single_endpoint_contract:projection_loss")
+    return sorted(errors)
 
 
 def _bounded_sequence(
@@ -886,6 +1121,204 @@ def _validate_presentable_envelope(envelope: dict[str, Any]) -> None:
         raise ValueError("verification envelope contains failed checks")
 
 
+def _display_number(value: Any) -> str:
+    if value is None:
+        return "Unavailable"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return format(value, ".8g")
+
+
+def _report_table(headers: list[str], rows: list[list[str]]) -> str:
+    return "\n".join([
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+        *("| " + " | ".join(row) + " |" for row in rows),
+    ])
+
+
+def _single_endpoint_readable_result(
+    tool: str, assumptions: dict[str, Any], result: dict[str, Any],
+    envelope: dict[str, Any],
+) -> str:
+    """Render only approved identifiers and verified numbers, never engine prose."""
+    if tool not in {"sample_size", "simulate_design"} or "result_contract_version" not in result:
+        return ""
+    if single_endpoint_contract_errors(tool, result, assumptions):
+        raise ValueError("single-endpoint readable report contract failed")
+    samples = result["results" if tool == "sample_size" else "sample_size"]
+    unavailable_sizes = any(row["sizing_status"] == "search_limit_reached" for row in samples)
+    sections = [
+        "## Statistical summary",
+        "Display values are rounded; the structured result below retains their full precision.",
+        _report_table(
+            ["Design", "Sizing test", "Alpha", "Target power", "Achieved power",
+             "Treatment n", "Control n", "Total n", "Sizing status"],
+            [
+                [row["design"], row["test"],
+                 *(_display_number(row.get(key)) for key in (
+                     "alpha", "power_target", "power_achieved", "n_trt", "n_ctrl", "n_total",
+                 )), row["sizing_status"]]
+                for row in samples
+            ],
+        ),
+    ]
+    if unavailable_sizes:
+        sections.append(
+            "Search-limit rows have no available sample size or achieved power. "
+            "Their target power is a request, not an achieved result; no design is "
+            "validated for those rows."
+        )
+    assessment = "Not assessed by OC criteria for this deterministic sizing result."
+    if tool == "simulate_design":
+        rows = result["oc"]
+        sections.extend([
+            "### Operating characteristics",
+            "Intervals below are 95% Monte Carlo intervals for the simulated decision "
+            "frequencies. They do not establish that the study assumptions are appropriate.",
+            _report_table(
+                ["True parameter", "GO [95% MC interval]", "CONSIDER [95% MC interval]",
+                 "NO-GO [95% MC interval]", "Replicates"],
+                [
+                    [_display_number(row["true_param"]),
+                     *(
+                         f'{_display_number(row[name])} '
+                         f'[{_display_number(row[name + "_mc_lower"])}, '
+                         f'{_display_number(row[name + "_mc_upper"])}]'
+                         for name in ("p_go", "p_consider", "p_nogo")
+                     ), _display_number(row["mc_replicates"])]
+                    for row in rows
+                ],
+            ),
+            "### Monte Carlo precision",
+            _report_table(
+                ["True parameter", "GO MC SE", "CONSIDER MC SE", "NO-GO MC SE",
+                 "Worst-case SE", "Target SE", "Outer precision met"],
+                [
+                    [_display_number(row[key]) for key in (
+                        "true_param", "p_go_mcse", "p_consider_mcse", "p_nogo_mcse",
+                        "mc_worst_case_se", "mc_precision_target_se", "mc_precision_ok",
+                    )]
+                    for row in rows
+                ],
+            ),
+            "Outer Monte Carlo error and inner posterior-probability integration error "
+            "are separate. Inner maxima summarize the reported computation.",
+            _report_table(
+                ["True parameter", "Inner probability method", "Maximum absolute error",
+                 "Tolerance", "Maximum evaluations", "Evaluation limit", "Inner precision met"],
+                [
+                    [_display_number(row["true_param"]), row["inner_probability_method"],
+                     *(_display_number(row[key]) for key in (
+                         "inner_probability_abs_error_max", "inner_probability_tolerance",
+                         "inner_probability_evaluations_max", "inner_probability_max_evaluations",
+                         "inner_precision_ok",
+                     ))]
+                    for row in rows
+                ],
+            ),
+        ])
+        config = assumptions.get("config") or {}
+        null = config.get("null_param")
+        alternative = config.get("alt_param")
+        anchors: list[dict[str, Any]] = []
+        if _number(null) is not _DROP and _number(alternative) is not _DROP:
+            for anchor in (null, alternative):
+                found = [row for row in rows if math.isclose(
+                    row["true_param"], anchor, rel_tol=1e-12, abs_tol=1e-12,
+                )]
+                if len(found) == 1:
+                    anchors.append(found[0])
+        if len(anchors) == 2:
+            p_null, p_alt = [row["p_go"] for row in anchors]
+            direction_met = p_alt > p_null
+            separation_met = p_alt >= 3 * p_null if p_null > 0 else p_alt > 0
+            assessment = (
+                ("Meets" if direction_met and separation_met else "Does not meet")
+                + " the selected OC heuristics; this is a design-performance assessment, "
+                "not a calculation-validity judgment."
+            )
+            sections.extend([
+                "### Design-performance assessment",
+                _report_table(
+                    ["Selected heuristic", "Null GO", "Alternative GO", "Met"],
+                    [
+                        ["Alternative GO exceeds null GO", _display_number(p_null),
+                         _display_number(p_alt), _display_number(direction_met)],
+                        ["Alternative GO is at least 3 times null GO (positive if null GO is zero)",
+                         _display_number(p_null), _display_number(p_alt),
+                         _display_number(separation_met)],
+                    ],
+                ),
+                assessment + " These heuristics are not universal scientific acceptance "
+                "criteria. An unfavorable result is retained for design review.",
+            ])
+        else:
+            assessment = "Not assessed: the exact null and alternative OC anchors were unavailable."
+        ppos = result.get("ppos")
+        if ppos is not None:
+            sections.extend([
+                "### Predictive probability of success",
+                f'Confirmatory test: {ppos["confirmatory_test"]}. '
+                f'Prior method: {ppos["prior_method"]}.',
+                _report_table(
+                    ["PPOS", "95% MC interval", "Posterior draws", "MC SE", "Worst-case SE",
+                     "Target SE", "Precision met"],
+                    [[_display_number(ppos["ppos"]),
+                      f'[{_display_number(ppos["ppos_mc_lower"])}, '
+                      f'{_display_number(ppos["ppos_mc_upper"])}]',
+                      *(_display_number(ppos[key]) for key in (
+                          "n_mc", "ppos_mcse", "mc_worst_case_se",
+                          "mc_precision_target_se", "mc_precision_ok",
+                      ))]],
+                ),
+                "This interval describes Monte Carlo estimation error in PPOS; "
+                "it is not a predictive interval for a future observed effect.",
+            ])
+            for ratio, label in (("hr", "hazard ratio"), ("rr", "rate ratio")):
+                status = ppos.get(f"{ratio}_post_mean_status")
+                if status is not None:
+                    mean = (
+                        "does not exist" if status == "does_not_exist"
+                        else _display_number(ppos[f"{ratio}_post_mean"])
+                    )
+                    interval = ppos[f"{ratio}_post_ci"]
+                    sections.append(
+                        f"Posterior {label}: mean {mean}; median "
+                        f'{_display_number(ppos[f"{ratio}_post_median"])}; 95% credible interval '
+                        f"[{_display_number(interval[0])}, {_display_number(interval[1])}]. "
+                        f'Summary method: {ppos["ratio_summary_method"]}.'
+                    )
+        workload = result.get("workload")
+        if isinstance(workload, dict) and workload:
+            sections.extend([
+                "### Admitted computation",
+                "These are operation-count bounds used for admission, not runtime predictions.",
+                _report_table(
+                    ["Work quantity", "Count"],
+                    [[key, _display_number(value)] for key, value in sorted(workload.items())],
+                ),
+            ])
+    checks = public_check_summary(envelope.get("checks") or {})
+    sections.extend([
+        "## Assurance dimensions",
+        _report_table(
+            ["Dimension", "Status"],
+            [
+                ["Calculation and result contract",
+                 "Sizing search completed with unavailable rows; status and metadata preserved"
+                 if unavailable_sizes else "Completed; required scientific metadata preserved"],
+                ["Input and result binding", "Verified by the canonical reporting boundary"],
+                ["Regression suite", "Passed" if checks.get("regression_suite") else "Not recorded"],
+                ["Same-seed replay", "Passed" if checks.get("reproducibility") else "Not recorded"],
+                ["Statistical assumptions", "Human review required; software checks do not establish suitability"],
+                ["Design performance", assessment],
+            ],
+        ),
+    ])
+    return "\n\n".join(sections) + "\n\n"
+
+
 def _render_report(
     tool: str,
     assumptions: dict[str, Any],
@@ -915,14 +1348,22 @@ def _render_report(
         "# Partially verified experiment-design result"
         if blocked else "# Verified experiment-design result"
     )
+    assumptions_heading = (
+        "## Supplied assumptions\n"
+        "These are the supplied, privacy-safe arguments. Omitted engine defaults "
+        "are not inferred here; any PPOS prior method below comes from the resolved "
+        "engine result.\n"
+        if "result_contract_version" in safe_result else "## Resolved assumptions\n"
+    )
     return (
         f"{title}\n\n"
         "## Question and estimand\n"
         f"Tool: `{tool}`\n\n"
-        "## Resolved assumptions\n"
+        f"{assumptions_heading}"
         "```json\n"
         f"{json.dumps(canonical_value(assumptions), sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
         "```\n\n"
+        f"{_single_endpoint_readable_result(tool, assumptions, safe_result, envelope)}"
         "## Result\n"
         "```json\n"
         f"{json.dumps(canonical_value(safe_result), sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False)}\n"
@@ -953,6 +1394,10 @@ def canonical_report(
         raise ValueError("verification identity is required for canonical reporting")
     if not identity_matches_call(identity, tool, arguments, result, provenance):
         raise ValueError("verification identity does not match the report inputs")
+    if "result_contract_version" in result and single_endpoint_contract_errors(
+        tool, result, arguments,
+    ):
+        raise ValueError("single-endpoint result contract failed")
     return _render_report(
         tool,
         public_arguments_view(tool, arguments),
@@ -985,6 +1430,10 @@ def canonical_public_report(
         server_envelope, tool, arguments, public_result, provenance or {},
     ):
         raise ValueError("server public-result/report binding failed")
+    if "result_contract_version" in public_result and single_endpoint_contract_errors(
+        tool, public_result, arguments,
+    ):
+        raise ValueError("single-endpoint public result contract failed")
     return _render_report(
         tool,
         public_arguments_view(tool, arguments),

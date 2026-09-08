@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "result_contract_version": 1,
+  "enums": {
+    "design": ["single_arm", "controlled"],
+    "test": ["exact_binomial", "z_unpooled", "one_sample_t", "two_sample_t", "two_sample_z_normal_approximation", "exponential_rate", "logrank", "exact_poisson", "poisson_rate_difference_wald"],
+    "sizing_status": ["target_met", "search_limit_reached"],
+    "confirmatory_test": ["exact_binomial", "z_unpooled", "one_sample_noncentral_t", "welch_noncentral_t_approximation", "exponential_event_normal_approximation", "exact_poisson", "poisson_rate_difference_wald"],
+    "inner_probability_method": ["analytic_beta_cdf", "student_t_cdf", "gamma_cdf", "scaled_beta_prime", "adaptive_quadrature"],
+    "prior_method": ["normal_jeffreys_joint", "custom_proper", "binary_jeffreys", "binary_flat", "binary_skeptical", "continuous_flat", "continuous_skeptical", "tte_jeffreys", "tte_flat", "tte_skeptical", "incidence_rate_jeffreys", "incidence_rate_flat", "incidence_rate_skeptical"],
+    "hr_post_mean_status": ["finite", "does_not_exist"],
+    "rr_post_mean_status": ["finite", "does_not_exist"],
+    "ratio_summary_method": ["scaled_beta_prime"]
+  },
+  "result_types": {
+    "sample_size_row": {
+      "required": {
+        "design": "enum",
+        "test": "enum",
+        "sizing_status": "enum",
+        "alpha": "open_probability",
+        "power_target": "open_probability",
+        "power_achieved": "nullable_probability",
+        "n_total": "nullable_positive_integer",
+        "n_trt": "nullable_positive_integer"
+      },
+      "optional": {
+        "n_ctrl": "nullable_positive_integer",
+        "k_crit": "nullable_nonnegative",
+        "events": "nullable_nonnegative",
+        "allocation_ratio": "positive",
+        "alloc_ratio": "positive"
+      }
+    },
+    "oc_row": {
+      "required": {
+        "true_param": "number",
+        "p_go": "probability",
+        "p_consider": "probability",
+        "p_nogo": "probability",
+        "p_go_mcse": "nonnegative",
+        "p_go_mc_lower": "probability",
+        "p_go_mc_upper": "probability",
+        "p_consider_mcse": "nonnegative",
+        "p_consider_mc_lower": "probability",
+        "p_consider_mc_upper": "probability",
+        "p_nogo_mcse": "nonnegative",
+        "p_nogo_mc_lower": "probability",
+        "p_nogo_mc_upper": "probability",
+        "mc_replicates": "positive_integer",
+        "mc_worst_case_se": "nonnegative",
+        "mc_precision_target_se": "positive",
+        "mc_precision_ok": "boolean",
+        "inner_probability_method": "enum",
+        "inner_probability_abs_error_max": "nonnegative",
+        "inner_probability_evaluations_max": "nonnegative_integer",
+        "inner_probability_tolerance": "nonnegative",
+        "inner_probability_max_evaluations": "nonnegative_integer",
+        "inner_precision_ok": "boolean"
+      },
+      "optional": {}
+    },
+    "ppos_result": {
+      "required": {
+        "ppos": "probability",
+        "confirmatory_test": "enum",
+        "prior_method": "enum",
+        "p3_n": "positive_integer",
+        "p3_alpha": "open_probability",
+        "n_mc": "positive_integer",
+        "ppos_mcse": "nonnegative",
+        "ppos_mc_lower": "probability",
+        "ppos_mc_upper": "probability",
+        "mc_worst_case_se": "nonnegative",
+        "mc_precision_target_se": "positive",
+        "mc_precision_ok": "boolean"
+      },
+      "optional": {
+        "p3_n_trt": "positive_integer",
+        "p3_n_ctrl": "positive_integer",
+        "p3_k_crit": "nonnegative",
+        "p2_post_shape": "positive",
+        "p2_post_rate": "positive",
+        "p2_post_mean_lambda": "nonnegative",
+        "p2_post_mean_rate": "nonnegative",
+        "rate_difference_post_mean": "number",
+        "hr_post_mean": "nullable_nonnegative",
+        "rr_post_mean": "nullable_nonnegative",
+        "hr_post_mean_status": "enum",
+        "rr_post_mean_status": "enum",
+        "hr_post_median": "nonnegative",
+        "rr_post_median": "nonnegative",
+        "hr_post_ci": "nonnegative_pair",
+        "rr_post_ci": "nonnegative_pair",
+        "ratio_summary_method": "enum"
+      }
+    }
+  }
+}

@@ -107,16 +107,19 @@ run_test("tte_zero_event_continuity", {
 # TEST 3: Posterior seed independence
 # ===========================================================================
 run_test("posterior_seed_independence", {
-  # With seed=NULL, bayes_binary_two_arm should consume from the caller's
-  # RNG stream, so two consecutive calls produce different results.
+  # Posterior decision probability is deterministic quadrature. Posterior
+  # descriptive draws may consume RNG, but cannot change a decision probability.
   set.seed(123)
   r1 <- bayes_binary_two_arm(x_trt = 7, n_trt = 10,
                              x_ctrl = 3, n_ctrl = 10, seed = NULL)
   r2 <- bayes_binary_two_arm(x_trt = 7, n_trt = 10,
                              x_ctrl = 3, n_ctrl = 10, seed = NULL)
 
-  # The two MC samples should differ (prob_above_delta based on 100k draws)
-  stopifnot(r1$prob_above_delta != r2$prob_above_delta)
+  stopifnot(r1$prob_above_delta == r2$prob_above_delta,
+            identical(r1$probability_method, "adaptive_quadrature"),
+            length(r1$probability_abs_error) == 1L,
+            is.finite(r1$probability_abs_error),
+            r1$probability_abs_error <= 1e-8)
 
   # Conversely, with a fixed seed both calls should agree
   r3 <- bayes_binary_two_arm(x_trt = 7, n_trt = 10,
@@ -650,7 +653,13 @@ run_test("frequentist_ci_level_and_zero_variance_contract", {
 
   ccfg <- create_config(endpoint_type = "continuous", study_type = "poc",
                         design = "single_arm", null_param = 0,
-                        alt_param = 1, sd = 1)
+                        alt_param = 1, sd = 1,
+                        prior = list(mu0 = 0, kappa0 = 0.01, alpha0 = 0.5, beta0 = 0.5))
+  objective <- create_config(endpoint_type = "continuous", study_type = "poc",
+                             design = "single_arm", null_param = 0, alt_param = 1, sd = 1)
+  stopifnot(tryCatch({
+    compute_decision(objective, list(x_bar = 1, s2 = 0, n = 5)); FALSE
+  }, error = function(e) TRUE))
   set.seed(7)
   bayes_zero <- compute_decision(ccfg, list(x_bar = 1, s2 = 0, n = 5))
   stopifnot(is.finite(bayes_zero$posterior_prob),

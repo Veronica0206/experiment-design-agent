@@ -8,7 +8,8 @@ import sys
 
 from gates import (GateVerdict, MANUAL_CHECKS, check_regression_tests, check_reproducibility,
                    combined_gate, design_checks_for)
-from final_report import canonical_report, privacy_safe_view
+from final_report import (canonical_report, privacy_safe_view,
+                          single_endpoint_contract_errors)
 from verification import (VerificationIdentity, content_hash,
                           public_arguments_hash,
                           public_check_summary, public_failure_codes,
@@ -99,6 +100,13 @@ def main() -> int:
     if not isinstance(result, dict):
         raise ValueError("tool result is not an object")
     verdicts = design_checks_for(tool, args, result)
+    if tool in {"sample_size", "simulate_design"}:
+        contract_errors = single_endpoint_contract_errors(tool, result, args)
+        verdicts.append(GateVerdict(
+            passed=not contract_errors,
+            checks={"result_contract": not contract_errors},
+            failures=contract_errors,
+        ))
     verdicts.append(check_regression_tests(regression))
     if request.get("replay_required"):
         if not isinstance(replay, dict):

@@ -72,7 +72,7 @@ compute_sample_size <- function(config) {
           design = "single_arm", test = "one_sample_t",
           alpha = a, power_target = pwr,
           n_total = sa$n, n_trt = sa$n, n_ctrl = NA,
-          power_achieved = pwr, k_crit = NA,
+          power_achieved = sa$power, k_crit = NA,
           stringsAsFactors = FALSE))
 
         if (config$design == "controlled") {
@@ -81,7 +81,7 @@ compute_sample_size <- function(config) {
             design = "controlled", test = ta$test,
             alpha = a, power_target = pwr,
             n_total = ta$n_total, n_trt = ta$n_trt, n_ctrl = ta$n_ctrl,
-            power_achieved = pwr, k_crit = NA,
+            power_achieved = ta$power, k_crit = NA,
             stringsAsFactors = FALSE))
         }
 
@@ -133,6 +133,32 @@ compute_sample_size <- function(config) {
     }
   }
 
+  # Recompute every achieved power from the actual integer design, including
+  # discrete tests whose search helpers retain display-rounded legacy fields.
+  results$sizing_status <- ifelse(is.na(results$n_total), "search_limit_reached", "target_met")
+  for (i in seq_len(nrow(results))) {
+    row <- results[i, ]
+    if (is.na(row$n_total)) next
+    minimum <- if (config$endpoint_type == "continuous") 2L else 1L
+    sizes <- if (row$design == "controlled") c(row$n_trt, row$n_ctrl) else row$n_total
+    if (any(!is.finite(sizes)) || any(sizes != floor(sizes)) || any(sizes < minimum))
+      stop("computed sample size violates the endpoint arm minimum", call. = FALSE)
+    p0 <- config$null_param; p1 <- config$alt_param; a <- row$alpha
+    achieved <- switch(row$test,
+      exact_binomial = power_binomial_single_arm(row$n_total, p0, p1, a),
+      z_unpooled = power_z_unpooled(row$n_trt, row$n_ctrl, p0, p1, a),
+      one_sample_t = power_ttest_single_arm(row$n_total, p1-p0, config$sd, a),
+      two_sample_t = power_ttest_two_arm(row$n_trt, row$n_ctrl, p1-p0, config$sd, a),
+      two_sample_z_normal_approximation = power_ttest_two_arm(row$n_trt, row$n_ctrl, p1-p0, config$sd, a),
+      exponential_rate = power_logrank_single_arm(row$n_total, p0, p1, config$accrual_time, config$followup_time, a),
+      logrank = power_logrank_two_arm(row$n_trt, row$n_ctrl, p0, p1, config$accrual_time, config$followup_time, a),
+      exact_poisson = power_poisson_single_arm(row$n_total, p0, p1, config$exposure_time, a, config$direction),
+      poisson_rate_difference_wald = power_poisson_two_arm(row$n_trt, row$n_ctrl, p0, p1, config$exposure_time, a),
+      stop("sample-size method has no achieved-power implementation", call. = FALSE))
+    if (!is.finite(achieved) || achieved < 0 || achieved > 1 || achieved + 1e-12 < row$power_target)
+      stop("computed sample size does not achieve its declared target power", call. = FALSE)
+    results$power_achieved[i] <- achieved
+  }
   results$label <- config$label
   return(results)
 }

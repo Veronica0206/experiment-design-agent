@@ -36,11 +36,13 @@
     "agent-harness/tests/test_multi_agent.py",
     "agent-harness/tests/test_response_budget.py",
     "agent-harness/tests/test_runtime_profile.py",
+    "agent-harness/tests/test_single_endpoint_contract.py",
     "agent-harness/tests/test_streamlit_surface.py",
     "agent-harness/tests/test_verification.py",
     "agent-harness/verification.py",
     "docs/PUBLIC-RELEASE.md",
     "docs/PUBLISHING.md",
+    "docs/STATISTICAL-ASSURANCE.md",
     "docs/examples/README.md",
     "docs/examples/single-endpoint-sample-size-report.md",
     "governance/__init__.py",
@@ -51,6 +53,7 @@
     "governance/runtime-profiles.json",
     "governance/runtime_profile.mjs",
     "governance/runtime_profile.py",
+    "governance/single-endpoint-result-contract.json",
     "hooks/README.md",
     "hooks/describe_domain_policy.mjs",
     "hooks/domain_tool_policy.mjs",
@@ -96,6 +99,7 @@
     "mcp-server/tests/server-shutdown-helper.mjs",
     "mcp-server/tsconfig.json",
     "renv.lock",
+    "tools/audit_dependency_advisories.py",
     "tools/bootstrap.sh",
     "tools/check_diff_credentials.py",
     "tools/check_publish_source.py",
@@ -107,6 +111,7 @@
     "tools/run-reviewed-r.sh",
     "tools/sanitize_python_environment.py",
     "tools/sync-to-github.sh",
+    "tools/tests/test_dependency_advisories.py",
     "tools/tests/test_public_release.py",
     "tools/tests/test_publish_guard.py",
     "tools/tests/test_reviewed_python_runner.py",
@@ -134,6 +139,8 @@
     "vera-experiment-designing/scripts/R/sample_size.R",
     "vera-experiment-designing/scripts/R/validate_framework.R",
     "vera-experiment-designing/scripts/tests/public_packaging.R",
-    "vera-experiment-designing/scripts/tests/run_tests.R"
+    "vera-experiment-designing/scripts/tests/run_tests.R",
+    "vera-experiment-designing/scripts/tests/test_planning_consistency.R",
+    "vera-experiment-designing/scripts/tests/test_posterior_contract.R"
   ]
 }

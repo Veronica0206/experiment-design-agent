@@ -18,10 +18,13 @@ test-r:
 	  echo "== $$s =="; \
 	  tools/run-reviewed-r.sh $$s/scripts/tests/run_tests.R || exit 1; \
 	done
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/test_planning_consistency.R
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/test_posterior_contract.R
 
 test-py:
 	@$(PYTHON_RUN) agent-harness/tests/test_gates.py
 	@$(PYTHON_RUN) agent-harness/tests/test_verification.py
+	@$(PYTHON_RUN) agent-harness/tests/test_single_endpoint_contract.py
 	@$(PYTHON_RUN) agent-harness/tests/test_harness.py
 	@$(PYTHON_RUN) agent-harness/tests/test_multi_agent.py
 	@$(PYTHON_RUN) agent-harness/tests/test_streamlit_surface.py
@@ -39,6 +42,7 @@ test-py:
 	@$(PYTHON_RUN) tools/tests/test_sanitize_python_environment.py
 	@$(PYTHON_RUN) tools/tests/test_validate_skills.py
 	@$(PYTHON_RUN) tools/tests/test_validate_r_lock.py
+	@$(PYTHON_RUN) tools/tests/test_dependency_advisories.py
 
 test-integration:
 	@cd mcp-server && npm run test:lifecycle
@@ -61,7 +65,11 @@ public-check:
 	@cd mcp-server && $(NPM_INSTALL)
 	@cd mcp-server && npm run test:public-lifecycle
 	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/run_tests.R
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/test_planning_consistency.R
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/test_posterior_contract.R
 	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/public_packaging.R
+	@$(PYTHON_RUN) agent-harness/tests/test_single_endpoint_contract.py
+	@$(PYTHON_RUN) tools/tests/test_dependency_advisories.py
 	@$(PYTHON_RUN) agent-harness/tests/test_runtime_profile.py
 	@$(PYTHON_RUN) tools/tests/test_public_release.py
 	@cd mcp-server && EXPDESIGN_PYTHON="$(PYTHON)" npm run test:public-engine
@@ -81,6 +89,7 @@ validate-python-lock:
 
 audit-deps:
 	@cd mcp-server && npm audit --omit=dev --audit-level=high
+	@$(PYTHON_RUN) tools/audit_dependency_advisories.py
 
 check-claude-version:
 	@tools/bootstrap.sh --check-claude-version

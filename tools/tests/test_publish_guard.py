@@ -70,7 +70,7 @@ def authorize(root: Path, paths: list[Path]) -> dict[str, str]:
 
 def run_guard(root: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(GUARD), *args, str(root)],
+        [sys.executable, "-B", str(GUARD), *args, str(root)],
         capture_output=True,
         text=True,
         env=env,
@@ -79,7 +79,7 @@ def run_guard(root: Path, env: dict[str, str], *args: str) -> subprocess.Complet
 
 def run_public(root: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(PUBLIC_GUARD), *args, str(root)],
+        [sys.executable, "-B", str(PUBLIC_GUARD), *args, str(root)],
         capture_output=True,
         text=True,
         env=env or publication_env(),
@@ -88,7 +88,7 @@ def run_public(root: Path, *args: str, env: dict[str, str] | None = None) -> sub
 
 def run_public_workflow(path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(PUBLIC_GUARD), "--public-workflow", str(path)],
+        [sys.executable, "-B", str(PUBLIC_GUARD), "--public-workflow", str(path)],
         capture_output=True,
         text=True,
         env=publication_env(),
@@ -204,15 +204,15 @@ with tempfile.TemporaryDirectory() as directory:
     check("duplicate_manifest_json_key_rejected", result.returncode == 1 and "duplicate JSON key" in result.stderr)
 
 large_diff = b"+" + FAKE_SK_TOKEN + b"\n" + b"+safe line\n" * 300000
-result = subprocess.run([sys.executable, str(SCANNER)], input=large_diff, capture_output=True)
+result = subprocess.run([sys.executable, "-B", str(SCANNER)], input=large_diff, capture_output=True)
 check("large_diff_credential_detected_without_sigpipe", result.returncode == 1)
-result = subprocess.run([sys.executable, str(SCANNER)], input=b"+safe line\n" * 300000, capture_output=True)
+result = subprocess.run([sys.executable, "-B", str(SCANNER)], input=b"+safe line\n" * 300000, capture_output=True)
 check("large_clean_diff_allowed", result.returncode == 0)
-result = subprocess.run([sys.executable, str(SCANNER)], input=FAKE_FINE_GRAINED_TOKEN, capture_output=True)
+result = subprocess.run([sys.executable, "-B", str(SCANNER)], input=FAKE_FINE_GRAINED_TOKEN, capture_output=True)
 check("fine_grained_github_token_detected", result.returncode == 1)
 
 boundary = b"x" * (1024 * 1024 - 5) + FAKE_SK_TOKEN[:5] + FAKE_SK_TOKEN[5:]
-result = subprocess.run([sys.executable, str(SCANNER)], input=boundary, capture_output=True)
+result = subprocess.run([sys.executable, "-B", str(SCANNER)], input=boundary, capture_output=True)
 check("chunk_boundary_credential_detected", result.returncode == 1)
 
 with tempfile.TemporaryDirectory() as directory:
@@ -222,7 +222,7 @@ with tempfile.TemporaryDirectory() as directory:
     binary.write_bytes(b"\x00\x01" + FAKE_FINE_GRAINED_TOKEN + b"\x00")
     git(root, "add", "payload.bin")
     result = subprocess.run(
-        [sys.executable, str(SCANNER), "--staged", str(root)],
+        [sys.executable, "-B", str(SCANNER), "--staged", str(root)],
         capture_output=True,
         env=publication_env(),
     )
@@ -231,7 +231,7 @@ with tempfile.TemporaryDirectory() as directory:
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     result = subprocess.run(
-        [sys.executable, str(SCANNER), "--staged", str(root)],
+        [sys.executable, "-B", str(SCANNER), "--staged", str(root)],
         capture_output=True,
         env=publication_env(),
     )
@@ -383,7 +383,7 @@ with tempfile.TemporaryDirectory() as directory:
     for name, payload in (("user.json", user), ("repository.json", repository), ("branch.json", branch)):
         (root / name).write_text(json.dumps(payload), encoding="utf-8")
     valid = subprocess.run(
-        [sys.executable, str(PUBLIC_GUARD), "--github-metadata", str(root)],
+        [sys.executable, "-B", str(PUBLIC_GUARD), "--github-metadata", str(root)],
         capture_output=True,
         text=True,
         env=publication_env(),
@@ -392,7 +392,7 @@ with tempfile.TemporaryDirectory() as directory:
     repository["node_id"] = "wrong"
     (root / "repository.json").write_text(json.dumps(repository), encoding="utf-8")
     wrong_repo = subprocess.run(
-        [sys.executable, str(PUBLIC_GUARD), "--github-metadata", str(root)],
+        [sys.executable, "-B", str(PUBLIC_GUARD), "--github-metadata", str(root)],
         capture_output=True,
         text=True,
         env=publication_env(),
@@ -403,7 +403,7 @@ with tempfile.TemporaryDirectory() as directory:
     user["login"] = "someone-else"
     (root / "user.json").write_text(json.dumps(user), encoding="utf-8")
     wrong_user = subprocess.run(
-        [sys.executable, str(PUBLIC_GUARD), "--github-metadata", str(root)],
+        [sys.executable, "-B", str(PUBLIC_GUARD), "--github-metadata", str(root)],
         capture_output=True,
         text=True,
         env=publication_env(),
@@ -446,6 +446,7 @@ def make_publication_clone(root: Path, *, correct_metadata: bool = True) -> str:
 def validate_repo(root: Path, sha: str, *, metadata: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
+        "-B",
         str(PUBLIC_GUARD),
         "--repository-state",
         str(root),
@@ -557,7 +558,7 @@ no_action = subprocess.run(
 check("publication_without_explicit_action_fails_usage", no_action.returncode == 2 and "Usage:" in no_action.stderr)
 
 owner_home = subprocess.run(
-    [sys.executable, str(PUBLIC_GUARD), "--owner-home"],
+    [sys.executable, "-B", str(PUBLIC_GUARD), "--owner-home"],
     capture_output=True,
     text=True,
     env=publication_env(),

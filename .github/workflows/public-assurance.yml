@@ -77,7 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.14"]
+        python: ["3.10", "3.14"]
     steps:
       - name: Check out reviewed source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -113,6 +113,8 @@ jobs:
       - name: Audit production dependencies
         working-directory: mcp-server
         run: npm audit --omit=dev --audit-level=high
+      - name: Audit all locked Python and R dependencies
+        run: /usr/bin/python3 -I -E -s -S -B tools/audit_dependency_advisories.py
       - name: Scan every reachable Git object for credential patterns
         shell: bash
         run: |

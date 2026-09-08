@@ -159,11 +159,10 @@ def validate_installed_distributions(
 ) -> tuple[int, int]:
     """Validate exact versions, RECORD bytes, and the recorded package surface."""
     if distributions is None:
-        installed_distributions = list(metadata.distributions(
-            path=None if distribution_paths is None else [
-                str(path) for path in distribution_paths
-            ]
-        ))
+        installed_distributions = list(metadata.distributions()
+            if distribution_paths is None else metadata.distributions(
+                path=[str(path) for path in distribution_paths]
+            ))
     else:
         installed_distributions = list(distributions)
     prefix = (environment_prefix or Path(sys.prefix)).resolve()

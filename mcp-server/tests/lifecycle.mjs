@@ -1716,11 +1716,13 @@ try {
       writeFileSync(
         runtimeProbeExecutable,
         "#!/bin/sh\n" +
-          "if [ \"$4\" = \"-c\" ]; then\n" +
+          "for probe_arg in \"$@\"; do\n" +
+          "if [ \"$probe_arg\" = \"-c\" ]; then\n" +
           `  echo $$ > ${JSON.stringify(runtimeProbePidFile)}\n` +
           `  ${JSON.stringify(runtimeProbeBlocker)} &\n` +
           "  exec /bin/sleep 60\n" +
           "fi\n" +
+          "done\n" +
           `exec ${JSON.stringify(PYTHON_EXECUTABLE)} \"$@\"\n`,
         { mode: 0o700 },
       );

@@ -1148,6 +1148,14 @@ registerStrictTool(
           "reduce B_oc or n_oc",
         );
       }
+      // The dispatcher budgets the exact deduplicated scenario grid before
+      // simulation. A nominal grid length is not a valid lower bound here.
+      const minimumPerArm = config.endpoint_type === "continuous" ? 2 : 1;
+      const armSizes = typeof params.n_oc === "number"
+        ? [params.n_oc] : [params.n_oc.n_trt, params.n_oc.n_ctrl];
+      if (armSizes.some((size) => size < minimumPerArm)) {
+        throw new InvalidRequestToolError("OC sample size is below the endpoint minimum");
+      }
       if (config.design === "single_arm" && typeof params.n_oc === "object") {
         throw new InvalidRequestToolError("single-arm OC requires scalar n_oc");
       }

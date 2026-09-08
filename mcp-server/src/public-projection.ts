@@ -14,6 +14,11 @@ const DIRECTIONS = new Set(["greater", "less"]);
 const SIDEDNESS = new Set(["one_sided"]);
 const TTE_METHODS = new Set(["exponential"]);
 const RATE_METHODS = new Set(["poisson"]);
+const PRIOR_METHODS = new Set([
+  "normal_jeffreys_joint", "custom_proper", "continuous_flat", "continuous_skeptical",
+  ...["binary", "tte", "incidence_rate"].flatMap(endpoint =>
+    ["jeffreys", "flat", "skeptical"].map(prior => `${endpoint}_${prior}`)),
+]);
 const PRIOR_FIELDS = new Set([
   "a", "b", "mu0", "kappa0", "alpha0", "beta0", "shape", "rate",
 ]);
@@ -122,6 +127,7 @@ export function publicValidatedConfig(value: unknown): JsonRecord {
     alphas: finiteNumberArray(resolvedSource.alphas, "resolved_config.alphas"),
     powers: finiteNumberArray(resolvedSource.powers, "resolved_config.powers"),
     prior_params: finitePrior(resolvedSource.prior_params),
+    prior_method: fixedEnum(resolvedSource.prior_method, PRIOR_METHODS, "resolved_config.prior_method"),
     go_threshold: finiteNumber(resolvedSource.go_threshold, "resolved_config.go_threshold"),
     consider_threshold: finiteNumber(resolvedSource.consider_threshold, "resolved_config.consider_threshold"),
     go_target: finiteNumber(resolvedSource.go_target, "resolved_config.go_target"),

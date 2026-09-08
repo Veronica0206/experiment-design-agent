@@ -12,6 +12,7 @@ The shared implementation consists of `config.R`, `sample_size.R`,
 
 - `scripts/R/examples.R` and `scripts/R/validate_framework.R`;
 - `scripts/tests/run_tests.R` and `scripts/tests/public_packaging.R`;
+- `scripts/tests/test_planning_consistency.R` and `scripts/tests/test_posterior_contract.R`;
 - `examples/study-planning.R` and `examples/analysis-template.R`;
 - the module README and existing GPLv3 license.
 
@@ -66,3 +67,8 @@ Public validation covers the selected implementation and installed runtime.
 The complete installation's broader release and platform-specific package-byte
 attestations remain separate. The optional authenticated Claude/Python model
 conversation also remains separate from deterministic public validation.
+
+The shared [statistical assurance contract](STATISTICAL-ASSURANCE.md) describes
+method identifiers, prior semantics, numerical limits, trust boundaries and
+the review regressions. Public CI separately audits exact Python and CRAN pins
+against OSV; a matching advisory or incomplete audit fails that job.

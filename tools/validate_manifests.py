@@ -581,6 +581,11 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_validate_python_environment\.py\s*$",
         r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_reviewed_python_runner\.py\s*$",
         r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_sanitize_python_environment\.py\s*$",
+        r"^\s*@\$\(PYTHON_RUN\) agent-harness/tests/test_single_endpoint_contract\.py\s*$",
+        r"^\s*@\$\(PYTHON_RUN\) tools/tests/test_dependency_advisories\.py\s*$",
+        r"^\s*@\$\(PYTHON_RUN\) tools/audit_dependency_advisories\.py\s*$",
+        r"^\s*@tools/run-reviewed-r\.sh vera-experiment-designing/scripts/tests/test_planning_consistency\.R\s*$",
+        r"^\s*@tools/run-reviewed-r\.sh vera-experiment-designing/scripts/tests/test_posterior_contract\.R\s*$",
     ))
     release = re.search(
         r"^release-check:\s*\n(?P<body>(?:^\t.*(?:\n|$))*)",
@@ -691,6 +696,7 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
                 "working-directory": "mcp-server",
                 "run": "npm audit --omit=dev --audit-level=high",
             },
+            {"run": "/usr/bin/python3 -I -E -s -S -B tools/audit_dependency_advisories.py"},
             {
                 "shell": "bash",
                 "run": "\n".join([
@@ -709,7 +715,7 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
         "python-contracts": {
             "strategy": {
                 "fail-fast": False,
-                "matrix": {"python": ["3.9", "3.14"]},
+                "matrix": {"python": ["3.10", "3.14"]},
             },
         },
         "supply-chain": {},

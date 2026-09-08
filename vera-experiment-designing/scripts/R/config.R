@@ -30,8 +30,8 @@
   } else if (endpoint_type == "continuous") {
     .qdf_require_fields(data, c("x_bar", "s2", "n"), label)
     .qdf_scalar(data$x_bar, paste0(label, "$x_bar"))
-    # Zero sample variance is valid for the conjugate Bayesian update. The
-    # frequentist sensitivity layer performs its stricter positive-SD check.
+    # Zero variance is valid with a proper NIG prior. The objective Jeffreys
+    # update and the frequentist layer perform their stricter checks.
     .qdf_scalar(data$s2, paste0(label, "$s2"), lower = 0)
     .qdf_scalar(data$n, paste0(label, "$n"), lower = 2, integer = TRUE)
   } else if (endpoint_type == "tte") {
@@ -289,6 +289,9 @@ create_config <- function(
     }
     .qdf_validate_arm(p2_data, endpoint_type, "p2_data")
     if (!is.null(p2_data_ctrl)) .qdf_validate_arm(p2_data_ctrl, endpoint_type, "p2_data_ctrl")
+    if (endpoint_type == "continuous" && prior_params$kappa0 == 0 &&
+        (p2_data$s2 <= 0 || (!is.null(p2_data_ctrl) && p2_data_ctrl$s2 <= 0)))
+      stop("Joint Jeffreys normal posterior requires positive sample variance in each observed arm", call. = FALSE)
 
     if (design == "single_arm") {
       minimum <- if (endpoint_type == "continuous") 2 else 1
@@ -325,6 +328,9 @@ create_config <- function(
     alphas             = alphas,
     powers             = powers,
     prior_params       = prior_params,
+    prior_method       = if (endpoint_type == "continuous" && is.character(prior) &&
+                              identical(prior, "jeffreys")) "normal_jeffreys_joint" else
+                           if (is.list(prior)) "custom_proper" else paste(endpoint_type, prior, sep = "_"),
     go_threshold       = go_threshold,
     consider_threshold = consider_threshold,
     go_target          = go_target,
@@ -371,7 +377,9 @@ resolve_prior <- function(prior, endpoint_type, null_param) {
     )
   } else if (endpoint_type == "continuous") {
     resolved <- switch(prior,
-      jeffreys  = list(mu0 = 0, kappa0 = 0.01, alpha0 = 0.5, beta0 = 0.5),
+      # Joint Jeffreys density p(mu, variance) is proportional to variance^(-3/2).
+      # The zero boundary gives a proper posterior for n>=2 and positive s2.
+      jeffreys  = list(mu0 = 0, kappa0 = 0, alpha0 = 0, beta0 = 0),
       flat      = list(mu0 = 0, kappa0 = 0.001, alpha0 = 0.001, beta0 = 0.001),
       skeptical = list(mu0 = null_param, kappa0 = 1, alpha0 = 1, beta0 = 1),
       stop("Unknown prior: ", prior, ". Use 'jeffreys', 'flat', 'skeptical', or list(mu0=, kappa0=, alpha0=, beta0=)")
@@ -389,8 +397,12 @@ resolve_prior <- function(prior, endpoint_type, null_param) {
     binary = c("a", "b"), continuous = c("kappa0", "alpha0", "beta0"),
     tte = c("shape", "rate"), incidence_rate = c("shape", "rate"))
   for (name in names(resolved)) .qdf_scalar(resolved[[name]], paste0("prior$", name))
+  objective_normal <- endpoint_type == "continuous" &&
+    identical(unname(unlist(resolved[c("kappa0", "alpha0", "beta0")])), c(0, 0, 0))
+  if (objective_normal && is.list(prior))
+    stop("Use the named jeffreys prior for the objective normal boundary", call. = FALSE)
   for (name in positive) {
-    if (resolved[[name]] <= 0) stop("prior$", name, " must be positive", call. = FALSE)
+    if (!objective_normal && resolved[[name]] <= 0) stop("prior$", name, " must be positive", call. = FALSE)
   }
   resolved
 }

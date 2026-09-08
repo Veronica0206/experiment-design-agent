@@ -91,7 +91,7 @@ export function runVerifierRequest(
     // modules and Python's standard library. A detached POSIX process group
     // lets cancellation terminate any verifier descendants as well.
     const proc = spawnRuntimeProcess(
-      PYTHON_EXECUTABLE, ["-E", "-s", "-S", verifierPath],
+      PYTHON_EXECUTABLE, ["-E", "-s", "-S", "-B", verifierPath],
       {
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",

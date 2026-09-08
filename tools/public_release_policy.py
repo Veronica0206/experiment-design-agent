@@ -22,6 +22,8 @@ PUBLIC_ENGINE_FILES = frozenset({
     "vera-experiment-designing/scripts/R/examples.R",
     "vera-experiment-designing/scripts/tests/run_tests.R",
     "vera-experiment-designing/scripts/tests/public_packaging.R",
+    "vera-experiment-designing/scripts/tests/test_planning_consistency.R",
+    "vera-experiment-designing/scripts/tests/test_posterior_contract.R",
     "vera-experiment-designing/examples/analysis-template.R",
     "vera-experiment-designing/examples/study-planning.R",
 })

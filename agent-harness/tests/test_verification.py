@@ -909,7 +909,10 @@ server_request = {
     "tool": "sample_size",
     "args": {"endpoint_type": "binary", "study_type": "poc",
              "design": "single_arm", "null_param": 0.2, "alt_param": 0.4},
-    "result": {"results": [{"design": "single_arm", "n_total": 30,
+    "result": {"result_contract_version": 1,
+               "results": [{"design": "single_arm", "test": "exact_binomial",
+                              "sizing_status": "target_met", "alpha": 0.05,
+                              "n_total": 30, "n_trt": 30,
                               "power_target": 0.8, "power_achieved": 0.82}],
                "private_note": "SECRET-RESULT-COMMITMENT"},
     "runtime_id": "analysis-public-success",
@@ -922,7 +925,7 @@ verifier_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..",
 
 def server_verdict(request):
     completed = subprocess.run(
-        [sys.executable, verifier_path], input=json.dumps(request),
+        [sys.executable, "-B", verifier_path], input=json.dumps(request),
         capture_output=True, text=True,
     )
     return completed.returncode, json.loads(completed.stdout)

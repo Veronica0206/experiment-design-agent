@@ -19,7 +19,7 @@ from typing import Iterable, NamedTuple, Sequence
 
 BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
 MAX_SITE_PACKAGES_ENTRIES = 500_000
-MINIMUM_PYTHON = (3, 9)
+MINIMUM_PYTHON = (3, 10)
 
 
 class SanitizationError(RuntimeError):
@@ -366,7 +366,7 @@ def _require_pre_site_interpreter() -> None:
 
 def _selected_environment() -> tuple[Path, tuple[Path, ...]]:
     if sys.version_info < MINIMUM_PYTHON:
-        raise SanitizationError("Python 3.9+ is required for the harness")
+        raise SanitizationError("Python 3.10+ is required for the harness")
     executable = Path(sys.executable)
     if not executable.is_absolute():
         raise SanitizationError("selected Python executable is not absolute")

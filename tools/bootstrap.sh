@@ -71,7 +71,7 @@ select_harness_python() {
       fi
     done
     if [[ -z "$HARNESS_PYTHON" ]]; then
-      echo "ERROR: Python 3.9+ is required for the harness"
+      echo "ERROR: Python 3.10+ is required for the harness"
       exit 1
     fi
   fi
@@ -82,9 +82,9 @@ select_harness_python() {
 
   if ! "$HARNESS_PYTHON" -E -s -S -B -I -c '
 import sys
-raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
 '; then
-    echo "ERROR: Python 3.9+ is required for the harness"
+    echo "ERROR: Python 3.10+ is required for the harness"
     exit 1
   fi
   echo "python:  $($HARNESS_PYTHON -E -s -S -B -I --version 2>&1) ($HARNESS_PYTHON)"

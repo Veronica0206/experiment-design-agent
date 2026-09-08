@@ -18,7 +18,7 @@ SUITE_ROOT = TOOLS_ROOT.parent
 VALIDATOR_PATH = TOOLS_ROOT / "validate_python_environment.py"
 REQUIREMENTS_PATH = SUITE_ROOT / "agent-harness" / "requirements.txt"
 LOCK_PATH = SUITE_ROOT / "agent-harness" / "requirements.lock"
-MINIMUM_PYTHON = (3, 9)
+MINIMUM_PYTHON = (3, 10)
 MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 BYTECODE_SUFFIXES = {".pyc", ".pyo"}
 MAX_SOURCE_ENTRIES = 100_000
@@ -79,7 +79,7 @@ def _reject_source_bytecode(root: Path, environment_prefix: Path) -> None:
 
 def _selected_environment() -> tuple[Path, tuple[Path, ...]]:
     if sys.version_info < MINIMUM_PYTHON:
-        raise RunnerError("Python 3.9+ is required for the harness")
+        raise RunnerError("Python 3.10+ is required for the harness")
     executable = Path(sys.executable)
     if not executable.is_absolute():
         raise RunnerError("selected Python executable is not absolute")

@@ -4,6 +4,25 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## 2026-09-08 statistical review corrections
+
+- Share a versioned single-endpoint result contract across execution,
+  verification and deterministic reporting. Retain method names, simulation
+  uncertainty, numerical precision and posterior moment-existence diagnostics.
+- Anchor OC grids to the exact null and alternative; report unfavorable design
+  performance separately from execution and numerical validity.
+- Use one controlled-binary planning/PPOS power rule, validate noncentral-t
+  tails, enforce integer arm minima and recompute achieved sizing power.
+- Correct the continuous Jeffreys prior to be invariant to units; use analytic
+  Gamma-ratio summaries and deterministic bounded posterior probabilities.
+- Account for scenario and inner-probability work before admitting OC jobs.
+  Add numerical counterexamples and actual R-to-public-report regressions.
+- Audit every locked Python and CRAN package against OSV, alongside the Node
+  audit, and update vulnerable Python dependencies. The harness now requires
+  Python 3.10 or newer.
+- Document statistical assumptions, host trust boundaries and measured
+  numerical work in [Statistical assurance](docs/STATISTICAL-ASSURANCE.md).
+
 ## Unreleased — 2026-09-08 public single-endpoint edition
 
 - Select complete or single-endpoint capabilities from a strict repository-owned

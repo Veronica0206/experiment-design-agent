@@ -73,6 +73,8 @@ with tempfile.TemporaryDirectory(prefix="expdesign-public-profile-") as director
             if source.is_file() and source.suffix in {".py", ".mjs"}:
                 shutil.copyfile(source, fixture / folder / source.name)
     profile_path = fixture / "governance/runtime-profiles.json"
+    shutil.copyfile(ROOT / "governance/single-endpoint-result-contract.json",
+                    fixture / "governance/single-endpoint-result-contract.json")
     document = {**catalog, "active": "single-endpoint"}
     profile_path.write_text(json.dumps(document))
 
