@@ -41,6 +41,7 @@ jobs:
         run: |
           "$pythonLocation/bin/python" -I -E -s -S -B -m venv agent-harness/.venv
           agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock
+          agent-harness/.venv/bin/python -I -E -s -S -B tools/sanitize_python_environment.py
       - name: Validate the runnable public single-endpoint edition
         run: make public-check
 

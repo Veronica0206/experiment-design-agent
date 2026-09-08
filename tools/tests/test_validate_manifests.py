@@ -24,6 +24,14 @@ spec.loader.exec_module(module)
 public_workflow = (
     module.ROOT / ".github" / "workflows" / "public-assurance.yml"
 ).read_text(encoding="utf-8")
+public_install_line = (
+    "          agent-harness/.venv/bin/python -I -E -s -B -m pip install "
+    "--no-compile --require-hashes -r agent-harness/requirements.lock\n"
+)
+public_sanitize_line = (
+    "          agent-harness/.venv/bin/python -I -E -s -S -B "
+    "tools/sanitize_python_environment.py\n"
+)
 
 checks = {
     "string_tools_are_structural": module.normalized_tools("Bash, Read") == {"Bash", "Read"},
@@ -150,6 +158,48 @@ checks = {
     "public_assurance_write_permission_rejected": not (
         module.valid_public_assurance_workflow(
             public_workflow.replace("contents: read", "contents: write")
+        )
+    ),
+    "public_assurance_missing_bytecode_sanitization_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(public_sanitize_line, "", 1)
+        )
+    ),
+    "public_assurance_sanitization_before_install_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                public_install_line + public_sanitize_line,
+                public_sanitize_line + public_install_line,
+                1,
+            )
+        )
+    ),
+    "public_assurance_sanitization_after_validation_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(public_sanitize_line, "", 1).replace(
+                "        run: make public-check\n",
+                "        run: |\n          make public-check\n"
+                + public_sanitize_line,
+                1,
+            )
+        )
+    ),
+    "public_assurance_sanitization_with_site_enabled_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                public_sanitize_line,
+                public_sanitize_line.replace(" -S ", " "),
+                1,
+            )
+        )
+    ),
+    "public_assurance_sanitization_without_isolation_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                public_sanitize_line,
+                public_sanitize_line.replace(" -I ", " "),
+                1,
+            )
         )
     ),
     "public_assurance_other_write_permission_rejected": not (
@@ -514,6 +564,44 @@ checks["malformed_r_tree_digest_rejected"] = (
 checks["fully_hashed_python_lock_accepted"] = module.valid_python_requirements_lock(
     lock_text
 )
+marked_lock_entry = (
+    'watchdog==6.0.0; platform_system != "Darwin" \\\n'
+    + "    --hash=sha256:" + "0" * 64 + "\n"
+)
+checks["hashed_non_darwin_requirement_accepted"] = (
+    module.valid_python_requirements_lock(marked_lock_entry)
+)
+checks["marked_requirement_still_requires_hash"] = (
+    not module.valid_python_requirements_lock(
+        marked_lock_entry.split("\n", 1)[0] + "\n"
+    )
+)
+checks["marked_requirement_rejects_malformed_hash"] = (
+    not module.valid_python_requirements_lock(
+        marked_lock_entry.replace("0" * 64, "invalid")
+    )
+)
+checks["duplicate_marked_requirement_rejected"] = (
+    not module.valid_python_requirements_lock(marked_lock_entry + marked_lock_entry)
+)
+checks["marked_and_unmarked_duplicate_rejected"] = (
+    not module.valid_python_requirements_lock(
+        marked_lock_entry
+        + marked_lock_entry.replace('; platform_system != "Darwin"', "")
+    )
+)
+for index, marker in enumerate((
+    'platform_system == "Darwin"',
+    'sys_platform != "darwin"',
+    'platform_system != "Darwin" or python_version > "0"',
+    "platform_system != 'Darwin'",
+    'platform_system!="Darwin"',
+)):
+    checks[f"unsupported_python_lock_marker_{index}_rejected"] = (
+        not module.valid_python_requirements_lock(
+            marked_lock_entry.replace('platform_system != "Darwin"', marker)
+        )
+    )
 
 
 def remove_first_entry_hashes(value: str) -> str:

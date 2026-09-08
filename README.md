@@ -53,8 +53,9 @@ exercised locally with 3.9 and in public CI with 3.11). Create the locked Python
 environment and build the MCP server:
 
 ```sh
-python3 -m venv agent-harness/.venv
+python3 -I -E -s -S -B -m venv agent-harness/.venv
 agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock
+agent-harness/.venv/bin/python -I -E -s -S -B tools/sanitize_python_environment.py
 cd mcp-server
 npm ci --no-audit --no-fund
 npm run build

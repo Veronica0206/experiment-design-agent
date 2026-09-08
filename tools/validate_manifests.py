@@ -70,7 +70,10 @@ REQUIRED_RUNTIME_FILES = {
     "hooks/enforce_verification.py",
 }
 
-LOCK_PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)\s+\\\s*$")
+LOCK_PIN_RE = re.compile(
+    r'^([A-Za-z0-9_.-]+)==([^\s\\;]+)'
+    r'(?:\s*;\s*(platform_system != "Darwin"))?\s+\\\s*$'
+)
 LOCK_HASH_RE = re.compile(
     r"^\s*--hash=sha256:([0-9a-f]{64})(?:\s+(\\))?\s*$"
 )
@@ -385,7 +388,7 @@ def valid_r_package_integrity_manifest(value: object) -> bool:
 
 
 def valid_python_requirements_lock(lock_text: str) -> bool:
-    """Require each continued pin to be followed immediately by its hashes."""
+    """Validate hashes and duplicates even for non-Darwin-only requirements."""
     pins: dict[str, str] = {}
     lines = lock_text.splitlines()
     index = 0
@@ -645,6 +648,7 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
             {"run": '\n'.join([
                 '"$pythonLocation/bin/python" -I -E -s -S -B -m venv agent-harness/.venv',
                 'agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock',
+                'agent-harness/.venv/bin/python -I -E -s -S -B tools/sanitize_python_environment.py',
             ])},
             {"run": "make public-check"},
         ],

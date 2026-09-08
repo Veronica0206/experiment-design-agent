@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "validate_python_environment.py"
@@ -74,6 +75,109 @@ def make_distribution(root: Path, name: str, version: str) -> FakeDistribution:
 
 
 checks: dict[str, bool] = {}
+
+
+def lock_entry(name: str, marker: str = "") -> str:
+    return f'{name}==1.0{marker} \\\n    --hash=sha256:{"0" * 64}\n'
+
+
+def rejects_lock(text: str) -> bool:
+    try:
+        module.parse_hash_lock(text)
+    except module.EnvironmentValidationError:
+        return True
+    return False
+
+
+conditional = lock_entry("watchdog", '; platform_system != "Darwin"')
+for host, expected in (
+    ("Darwin", {"example": "1.0"}),
+    ("Linux", {"example": "1.0", "watchdog": "1.0"}),
+):
+    with patch.object(module.platform, "system", return_value=host):
+        checks[f"{host.lower()}_selects_exact_marked_requirements"] = (
+            module.parse_hash_lock(lock_entry("example") + conditional) == expected
+        )
+        checks[f"{host.lower()}_rejects_duplicate_marked_names"] = rejects_lock(
+            conditional + lock_entry("WATCHDOG")
+        )
+        checks[f"{host.lower()}_rejects_duplicate_inactive_markers"] = rejects_lock(
+            conditional + conditional
+        )
+        checks[f"{host.lower()}_validates_marked_hashes"] = rejects_lock(
+            lock_entry("example") + conditional.replace("0" * 64, "invalid")
+        )
+        checks[f"{host.lower()}_rejects_unhashed_marked_entry"] = rejects_lock(
+            lock_entry("example") + conditional.split("\n", 1)[0] + "\n"
+        )
+
+for index, marker in enumerate((
+    '; platform_system == "Darwin"',
+    '; sys_platform != "darwin"',
+    '; platform_system != "Darwin" or python_version > "0"',
+    "; platform_system != 'Darwin'",
+    ';platform_system!="Darwin"',
+)):
+    checks[f"unsupported_platform_marker_{index}_rejected"] = rejects_lock(
+        lock_entry("example") + lock_entry("watchdog", marker)
+    )
+
+real_lock = (
+    MODULE_PATH.parents[1] / "agent-harness" / "requirements.lock"
+).read_text(encoding="utf-8")
+with patch.object(module.platform, "system", return_value="Darwin"):
+    darwin_pins = module.parse_hash_lock(real_lock)
+with patch.object(module.platform, "system", return_value="Linux"):
+    linux_pins = module.parse_hash_lock(real_lock)
+checks["real_lock_keeps_51_darwin_requirements"] = (
+    len(darwin_pins) == 51 and "watchdog" not in darwin_pins
+)
+checks["real_lock_adds_only_pinned_watchdog_on_linux"] = (
+    len(linux_pins) == 52 and linux_pins == {**darwin_pins, "watchdog": "6.0.0"}
+)
+
+for host in ("Darwin", "Linux"):
+    with patch.object(module.platform, "system", return_value=host):
+        host_pins = module.parse_hash_lock(lock_entry("example") + conditional)
+    with tempfile.TemporaryDirectory() as directory:
+        prefix = Path(directory) / "venv"
+        root = prefix / "site-packages"
+        app = make_distribution(root, "example", "1.0")
+        if host == "Linux":
+            try:
+                module.validate_installed_distributions(
+                    host_pins, distributions=[app], environment_prefix=prefix,
+                )
+                checks["linux_requires_marked_distribution"] = False
+            except module.EnvironmentValidationError as exc:
+                checks["linux_requires_marked_distribution"] = (
+                    "locked distribution(s) missing: watchdog" in str(exc)
+                )
+        watchdog = make_distribution(root, "watchdog", "1.0")
+        try:
+            result = module.validate_installed_distributions(
+                host_pins, distributions=[app, watchdog], environment_prefix=prefix,
+            )
+            checks[f"{host.lower()}_marked_installation_enforced"] = (
+                host == "Linux" and result[0] == 2
+            )
+        except module.EnvironmentValidationError as exc:
+            checks[f"{host.lower()}_marked_installation_enforced"] = (
+                host == "Darwin"
+                and "unexpected installed distribution(s): watchdog" in str(exc)
+            )
+        if host == "Linux":
+            watchdog.version = "2.0"
+            try:
+                module.validate_installed_distributions(
+                    host_pins, distributions=[app, watchdog], environment_prefix=prefix,
+                )
+                checks["linux_marked_version_drift_rejected"] = False
+            except module.EnvironmentValidationError as exc:
+                checks["linux_marked_version_drift_rejected"] = (
+                    "expected 1.0" in str(exc)
+                )
+
 with tempfile.TemporaryDirectory() as directory:
     prefix = Path(directory) / "venv"
     root = prefix / "site-packages"

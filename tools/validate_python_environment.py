@@ -14,6 +14,7 @@ import argparse
 import base64
 import hashlib
 import os
+import platform
 import re
 import sys
 from importlib import metadata
@@ -21,7 +22,10 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-LOCK_PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)\s+\\\s*$")
+LOCK_PIN_RE = re.compile(
+    r'^([A-Za-z0-9_.-]+)==([^\s\\;]+)'
+    r'(?:\s*;\s*(platform_system != "Darwin"))?\s+\\\s*$'
+)
 LOCK_HASH_RE = re.compile(
     r"^\s*--hash=sha256:([0-9a-f]{64})(?:\s+(\\))?\s*$"
 )
@@ -65,8 +69,13 @@ def parse_direct_requirements(text: str) -> dict[str, str]:
 
 
 def parse_hash_lock(text: str) -> dict[str, str]:
-    """Parse the intentionally small, fully pinned requirements syntax."""
+    """Validate every pin and return only requirements for the running host.
+
+    The sole supported marker is Streamlit's non-Darwin watchdog dependency.
+    Keep this parser stdlib-only: it runs before site-packages are trusted.
+    """
     pins: dict[str, str] = {}
+    seen: set[str] = set()
     lines = text.splitlines()
     index = 0
     while index < len(lines):
@@ -80,11 +89,11 @@ def parse_hash_lock(text: str) -> dict[str, str]:
                 "malformed or unhashed lock entry in requirements.lock"
             )
         package = canonical_name(pin.group(1))
-        if package in pins:
+        if package in seen:
             raise EnvironmentValidationError(
                 f"duplicate or conflicting lock entry for {package}"
             )
-        pins[package] = pin.group(2)
+        seen.add(package)
         index += 1
         entry_hashes: set[str] = set()
         while index < len(lines):
@@ -105,7 +114,11 @@ def parse_hash_lock(text: str) -> dict[str, str]:
             raise EnvironmentValidationError(
                 "malformed or unhashed lock entry in requirements.lock"
             )
-    if not pins:
+        # Inactive requirements must still have valid hashes and unique names.
+        # No environment variable or CLI option may override the actual host.
+        if pin.group(3) is None or platform.system() != "Darwin":
+            pins[package] = pin.group(2)
+    if not seen:
         raise EnvironmentValidationError(
             "no hash-locked harness requirements were declared"
         )
