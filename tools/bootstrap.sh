@@ -2,11 +2,11 @@
 # Setup for an authorized complete checkout: build the gitignored
 # mcp-server/dist/ that .mcp.json points at, and verify the pinned Python, R,
 # and Node runtimes. The public portfolio distribution intentionally omits the
-# statistical engines; use `make public-check` there instead.
+# other statistical engines; its single-endpoint profile runs `make public-check`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MIN_CLAUDE_CODE_VERSION="2.1.197"
+MIN_CLAUDE_CODE_VERSION="2.1.233"
 HARNESS_ONLY=false
 CLAUDE_VERSION_CHECK_ONLY=false
 CLAUDE_LIVE_CHECK_ONLY=false
@@ -174,6 +174,26 @@ for (let i = 0; i < 3; i += 1) {
     exit 1
   fi
   echo "claude:  $claude_raw ($REVIEWED_CLAUDE)"
+  # Check the reviewed startup configuration, without authenticating or
+  # dispatching a paid model request. The capture hook checks the effective
+  # environment in the running Claude process as well.
+  "$REVIEWED_NODE" -e '
+const fs = require("node:fs");
+const settings = JSON.parse(fs.readFileSync(".claude/settings.json", "utf8"));
+if (settings.env?.CLAUDE_CODE_FORK_SUBAGENT !== "0"
+    || (process.env.CLAUDE_CODE_FORK_SUBAGENT !== undefined
+        && process.env.CLAUDE_CODE_FORK_SUBAGENT !== "0")) {
+  console.error("ERROR: native coordinator requires CLAUDE_CODE_FORK_SUBAGENT=0 in project settings and no conflicting environment override");
+  process.exit(1);
+}
+const disabled = (value) => ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+if (disabled(settings.env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)
+    || disabled(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)) {
+  console.error("ERROR: native coordinator explicit foreground contract is incompatible with CLAUDE_CODE_DISABLE_BACKGROUND_TASKS; unset it or set it false before starting Claude");
+  process.exit(1);
+}
+'
+  echo "Claude foreground startup configuration check passed"
 }
 
 check_claude_live() {
@@ -220,10 +240,13 @@ else
   echo "claude:  skipped (--harness-only)"
 fi
 
-echo "== R packages =="
+RUNTIME_PROFILE=$(tools/run-reviewed-r.sh -e 'source("mcp-server/r-wrapper/runtime-profile.R"); cat(load_runtime_profile(".")$name)')
+echo "== R packages ($RUNTIME_PROFILE) =="
 tools/run-reviewed-r.sh - <<'RS'
-req <- c("jsonlite", "mvtnorm", "survival")
-opt <- c("Exact", "MAMS")
+source("mcp-server/r-wrapper/runtime-profile.R")
+profile <- load_runtime_profile(".")
+req <- setdiff(profile$r_packages, c("Exact", "MAMS"))
+opt <- intersect(profile$r_packages, c("Exact", "MAMS"))
 missing <- req[!vapply(req, requireNamespace, TRUE, quietly = TRUE)]
 if (length(missing)) {
   stop("required R package(s) missing: ", paste(missing, collapse = ", "),
@@ -240,15 +263,24 @@ for (p in opt) {
 }
 cat("R packages OK\n")
 RS
-EXPDESIGN_PYTHON="$HARNESS_PYTHON" \
-  tools/run-reviewed-python.sh tools/validate_r_environment.py
+if [[ "$RUNTIME_PROFILE" == complete ]]; then
+  EXPDESIGN_PYTHON="$HARNESS_PYTHON" \
+    tools/run-reviewed-python.sh tools/validate_r_environment.py
+else
+  echo "Public edition: installed R/package bytes are recorded and checked by runtime provenance."
+  echo "The complete installation's platform-specific R release attestation is a separate gate."
+fi
 
 echo "== MCP server build =="
 (cd mcp-server && npm ci --no-audit --no-fund && npm run build)
 test -f mcp-server/dist/index.js || { echo "ERROR: dist/index.js missing after build"; exit 1; }
 
 echo "== test matrix =="
-make PYTHON="$HARNESS_PYTHON" test
+if [[ "$RUNTIME_PROFILE" == single-endpoint ]]; then
+  make PYTHON="$HARNESS_PYTHON" public-check
+else
+  make PYTHON="$HARNESS_PYTHON" test
+fi
 
 echo "Bootstrap complete. Open this folder in Claude Code (uses .mcp.json), or run:"
 echo "  EXPDESIGN_PYTHON=$HARNESS_PYTHON tools/run-reviewed-python.sh -m streamlit run agent-harness/streamlit_app.py --server.headless true --server.address 127.0.0.1 --server.port 8501"

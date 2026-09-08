@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "active": "single-endpoint",
+  "profiles": {
+    "complete": {
+      "skills": [
+        "vera-experiment-designing",
+        "vera-master-experiment-designing",
+        "vera-doe-designing",
+        "vera-indirect-comparing",
+        "vera-meta-analyzing"
+      ],
+      "domains": [
+        "single_endpoint",
+        "master_protocol",
+        "doe",
+        "randomization",
+        "indirect_comparison",
+        "meta_analysis"
+      ],
+      "tools": [
+        "validate_config",
+        "sample_size",
+        "simulate_design",
+        "run_tests",
+        "master_simulate",
+        "ab_test",
+        "factorial_design",
+        "rsm_design",
+        "randomize",
+        "indirect_compare",
+        "meta_analyze"
+      ],
+      "r_packages": [
+        "jsonlite",
+        "survival",
+        "Exact",
+        "mvtnorm",
+        "MAMS"
+      ],
+      "expected_regression_pass_counts": {
+        "vera-experiment-designing": 31,
+        "vera-master-experiment-designing": 53,
+        "vera-doe-designing": 14,
+        "vera-indirect-comparing": 15,
+        "vera-meta-analyzing": 14
+      }
+    },
+    "single-endpoint": {
+      "skills": [
+        "vera-experiment-designing"
+      ],
+      "domains": [
+        "single_endpoint"
+      ],
+      "tools": [
+        "validate_config",
+        "sample_size",
+        "simulate_design",
+        "run_tests"
+      ],
+      "r_packages": [
+        "jsonlite",
+        "survival",
+        "Exact"
+      ],
+      "expected_regression_pass_counts": {
+        "vera-experiment-designing": 31
+      }
+    }
+  }
+}

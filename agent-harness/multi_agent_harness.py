@@ -39,6 +39,14 @@ CLARIFICATION_FIELDS = (
 
 
 def _router_prompt(children: list[str]) -> str:
+    rules = {
+        "single-endpoint-designer": "one-endpoint validation, power, sample size, OC, PPOS.",
+        "master-protocol-designer": "basket, umbrella, platform, multi-arm or multi-stage.",
+        "doe-designer": "A/B sizing, factorial screening, response-surface design.",
+        "randomization-planner": "seeded simple, block, or stratified assignment only.",
+        "indirect-comparison-analyst": "one Bucher comparison or one MAIC analysis.",
+        "meta-analysis-analyst": "fixed- or random-effects pooling across studies.",
+    }
     return f"""\
 You are the routing-only coordinator for a governed experiment-design system.
 You never calculate, interpret, or restate a statistical result. Return exactly
@@ -48,12 +56,10 @@ Allowed domain agents, in canonical output order:
 {chr(10).join(f'- {name}' for name in children)}
 
 Routing rules:
-- single-endpoint-designer: one-endpoint validation, power, sample size, OC, PPOS.
-- master-protocol-designer: basket, umbrella, platform, multi-arm or multi-stage.
-- doe-designer: A/B sizing, factorial screening, response-surface design.
-- randomization-planner: seeded simple, block, or stratified assignment only.
-- indirect-comparison-analyst: one Bucher comparison or one MAIC analysis.
-- meta-analysis-analyst: fixed- or random-effects pooling across studies.
+{chr(10).join(f'- {name}: {rules[name]}' for name in children)}
+Capabilities absent from this roster are unavailable in the installed edition.
+For an unavailable request, clarify the intended supported analysis; never route
+it to an unrelated specialist or pretend the missing capability is installed.
 
 Prefer one agent. Select several only for explicitly independent deliverables.
 Never route a dependent evidence-to-design pipeline in one turn: an indirect or
@@ -62,6 +68,10 @@ explicitly confirms the exact estimate and intended design role. If routing is
 ambiguous, choose action=clarify with the smallest allowlisted field list.
 Never include private data, paths, labels, rows, strata, or numeric values in the
 route decision; child agents receive the original user message from the host.
+When routing or a domain agent required clarification, the host also includes
+unseen verbatim user messages from that unresolved request, separately from the
+current user reply. Completed requests remain in their own domain conversations
+and are never copied to a newly selected domain agent.
 """
 
 
@@ -115,6 +125,11 @@ class MultiAgentExperimentDesignHarness:
         if not self.children:
             raise ValueError("coordinator has no governed domain agents")
         self._router_messages: list[dict[str, Any]] = []
+        # Only raw user messages from an unresolved clarification episode live
+        # here. Track what each domain already received to avoid duplicate
+        # history while allowing clarification to select a different domain.
+        self._pending_user_messages: list[str] = []
+        self._pending_messages_seen_by_agent: dict[str, int] = {}
         self._executors: dict[str, ExperimentDesignHarness] = {}
         self._started = False
         self.orchestration_id = f"orchestration-{uuid.uuid4().hex}"
@@ -136,6 +151,12 @@ class MultiAgentExperimentDesignHarness:
                 # allowing the UI or caller to retry cleanup deterministically.
                 failed[name] = executor
         self._executors = failed
+        # A later start creates fresh conversations for retired handles. Those
+        # domains must receive the unresolved request again when dispatched.
+        self._pending_messages_seen_by_agent = {
+            name: count for name, count in self._pending_messages_seen_by_agent.items()
+            if name in failed
+        }
         self._started = False
         if failed:
             raise RuntimeError("one or more domain runtimes failed to stop")
@@ -200,7 +221,9 @@ class MultiAgentExperimentDesignHarness:
             if phase in {"Elicit", "Configure", "Execute", "Verify"}:
                 return {"event": "phase", "phase": phase}
             return None
-        if event_type in {"tool_call", "tool_result", "tool_result_withheld"}:
+        if event_type in {
+            "tool_call", "tool_result", "tool_result_withheld", "tool_request_rejected",
+        }:
             tool = event.get("tool")
             if tool not in allowed_tools:
                 return None
@@ -318,6 +341,8 @@ class MultiAgentExperimentDesignHarness:
             raise RuntimeError("call start() before run()")
         parent_task_id = f"turn-{uuid.uuid4().hex}"
         router_checkpoint = len(self._router_messages)
+        pending_checkpoint = list(self._pending_user_messages)
+        seen_checkpoint = dict(self._pending_messages_seen_by_agent)
         child_checkpoints: list[tuple[Any, int]] = []
         try:
             try:
@@ -331,6 +356,16 @@ class MultiAgentExperimentDesignHarness:
                     agent_name="experiment-design-coordinator",
                     domain="coordination",
                 )
+
+            if action == "clarify":
+                self._pending_user_messages.append(user_message)
+            else:
+                # A terminal execution failure must not carry an abandoned
+                # request into another domain. An accepted child clarification
+                # retains the episode after fan-in; cancellation restores both
+                # checkpoints alongside router and child conversations.
+                self._pending_user_messages.clear()
+                self._pending_messages_seen_by_agent.clear()
 
             yield {"event": "route", "action": action, "agents": agents, "fields": fields}
             if action == "clarify":
@@ -358,7 +393,15 @@ class MultiAgentExperimentDesignHarness:
                     checkpoint = self._child_checkpoint(child)
                     if checkpoint is not None:
                         child_checkpoints.append((child, checkpoint))
-                    generator = child.run(user_message)
+                    child_request = user_message
+                    unseen_messages = pending_checkpoint[seen_checkpoint.get(agent_name, 0):]
+                    if unseen_messages:
+                        child_request = json.dumps({
+                            "type": "clarified_user_request",
+                            "prior_user_messages": unseen_messages,
+                            "current_user_message": user_message,
+                        }, separators=(",", ":"), ensure_ascii=True)
+                    generator = child.run(child_request)
                     try:
                         while True:
                             try:
@@ -428,6 +471,14 @@ class MultiAgentExperimentDesignHarness:
                     domain="coordination",
                 )
 
+            if any(item.status == "CLARIFICATION" for item in ledger.all()):
+                # aggregate_handoffs permits only one child for clarification.
+                # Save raw user input only, never its elicitation output or any
+                # generated evidence. Other domains may still need this input.
+                self._pending_user_messages[:] = [*pending_checkpoint, user_message]
+                self._pending_messages_seen_by_agent.update(seen_checkpoint)
+                self._pending_messages_seen_by_agent[agents[0]] = len(self._pending_user_messages)
+
             yield {"event": "message", "content": final}
             yield {"event": "done"}
             return RunResult(
@@ -445,6 +496,9 @@ class MultiAgentExperimentDesignHarness:
             # No user result is emitted for caller cancellation. Restore both
             # the routing conversation and every child touched by this turn.
             del self._router_messages[router_checkpoint:]
+            self._pending_user_messages[:] = pending_checkpoint
+            self._pending_messages_seen_by_agent.clear()
+            self._pending_messages_seen_by_agent.update(seen_checkpoint)
             self._rollback_children(child_checkpoints)
             raise
 

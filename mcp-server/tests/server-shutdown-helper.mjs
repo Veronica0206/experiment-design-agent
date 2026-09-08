@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { runRscript, activeRProcessGroupCount } from "../dist/r-bridge.js";
+import {
+  runRscript, activeRProcessGroupCount, shutdownActiveRProcesses,
+} from "../dist/r-bridge.js";
 import {
   activeVerifierProcessGroupCount,
   runVerifierRequest,
+  shutdownActiveVerifierProcesses,
 } from "../dist/verifier.js";
 import {
   activeRuntimeProbeProcessGroupCount,
   currentPythonRuntimeSnapshot,
+  shutdownActiveRuntimeProbeProcesses,
 } from "../dist/integrity.js";
 import { installServerShutdownHandlers } from "../dist/index.js";
 
@@ -60,6 +64,13 @@ assert.match(String(verification.error), /Verifier runtime is shutting down/);
 const runtimeProbe = await runtimeProbeOutcome;
 assert.equal(runtimeProbe.ok, false);
 assert.match(String(runtimeProbe.error), /Runtime fingerprint probes are shutting down/);
+// Cancellation rejects verifier/probe requests before their close events.
+// Await the production cleanup promises before asserting group bookkeeping.
+await Promise.all([
+  shutdownActiveRProcesses(),
+  shutdownActiveVerifierProcesses(),
+  shutdownActiveRuntimeProbeProcesses(),
+]);
 assert.equal(activeRProcessGroupCount(), 0);
 assert.equal(activeVerifierProcessGroupCount(), 0);
 assert.equal(activeRuntimeProbeProcessGroupCount(), 0);

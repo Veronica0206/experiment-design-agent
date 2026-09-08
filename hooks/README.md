@@ -9,6 +9,17 @@ only for a main agent; inside a subagent definition the parenthesized list is
 ignored. Requiring the coordinator as main preserves both its child allowlist
 and its user-prompt binding.
 
+The project also sets `CLAUDE_CODE_FORK_SUBAGENT=0` in `.claude/settings.json`.
+This overrides the interactive fork-mode default introduced in Claude 2.1.232,
+which otherwise hides `run_in_background` and forces asynchronous dispatch.
+`bootstrap.sh --check-claude-version` checks the startup setting and rejects a
+conflicting environment override. The capture/bind launcher checks that the
+running host actually inherited `0`; restart Claude after changing settings.
+The preflight and capture/bind checks also reject a true
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` setting (Claude's case-insensitive,
+trimmed `1`, `true`, `yes`, or `on` values), which independently hides the same
+Agent parameter. These checks do not override that user preference.
+
 Before each main-thread user turn, the coordinator's `UserPromptSubmit` hook
 captures a keyed HMAC commitment to the exact raw prompt. The commitment is
 keyed by `session_id`, `prompt_id`, and `main:experiment-design-coordinator`.
@@ -17,7 +28,7 @@ files use mode `0600` inside a mode-`0700` host directory.
 
 Before an `Agent` call executes, the coordinator's `PreToolUse` hook requires:
 
-1. the exact committed user prompt, byte-for-byte;
+1. the exact committed user prompt, or a host-validated clarification envelope;
 2. one registry-approved child type;
 3. the deterministic description `Dispatch current request to <child>`;
 4. explicit foreground execution (`run_in_background: false`); and
@@ -31,10 +42,36 @@ unsupported input shape blocks before the child starts. Child names already
 authorized for the turn are committed atomically without storing the prompt;
 distinct same-phase fan-out remains allowed. The per-prompt commitment is
 removed when the coordinator emits a terminal governed response.
+An accepted clarification preserves only keyed commitments to unresolved user
+messages in a private session episode. The next capture announces the number of
+prior turns. Dispatch then requires a JSON object with `type` set to
+`clarified_user_request`, a `prior_user_messages` array of those exact messages
+in order, and `current_user_message` set to the latest exact message. The host
+checks every commitment, rejects omissions, reordering and added assistant/tool
+text, and normalizes the envelope before execution. Only the current message
+may establish current-turn confirmation. The original request remains available
+when a child asks a question or one report in a multi-child aggregate is a
+clarification. A previously selected evidence/planning phase carries forward.
+Success and value-free failure clear the pending episode; blocked output leaves
+it available for retry. Pending history is bounded to 16 user turns and 128 KiB
+of decoded user text. An over-limit clarification must end with value-free
+failure; start a fresh request with complete parameters. Old or malformed state
+is rejected rather than silently migrated. No raw request text is persisted.
 `PostToolBatch` still sanitizes the completed child call to its approved type
 plus final text, and `Stop` still binds the coordinator's final output to that
 ledger. A legacy/malformed mixed ledger may terminate only with the exact
 value-free failure report, which also clears the turn state.
+
+The native response adapter recognizes the exact standalone final telemetry
+block emitted by Claude 2.1.233 (matching agent IDs and bounded usage integers).
+It removes that block before binding the child result. Structured completed
+responses already separate metadata and therefore need no stripping. Embedded,
+duplicated, malformed or unknown metadata formats fail closed, as do async
+launches. The adapter never removes suffixes from arbitrary child prose. This
+preserves exact failure detection and prevents a failed child from being
+combined with a successful sibling. These paths are tested with production-hook
+fixtures; the installed-version/configuration probe is not an authenticated
+end-to-end Claude model test.
 
 ## enforce_verification.py — agent-scoped `Stop` / `SubagentStop` gate
 
@@ -125,10 +162,18 @@ The generous hook
 timeout is not the only trust boundary: the MCP server verifies before release.
 It keys on the MCP server name `mcp__experiment-design__` — if you register the
 server under a different name in `.mcp.json`, update `SERVER` in the hook.
-Claude Code 2.1.197+ is required: the identity-safe ledger depends on the
-`prompt_id` hook field introduced in 2.1.196, and both governed agents select
-Claude Sonnet 5, which requires 2.1.197. `tools/bootstrap.sh` enforces the
-combined minimum.
+Claude Code 2.1.233+ is required for the reviewed foreground child-result
+protocol. This also covers the `prompt_id` hook identity field and configured
+Claude Sonnet 5 model. `tools/bootstrap.sh` enforces this minimum; unsupported
+future result formats still fail closed until their adapters are reviewed.
+
+**Workspace trust.** Agent-frontmatter hooks run only after the workspace-trust
+dialog for this suite folder has been accepted (Claude Code 2.1.218+). In an
+untrusted folder the `record` and `enforce` hooks never start, and because an
+allowing hook is silent (see Observability below) the loss of enforcement is
+invisible in the transcript. Before relying on the gate, set
+`EXPDESIGN_HOOK_LOG`, run one governed analysis, and confirm that a
+`PostToolBatch` and a `Stop`/`SubagentStop` event were logged.
 
 **Tests.** `hooks/tests/test_enforce_verification.py` covers identity-safe
 correction, laundering, framework schemas, and value-free escape behavior.

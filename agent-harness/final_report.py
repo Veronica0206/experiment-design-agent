@@ -22,6 +22,22 @@ from verification import (PUBLIC_LIMITATION_MESSAGES, canonical_value,
                           public_limitation_codes)
 
 
+# Design rows mix factor coordinates with a small, fixed metadata vocabulary.
+# Keep this contract in the public-projection module and import it from the
+# scientific gates so discovery, shape validation, and reporting cannot drift.
+# Matching is case-insensitive at the private boundary; public output always
+# uses these canonical lowercase names.
+DESIGN_METADATA_COLUMNS = frozenset({"point_type", "run", "std_order"})
+
+
+def normalized_design_metadata_column(value: Any) -> str | None:
+    """Return a canonical design-metadata name, or ``None`` for a factor."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.casefold()
+    return normalized if normalized in DESIGN_METADATA_COLUMNS else None
+
+
 # Public reports are explicit data-transfer contracts.  Unknown fields are
 # private by default, and a field is admitted only at its documented tool/path
 # and in the correct direction (argument or result).  This prevents a new R
@@ -396,7 +412,7 @@ def _bounded_sequence(
     return projected
 
 
-def _factor_name_sort_key(name: str) -> tuple[int, int, str]:
+def factor_name_sort_key(name: str) -> tuple[int, int, str]:
     """Sort canonical public aliases numerically and all other names stably."""
     prefix = "factor_"
     if name.startswith(prefix):
@@ -470,10 +486,10 @@ def _factor_names_from_design(value: dict[str, Any]) -> list[str]:
     return sorted(
         {
             str(key) for row in rows for key, item in row.items()
-            if str(key).lower() not in {"point_type", "run", "std_order"}
+            if normalized_design_metadata_column(key) is None
             and _number(item) is not _DROP
         },
-        key=_factor_name_sort_key,
+        key=factor_name_sort_key,
     )
 
 
@@ -596,10 +612,10 @@ def _project_design(value: Any) -> Any:
     factor_names = sorted(
         {
             str(key) for row in rows for key, item in row.items()
-            if str(key).lower() not in {"point_type", "run"}
+            if normalized_design_metadata_column(key) is None
             and _number(item) is not _DROP
         },
-        key=_factor_name_sort_key,
+        key=factor_name_sort_key,
     )
     aliases = {name: f"factor_{index + 1}" for index, name in enumerate(factor_names)}
     public_rows: list[dict[str, Any]] = []
@@ -607,18 +623,18 @@ def _project_design(value: Any) -> Any:
         public_row: dict[str, Any] = {}
         for key, item in sorted(row.items(), key=lambda pair: str(pair[0])):
             name = str(key)
-            lowered = name.lower()
+            metadata_name = normalized_design_metadata_column(key)
             if name in aliases:
                 public = _number(item)
                 if public is not _DROP:
                     public_row[aliases[name]] = public
                 continue
-            if lowered == "run":
+            if metadata_name in {"run", "std_order"}:
                 public = _number(item)
                 if public is not _DROP:
-                    public_row["run"] = public
-            elif lowered == "point_type" and isinstance(item, str):
-                normalized = item.lower()
+                    public_row[metadata_name] = public
+            elif metadata_name == "point_type" and isinstance(item, str):
+                normalized = item.casefold()
                 if normalized in _ENUM_VALUES["point_type"]:
                     public_row["point_type"] = normalized
         public_rows.append(public_row)

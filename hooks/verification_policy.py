@@ -23,6 +23,7 @@ from private_state import (
     locked_private_directory,
 )
 from governance.registry import RegistryError, domain_phase, get_agent
+from governance.runtime_profile import load_runtime_profile
 
 
 SERVER = "mcp__experiment-design__"
@@ -375,7 +376,7 @@ def _enforce_coordinator(
         lines = line_source(data)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         if api["is_elicitation_message"](message):
-            clear_ledger(data)
+            clear_ledger(data, preserve_clarification=True)
             _allow("coordinator has no child ledger; explicit open-ended elicitation")
         if _safe_failure_report(message):
             clear_ledger(data)
@@ -392,7 +393,7 @@ def _enforce_coordinator(
 
     if not calls:
         if api["is_elicitation_message"](message):
-            clear_ledger(data)
+            clear_ledger(data, preserve_clarification=True)
             _allow("coordinator made no child call; explicit open-ended elicitation")
         if _safe_failure_report(message):
             clear_ledger(data)
@@ -436,7 +437,9 @@ def _enforce_coordinator(
             "VERIFIED. Coordinator output must copy the completed child result exactly, "
             "or join multiple results in registry order with blank-line horizontal-rule separators."
         )
-    clear_ledger(data)
+    clear_ledger(data, preserve_clarification=any(
+        api["is_elicitation_message"](call["final"]) for call in ordered
+    ))
     _allow(f"VERIFIED: {len(ordered)} exact child result(s)")
 
 
@@ -484,14 +487,15 @@ def enforce(
     if parse_errors:
         _terminal_or_block(data, "; ".join(parse_errors[:5]), "INTERNAL_ERROR")
     allowed_tools = set(agent["tools"])
-    if f"{SERVER}*" not in allowed_tools:
-        used_tools = {f"{SERVER}{item['tool']}" for item in calls + runtests + ungated}
-        outside = sorted(used_tools - allowed_tools)
-        if outside:
-            _terminal_or_block(
-                data, f"Tools outside the registered agent allowlist were used: {outside}.",
-                "INTERNAL_ERROR",
-            )
+    installed = {f"{SERVER}{tool}" for tool in load_runtime_profile()["tools"]}
+    allowed_tools = installed if f"{SERVER}*" in allowed_tools else allowed_tools & installed
+    used_tools = {f"{SERVER}{item['tool']}" for item in calls + runtests + ungated}
+    outside = sorted(used_tools - allowed_tools)
+    if outside:
+        _terminal_or_block(
+            data, f"Tools outside the registered agent allowlist were used: {outside}.",
+            "INTERNAL_ERROR",
+        )
     if not calls:
         message = _last_message_text(data.get("last_assistant_message")) or _last_assistant_text(lines)
         validate_history = [

@@ -4,6 +4,93 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## Unreleased — 2026-09-08 public single-endpoint edition
+
+- Select complete or single-endpoint capabilities from a strict repository-owned
+  profile; scope tools, agent routing, startup dependencies, regression counts,
+  fingerprints and native hooks to that installation.
+- Prepare an isolated public source tree with the six shared R engine files,
+  curated examples and tests. Exclude other engines, proprietary skill content,
+  reference documents, older duplicate scenario drivers and generated artifacts.
+- Keep default numerical methods unchanged; add explicit example simulation
+  budgets and robust paths, including directories containing spaces.
+- Add actual public MCP calculation/replay tests, profile rejection tests and
+  source-inventory checks. Public CI validates the runnable selected engine.
+- Preserve the R module's existing GPLv3 notice alongside the agent's MPL 2.0
+  notice. Preparation records byte hashes and performs no remote publication.
+
+## Unreleased — 2026-09-04 agent review fixes
+
+- Configure the native coordinator for foreground dispatch and check the
+  Claude Code 2.1.233 protocol at startup. Separate the exact native Agent
+  telemetry footer from child content before canonical-result comparison and
+  failure propagation.
+- Preserve unresolved clarification inputs as exact user-message envelopes.
+  Native hooks verify keyed commitments without persisting raw prompts;
+  the Python coordinator forwards only the context a specialist has not
+  already received. Completed results are not added to clarification inputs.
+- Preserve validated MCP input rejections as typed errors and permit bounded
+  correction or structured clarification. Rejected requests do not trigger
+  statistical verification. Malformed evidence remains terminal, and
+  ambiguous correction calls cannot share a verification lineage.
+- Exclude uncommitted staging runs from committed artifact retention capacity.
+  Aborting a run removes its own staging output without evicting verified
+  output; capacity cleanup applies when a verified run is committed.
+- Keep a supervisor as the process-group leader for standalone detached
+  Linux/macOS runtimes until descendant cleanup finishes, including when
+  descendants retain inherited descriptors after the runtime exits.
+- Add regressions for native dispatch and footer handling, clarification
+  integrity, bounded request correction, artifact retention, and standalone
+  descendant cleanup.
+
+## Unreleased — 2026-09-03 review and SCD demo readiness
+
+- Made the lifecycle mutating-file assertion accept the open-phase detection
+  (`changed while opening`) as well as the read-phase detection. Under CPU
+  contention the first append landed between the named `lstat` and the
+  descriptor `stat`, which the fingerprint code correctly rejects, and the
+  release gate failed on wording alone.
+- Raised the production dependency overrides after new advisories:
+  `fast-uri` 3.1.5 -> 3.1.7 (four high-severity host-confusion/SSRF advisories
+  in 3.0.0-3.1.5) and a new `qs` 6.16.0 override (array-limit bypass and
+  attacker-controlled `isBuffer` denial of service in <= 6.15.3).
+  `npm audit --omit=dev --audit-level=high` is clean again.
+- Added a MAIC form to the Streamlit indirect-comparison mode. The direct form
+  path previously offered only Bucher, so a matching-adjusted comparison could
+  run only through the LLM chat mode or the Claude Code agent.
+- Documented the workspace-trust requirement for agent-frontmatter hooks
+  (Claude Code 2.1.218+) and how to confirm that the ledger and Stop hooks
+  actually fired, and documented the two-turn anchored-MAIC workflow (MAIC, then
+  Bucher with the restated effect) in the READMEs, the indirect-comparison
+  agent prompt, and the legacy harness prompt.
+- Known limitation recorded, not changed: public MAIC and Bucher reports omit
+  arm, covariate, and treatment labels by design (strings pass the projection
+  only through enum tables), so `arm_summary`, `ess`, and `balance` rows are
+  identified by position (arms in alphabetical label order; covariates in
+  request order). Labels remain in the private artifacts.
+
+## Unreleased — 2026-08-26 third-round public-interface review
+
+- Bound response-surface outputs to the effective request, canonical standard
+  order, reported run order, and requested randomization state. CCD and BBD
+  geometry checks now reject incomplete, malformed, and resolution-II cores,
+  while public metadata remains literal and projection-idempotent. Standard
+  order now uses the same numeric-aware factor-name order as public aliases,
+  independent of private column insertion order.
+- Moved MCP tool dispatch behind a repository-controlled strict boundary so
+  malformed tool names, argument containers, schemas, and supported
+  cross-field combinations receive the fixed public error taxonomy before an
+  R workload or input-file read begins. A real stdio boundary regression runs
+  in the engine-free public lifecycle as well as the complete installation.
+- Replaced ambient Node environment inheritance with an explicit Python-side
+  allowlist and a second, empty-environment launcher boundary. Only reviewed
+  runtime, locale, temporary-directory, artifact, and authenticated supervisor
+  values reach the MCP server process.
+- Added compositional response budgets at the tool-result, verifier-envelope,
+  canonical-report, public-result, and client-frame layers. Exact-limit and
+  over-limit regressions are now part of both the local suite and the pinned
+  public assurance workflow.
+
 ## Unreleased — 2026-08-26 second-round public-interface review
 
 - Made the standalone MCP smoke suite fail closed: every executed check is

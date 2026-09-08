@@ -1,37 +1,35 @@
 # Experiment Design MCP Server
 
-> **Not a standalone public distribution:** The public portfolio repository
-> intentionally omits the required proprietary statistical engines. You can
-> inspect and compile the distributed TypeScript surface, but a fresh public
-> clone cannot execute the analysis tools. Operational use requires an
-> authorized, complete suite installation.
+The public single-endpoint edition exposes four typed MCP tools over stdio:
+`validate_config`, `sample_size`, `simulate_design`, and `run_tests`. It includes
+the shared R engine, numerical tests, runtime fingerprints and verification.
 
-Wraps the R experiment-design framework as 11 typed MCP tools over stdio:
+The complete installation additionally exposes `master_simulate`,
+`indirect_compare`, `meta_analyze`, `ab_test`, `factorial_design`, `rsm_design`,
+and `randomize`. Those tools are neither advertised nor callable in the public
+profile. The sections below describe shared contracts and, where named,
+complete-installation tools.
 
-**Planning** — `validate_config`, `sample_size`, `simulate_design`,
-`master_simulate`, `indirect_compare`, `meta_analyze`
-**Construction (DOE)** — `ab_test`, `factorial_design`, `rsm_design`, `randomize`
-**Verification** — `run_tests`
+## Build and installation prerequisites
 
-## Build and authorized-installation prerequisites
-
-The commands below compile the public MCP interface. A successful build is not
-an operational-readiness or release attestation, and it does not supply the
-omitted engines.
+Build the MCP interface after installing the dependencies documented in the
+root README. The selected profile must have all its required engine files;
+a successful compilation alone does not verify an analysis.
 
 ```bash
 cd mcp-server
-npm ci
+npm ci --no-audit --no-fund
 npm run build      # compiles src/ -> dist/ (dist is gitignored)
 ```
 
-When the compiled entrypoint is executed, it checks for the required private
-engine entrypoints before connecting the MCP transport or advertising any
+When the compiled entrypoint is executed, it checks for the engine entrypoints
+required by the repository-owned profile before connecting the MCP transport or advertising any
 tools. If the installation is incomplete, startup exits with a fixed,
 path-free explanation. This presence check has no bypass and is deliberately
 narrow: it does not validate scientific correctness, runtime dependencies,
 regression status, or complete release readiness. Those remain the job of the
-full authorized-installation validation and runtime gates.
+selected-profile numerical checks and runtime gates. `make public-check`
+executes the public R suite and real MCP requests with the other engines absent.
 
 This package is intentionally non-publishable: `private: true` and a local
 `prepublishOnly` guard make an accidental `npm publish` fail closed.
@@ -43,15 +41,17 @@ closed list of absolute installation candidates and prefers
 absolute `EXPDESIGN_RSCRIPT` and `EXPDESIGN_PYTHON` paths; relative overrides
 are rejected. R profile and library environment variables are cleared, so the
 governed runtime uses only the selected R installation's default libraries;
-project-local `renv` libraries are not implicitly activated. R must provide
-`jsonlite`, `mvtnorm`, and `survival`; the release gate also validates their
+project-local `renv` libraries are not implicitly activated. The public profile requires `jsonlite` and `survival`, with optional `Exact`.
+The complete profile additionally uses `mvtnorm` and optional `MAMS`; its full
+release gate also validates the
 applicable transitive lock closure and every installed `renv.lock` record. The
 release gate separately compares bounded, no-follow SHA-256 hashes of every
 applicable installed R package tree with the reviewed exact-version/platform
 profile. That profile detects post-review installed-byte drift; it does not
 authenticate package archives and must be generated only after an independently
 clean, lock-restored review. The Claude agent path additionally requires a
-canonical Claude Code product identity and version 2.1.197+ for agent-scoped hooks,
+canonical Claude Code product identity and version 2.1.233+ for the reviewed
+foreground dispatch and child-result protocol,
 `prompt_id` ledger binding, and the configured Claude Sonnet 5 model. The
 release gate checks that installed version without requiring login;
 `make check-claude-live` is the optional authenticated-session check.
@@ -66,10 +66,13 @@ cryptographic attestation against a deliberately impersonating same-user binary.
 the suite directory and launch the recommended routing-only coordinator with
 `claude --agent experiment-design-coordinator`. It delegates to the smallest
 approved specialist set and combines only verified canonical reports. The
-legacy **experiment-designer** remains available as an all-domain compatibility
-surface. `design-verifier` is an optional fresh re-execution surface governed
+legacy **experiment-designer** remains available as a compatibility surface,
+restricted to the installed profile's tools. `design-verifier` is an optional fresh re-execution surface governed
 by the same engine and fail-closed policy; it is not an independent methodology
-audit.
+audit. Accept the workspace-trust prompt for the suite folder before the first
+run: agent-scoped frontmatter hooks (the verification ledger and the Stop gate)
+do not execute from an untrusted folder, and an allowing hook leaves no trace in
+the transcript. `hooks/README.md` describes how to confirm that the hooks fired.
 
 ## Use from Python (Streamlit harness)
 
@@ -108,7 +111,12 @@ requested label. The server closes that class of bug three ways:
     Platform requests must provide `n_periods`, `n_per_period`, and an
     `arms_schedule` whose `enter`/`leave` arrays each have `n_subgroups` integer
     values satisfying `1 <= enter <= leave <= n_periods`. Platform-only fields
-    are rejected for basket and umbrella designs. `interim_frequency` and
+    are rejected for basket and umbrella designs; basket- and umbrella-only
+    fields are likewise rejected outside their design. Method-specific prior,
+    dropping, adaptive-randomization, and NCC controls require the method that
+    actually consumes them. Endpoint parameter arrays must match
+    `n_subgroups`, and endpoint-specific inputs are checked before execution.
+    `interim_frequency` and
     `futility_threshold` are available only for binary/continuous platform
     designs with `ncc_method='none'`. `effect_threshold` is not exposed because
     calibrated interim efficacy stopping is not implemented; the Python gate
@@ -118,7 +126,10 @@ requested label. The server closes that class of bug three ways:
   like `overdispersion` / `rar_eta`) errors at the boundary instead of being
   stripped. Selected fixed-value/reserved enums stay exposed so the request
   fails rather than silently degrading; wholly unsupported controls are absent.
-  Model-facing execution errors use a fixed value-free message. Exposed
+  The repository owns the low-level `tools/call` boundary, so tool-name,
+  argument-container, and schema failures cannot be serialized first by the
+  SDK as free-form diagnostics. Model-facing execution errors use a fixed
+  value-free message. Exposed
   refusal cases include single-value enums (`tte_method`, `rate_method`,
   `fwer_control`, `power_type`, `shared_control`), `selection_rule` (derived
   only), and the design-scoped keys `phase` / `borrowing_method` (basket),
@@ -131,6 +142,13 @@ requested label. The server closes that class of bug three ways:
     number or `{n_trt, n_ctrl}`), `seed`.
   - `master_simulate`: `seed` (the config's resolved seed).
   - `factorial_design` / `rsm_design`: `seed` echoed when `randomize=true`.
+    RSM rows always include literal `run` and `std_order` metadata. The public
+    bridge constructs the standard design first, then applies the requested
+    seeded run-order permutation. Standard order uses the same deterministic
+    factor-name ordering as the public `factor_N` projection, so it is
+    independent of private data-frame column insertion order. Verification can
+    distinguish randomized from standard order without treating either
+    metadata column as a factor.
   - `randomize`: `method='simple'` is equal-probability randomization only;
     non-equal `ratio` weights require `block` or `stratified`. For those methods,
     `block_size_used` shows the effective block: a requested `block_size` is
@@ -138,7 +156,9 @@ requested label. The server closes that class of bug three ways:
     otherwise the base block is used.
   - `meta_analyze`: `n_input`, `k_used`, `dropped_studies` (+ per-study
     `dropped_detail` with reasons) — pooling drops studies with non-finite or
-    malformed inputs, and that exclusion is now visible instead of silent.
+    malformed inputs, and that exclusion is now visible instead of silent. A
+    request must still contain at least two usable studies on one compatible
+    effect-measure scale.
   - DOE tools (`ab_test`, `factorial_design`, `rsm_design`, `randomize`):
     provided parameters that the selected R routine does not declare are
     returned in `ignored_params` instead of being dropped silently (e.g.
@@ -155,6 +175,16 @@ uses a stratified nonparametric bootstrap that refits the MAIC weights; its
 replicate count and seed are explicit and echoed. Row-level MAIC weights remain in
 the private artifact directory; model-visible output contains aggregate weight
 summaries, ESS, balance, effects, and artifact provenance only.
+
+An anchored MAIC against a published comparator is two governed turns, not one
+call. The MAIC turn returns the reweighted effect of the trial's own treatment
+versus its own control in the published population. A later user turn restates
+that estimate and standard error together with the published
+comparator-versus-control contrast in a Bucher call, which yields the
+treatment-versus-comparator estimate. The MCP `indirect_compare` schema does
+not accept an anchored comparator file, and arm, covariate, and treatment
+labels appear only in the request and the private artifacts, never in the
+public report.
 
 ## Trust boundary
 
@@ -236,5 +266,7 @@ group so `run_tests` grandchildren cannot survive; regression grandchildren
 also use `--vanilla`) → `r-wrapper/dispatcher.R`
 (sources the skill R and dispatches). R diagnostics stay private; model-facing
 errors use a fixed category and remediation rather than exposing paths, labels,
-or data-dependent text. Workload-limit errors disclose only the computed
-formula inputs and the safe knob to reduce.
+or data-dependent text. Public result, report, verifier-envelope, tool-result,
+and JSON-RPC frame sizes have nested fail-closed budgets; an expansion beyond
+any downstream boundary becomes the same small fixed error. Workload-limit
+errors disclose only the computed formula inputs and the safe knob to reduce.

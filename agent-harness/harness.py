@@ -25,7 +25,7 @@ if str(SUITE_ROOT) not in sys.path:
 
 import anthropic
 
-from mcp_client import MCPClient
+from mcp_client import MCPClient, MCPInvalidRequestError, PUBLIC_TOOL_ERROR_MESSAGES
 from audit import AuditLog
 from final_report import canonical_public_report, is_elicitation_message, join_reports
 from gates import (
@@ -45,6 +45,7 @@ from verification import (
     public_note_codes,
 )
 from governance.registry import RegistryError, get_agent
+from governance.runtime_profile import load_runtime_profile
 
 MODEL = "claude-sonnet-5"
 MAX_TOKENS = 8192
@@ -112,7 +113,9 @@ Planning (how many units, what decision rule):
 - sample_size: sample sizes for single-endpoint designs
 - simulate_design: full simulation (sample size + operating characteristics + optional PPOS)
 - master_simulate: multi-arm adaptive designs (basket/umbrella/platform)
-- indirect_compare: Bucher ITC or MAIC
+- indirect_compare: Bucher ITC or MAIC (an anchored MAIC against a published \
+comparator is a MAIC turn followed by a later Bucher turn in which the user \
+restates the MAIC estimate and SE with the published comparator contrast)
 - meta_analyze: fixed/random-effects meta-analysis
 
 Construction (which runs to perform, how to assign units):
@@ -259,16 +262,16 @@ class ExperimentDesignHarness:
 
     def _system_prompt_for_agent(self) -> str:
         """Return the shared governed contract with a role-specific boundary."""
-        if self.agent_spec["role"] in {"legacy_executor", "reexecutor"}:
+        profile = load_runtime_profile()
+        if (self.agent_spec["role"] in {"legacy_executor", "reexecutor"}
+                and profile["name"] == "complete"):
             return SYSTEM_PROMPT
-        allowed = [
-            name.removeprefix("mcp__experiment-design__")
-            for name in self.agent_spec["tools"]
-        ]
+        allowed = sorted(self._allowed_mcp_tools() or ())
         descriptions = "\n".join(
             f"- {name}: {TOOL_PURPOSES[name]}" for name in allowed
         )
-        guidance = DOMAIN_GUIDANCE.get(self.domain, "Stay inside the registered domain.")
+        guidance_domain = profile["domains"][0] if len(profile["domains"]) == 1 else self.domain
+        guidance = DOMAIN_GUIDANCE.get(guidance_domain, "Stay inside the registered domain.")
         return f"""\
 You are the governed {self.agent_name} domain executor for {self.domain}.
 You have exactly these tools and no others:
@@ -293,11 +296,13 @@ Rules:
 """
 
     def _allowed_mcp_tools(self) -> set[str] | None:
+        profile = load_runtime_profile()
+        installed = set(profile["tools"])
         grants = set(self.agent_spec["tools"])
         if "mcp__experiment-design__*" in grants:
-            return None
+            return None if profile["name"] == "complete" else installed
         prefix = "mcp__experiment-design__"
-        return {
+        return installed & {
             grant[len(prefix):]
             for grant in grants
             if grant.startswith(prefix)
@@ -375,18 +380,18 @@ Rules:
 
     def _prepare_args(self, tool_name: str, tool_input: dict, call_id: str) -> dict:
         args = self._inject_seed(tool_name, tool_input)
+        if call_id in self._lineage_by_call:
+            raise ValueError(f"duplicate tool call id in one turn: {call_id!r}")
+        pending = self._pending_retry_lineages_by_tool.get(tool_name, [])
+        lineage_id = pending[0] if len(pending) == 1 else f"lineage-{uuid.uuid4().hex}"
+        self._lineage_by_call[call_id] = lineage_id
         if _is_gated(tool_name):
             # Every call receives a fresh immutable identity. A correction may
             # inherit an internal retry lineage only when exactly one failed
             # analysis of this tool is pending; ambiguous same-tool fan-out is
             # never guessed or silently cleared.
             args.pop("verification_id", None)
-            if call_id in self._lineage_by_call:
-                raise ValueError(f"duplicate tool call id in one turn: {call_id!r}")
             analysis_id = f"analysis-{uuid.uuid4().hex}"
-            pending = self._pending_retry_lineages_by_tool.get(tool_name, [])
-            lineage_id = pending[0] if len(pending) == 1 else f"lineage-{uuid.uuid4().hex}"
-            self._lineage_by_call[call_id] = lineage_id
             self._lineage_by_analysis[analysis_id] = lineage_id
             args["verification_id"] = analysis_id
         return args
@@ -396,6 +401,10 @@ Rules:
         try:
             result = self.mcp.call_tool(tool_name, tool_input)
             error = result.get("error") if isinstance(result, dict) else None
+        except MCPInvalidRequestError:
+            # Preserve this typed, validated rejection. A plain error dictionary
+            # must never be able to masquerade as a correctable request error.
+            raise
         except Exception as e:                          # noqa: BLE001 - surfaced to model
             result = {"error": str(e)}
             error = str(e)
@@ -429,6 +438,7 @@ Rules:
         report_bindings_by_lineage: dict[str, dict[str, Any]] = {}
         resources_by_lineage: dict[str, list[dict[str, Any]]] = {}
         configuration_reports: list[str] = []
+        pending_request_rejections: set[str] = set()
         max_gate_fails = VERIFY_RETRIES + 1
 
         def failure_result(reason: str, stopped: str = "verify_failed") -> RunResult:
@@ -466,10 +476,26 @@ Rules:
                     messages=self.messages,
                 )
 
+                # A correction has one host-owned lineage. Two same-tool calls
+                # in this response cannot both claim it: doing so would bypass
+                # its retry limit and collapse distinct reports into one entry.
+                requested_tools = [
+                    block.name for block in response.content if block.type == "tool_use"
+                ]
+                if any(
+                    self._pending_retry_lineages_by_tool.get(name)
+                    and (len(self._pending_retry_lineages_by_tool[name]) > 1
+                         or requested_tools.count(name) > 1)
+                    for name in set(requested_tools)
+                ):
+                    yield {"event": "done"}
+                    return failure_result("AMBIGUOUS_CORRECTION")
+
                 round_text: list[str] = []
                 tool_calls: list[tuple[str, dict, dict, str]] = []  # (name, args, result, id)
                 assistant_content: list[dict] = []
                 refused_more_analysis = False
+                rejected_call_ids: set[str] = set()
 
                 for block in response.content:
                     if block.type == "text":
@@ -488,13 +514,22 @@ Rules:
                         yield {"event": "tool_call", "tool": block.name, "params": args}
                         analysis_id = str(args.get("verification_id", ""))
                         lineage_id = self._lineage_by_call.get(block.id, analysis_id)
-                        if (_is_gated(block.name) and
-                                self._retry_failures_by_lineage.get(lineage_id, 0) >= max_gate_fails):
+                        if self._retry_failures_by_lineage.get(lineage_id, 0) >= max_gate_fails:
                             refused_more_analysis = True
                             result, dur, err = ({"error": "verification retry budget exhausted; call not executed"}, 0.0,
                                                 "verification retry budget exhausted")
                         else:
-                            result, dur, err = self._exec_tool(block.name, args)
+                            started = time.monotonic()
+                            try:
+                                result, dur, err = self._exec_tool(block.name, args)
+                            except MCPInvalidRequestError:
+                                rejected_call_ids.add(block.id)
+                                result = {"error": {
+                                    "code": "invalid_request",
+                                    "message": PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"],
+                                }}
+                                dur = (time.monotonic() - started) * 1000
+                                err = "invalid_request"
                         audit.log_tool_call(
                             block.name, args, result, dur, phase="Execute", error=err,
                         )
@@ -506,7 +541,14 @@ Rules:
                 # End the turn and hand control back to the user (covers end_turn,
                 # max_tokens, refusal, etc. — no prefill spin, A-2/A-5).
                 if not tool_calls:
-                    if ledger.unresolved():
+                    candidate = "\n".join(round_text).strip()
+                    rejection_clarification = (
+                        not ledger.all() and not configuration_reports
+                        and is_elicitation_message(candidate)
+                    )
+                    if ledger.unresolved() or (
+                        pending_request_rejections and not rejection_clarification
+                    ):
                         yield {"event": "done"}
                         return failure_result("FAILED")
                     latest = ledger.latest()
@@ -521,7 +563,6 @@ Rules:
                             if binding is not None:
                                 latest_report_bindings.append(binding)
                             latest_resources.extend(resources_by_lineage.get(lineage, []))
-                    candidate = "\n".join(round_text).strip()
                     if latest_reports:
                         final = join_reports(latest_reports)
                     elif configuration_reports:
@@ -562,7 +603,10 @@ Rules:
                     yield {"event": "done"}
                     return failure_result("RETRY_REQUIRED")
 
-                analysis = [(n, a, r, tid) for (n, a, r, tid) in tool_calls if _is_gated(n)]
+                analysis = [
+                    (n, a, r, tid) for (n, a, r, tid) in tool_calls
+                    if _is_gated(n) and tid not in rejected_call_ids
+                ]
                 safe_results: dict[str, dict] = {}
                 round_failed = False
 
@@ -578,6 +622,19 @@ Rules:
                     )
 
                 for name, args, result, tid in tool_calls:
+                    lineage_id = self._lineage_by_call[tid]
+                    if tid in rejected_call_ids:
+                        pending_request_rejections.add(lineage_id)
+                        pending = self._pending_retry_lineages_by_tool.setdefault(name, [])
+                        if lineage_id not in pending:
+                            pending.append(lineage_id)
+                        self._retry_failures_by_lineage[lineage_id] = (
+                            self._retry_failures_by_lineage.get(lineage_id, 0) + 1
+                        )
+                        safe_results[tid] = result
+                        round_failed = True
+                        yield {"event": "tool_request_rejected", "tool": name}
+                        continue
                     if not _is_gated(name):
                         if name == "validate_config" and isinstance(result, dict):
                             report = result.get("configuration_report")
@@ -589,6 +646,14 @@ Rules:
                                 safe_results[tid] = result
                         else:
                             safe_results[tid] = result
+                        if (isinstance(result, dict) and not result.get("error")
+                                and (name != "validate_config" or result.get("valid") is True)):
+                            pending_request_rejections.discard(lineage_id)
+                            pending = self._pending_retry_lineages_by_tool.get(name, [])
+                            self._pending_retry_lineages_by_tool[name] = [
+                                item for item in pending if item != lineage_id
+                            ]
+                            self._retry_failures_by_lineage.pop(lineage_id, None)
                         yield {"event": "tool_result", "tool": name,
                                "result": safe_results[tid]}
                         continue
@@ -641,6 +706,7 @@ Rules:
                     # server verdict.
                     envelope = envelope_from_verdict(identity, gate, provenance)
                     ledger.record(envelope, lineage_id=lineage_id)
+                    pending_request_rejections.discard(lineage_id)
                     gate_verdicts.append(envelope.status.value)
                     audit.log_gate(
                         "Verify",
@@ -717,22 +783,25 @@ Rules:
                     for (_n, _a, _r, tid) in tool_calls
                 ]})
 
-                if round_failed:
+                if round_failed or pending_request_rejections or ledger.unresolved():
                     unresolved = ledger.unresolved()
-                    retry_ids = [
+                    retry_ids = sorted({
                         self._lineage_by_analysis.get(e.identity.analysis_id, e.identity.analysis_id)
                         for e in unresolved
-                    ]
+                    } | pending_request_rejections)
                     can_retry = all(
-                        self._retry_failures_by_lineage.get(
-                            self._lineage_by_analysis.get(item.identity.analysis_id, item.identity.analysis_id), 0
-                        ) < max_gate_fails
-                        for item in unresolved
+                        self._retry_failures_by_lineage.get(lineage, 0) < max_gate_fails
+                        for lineage in retry_ids
                     )
+                    if not can_retry and pending_request_rejections:
+                        yield {"event": "done"}
+                        return failure_result("REQUEST_RETRIES_EXHAUSTED")
                     if can_retry:
                         self.messages.append({"role": "user", "content": (
-                            "Verification FAILED. Raw outputs were withheld. Correct the "
-                            "same analysis. The runtime will bind the correction to: "
+                            "A request was rejected or verification failed. No failed "
+                            "result may be reported. Correct the same tool request using "
+                            "its input schema, or request missing fields with the structured "
+                            "clarification action. The runtime will bind the correction to: "
                             f"{retry_ids}. Do not supply or alter verification_id, and do "
                             "not quote or reconstruct the failed values."
                         )})

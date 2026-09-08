@@ -19,6 +19,7 @@ from artifact_download import read_verified_artifact
 from mcp_client import MCPClient
 from gates import GateVerdict, check_regression_tests, combined_gate
 from verification import public_envelope_matches_call
+from governance.runtime_profile import load_runtime_profile
 
 st.set_page_config(page_title="Experiment Design Agent", layout="wide")
 
@@ -34,6 +35,16 @@ AGENT_LABELS = {
 
 CHAT_MODE = "Free-form (multi-agent chat)"
 MODE_STATE_KEY = "experiment_design_active_mode"
+
+
+def available_modes() -> list[str]:
+    modes = {
+        "single_endpoint": "Single-endpoint design",
+        "master_protocol": "Multi-arm adaptive design",
+        "doe": "Design of experiments", "randomization": "Randomization",
+        "indirect_comparison": "Indirect comparison", "meta_analysis": "Meta-analysis",
+    }
+    return [modes[domain] for domain in load_runtime_profile()["domains"]] + [CHAT_MODE]
 
 
 def render_private_resources(
@@ -182,15 +193,7 @@ def clamp_session_integer(key: str, default: int, lower: int, upper: int) -> int
 st.sidebar.title("Experiment Design Agent")
 mode = st.sidebar.radio(
     "Design type",
-    [
-        "Single-endpoint design",
-        "Multi-arm adaptive design",
-        "Design of experiments",
-        "Randomization",
-        "Indirect comparison",
-        "Meta-analysis",
-        "Free-form (multi-agent chat)",
-    ],
+    available_modes(),
 )
 
 if "messages" not in st.session_state:
@@ -560,7 +563,7 @@ def randomization_form() -> dict[str, Any] | None:
         return params
 
 
-def indirect_comparison_form() -> dict | None:
+def bucher_form() -> dict | None:
     with st.form("indirect_compare"):
         st.subheader("Indirect Treatment Comparison (Bucher)")
         col1, col2 = st.columns(2)
@@ -591,6 +594,134 @@ def indirect_comparison_form() -> dict | None:
                 "effect_measure": effect_measure,
             }],
         }
+
+
+MAIC_ENDPOINT_COLUMNS = {
+    "binary": "a 0/1 outcome column",
+    "continuous": "a numeric outcome column",
+    "rate": "an event-count column and a person-time column",
+    "tte": "a follow-up time column and a 0/1 event-status column",
+}
+
+
+def maic_form() -> dict | None:
+    """Collect one MAIC request; the MCP server enforces read roots and schema.
+
+    Row-level data, weights, and file paths never reach the public report. An
+    anchored comparison against a published comparator is a second, separate
+    Bucher submission that restates the MAIC effect and standard error.
+    """
+    endpoint = st.selectbox(
+        "IPD outcome type", list(MAIC_ENDPOINT_COLUMNS.keys()), key="maic_endpoint",
+    )
+    st.caption(f"The IPD must contain {MAIC_ENDPOINT_COLUMNS[endpoint]} for **{endpoint}**.")
+    with st.form("indirect_compare_maic"):
+        st.subheader("Matching-Adjusted Indirect Comparison (MAIC)")
+        st.caption(
+            "Both CSV files must sit inside an approved read root. The published "
+            "target file needs `covariate,target_mean` columns."
+        )
+        ipd_file = st.text_input("Individual-level data CSV (absolute path)")
+        targets_file = st.text_input("Published target means CSV (absolute path)")
+        col1, col2 = st.columns(2)
+        with col1:
+            arm_col = st.text_input("Arm column", value="arm")
+            treatment_arm = st.text_input("Treatment arm label")
+            comparator_arm = st.text_input("Comparator arm label (blank = unanchored weights only)")
+        with col2:
+            covariates = st.text_input(
+                "Covariates to match (comma-separated; blank = every target column)"
+            )
+            measure = st.text_input("Effect measure (blank = endpoint default)")
+            alpha = st.number_input("Two-sided alpha", value=0.05, min_value=0.001,
+                                    max_value=0.5)
+        outcome_col = event_col = time_col = status_col = None
+        tte_method = "cox"
+        if endpoint in ("binary", "continuous"):
+            outcome_col = st.text_input("Outcome column", value="response")
+        elif endpoint == "rate":
+            event_col = st.text_input("Event-count column")
+            time_col = st.text_input("Person-time column")
+        else:
+            time_col = st.text_input("Follow-up time column")
+            status_col = st.text_input("Event-status column (0/1)")
+            tte_method = st.selectbox("Time-to-event model", ["cox", "exponential"])
+        col3, col4 = st.columns(2)
+        with col3:
+            replicates = st.number_input(
+                "Bootstrap replicates (non-Cox effects)", value=200, min_value=50,
+                max_value=5000, step=50,
+            )
+        with col4:
+            bootstrap_seed = st.number_input(
+                "Bootstrap seed (non-Cox effects)", value=42, min_value=0,
+                max_value=2147483647,
+            )
+        submitted = st.form_submit_button("Reweight and compare")
+        if not submitted:
+            return None
+
+        def required(label: str, value: str | None) -> str | None:
+            text = (value or "").strip()
+            if not text:
+                st.error(f"{label} is required.")
+            return text or None
+
+        ipd = required("The IPD CSV path", ipd_file)
+        targets = required("The target means CSV path", targets_file)
+        treatment = required("The treatment arm label", treatment_arm)
+        if not (ipd and targets and treatment):
+            return None
+        params: dict[str, Any] = {
+            "method": "maic",
+            "ipd_file": ipd,
+            "targets_file": targets,
+            "treatment_arm": treatment,
+            "arm_col": (arm_col or "").strip() or "arm",
+            "maic_endpoint_type": endpoint,
+            "alpha": float(alpha),
+        }
+        if (comparator_arm or "").strip():
+            params["comparator_arm"] = comparator_arm.strip()
+        covariate_list = [item.strip() for item in (covariates or "").split(",") if item.strip()]
+        if covariate_list:
+            params["covariates"] = covariate_list
+        if (measure or "").strip():
+            params["measure"] = measure.strip()
+        if endpoint in ("binary", "continuous"):
+            params["outcome_col"] = (outcome_col or "").strip() or "response"
+        elif endpoint == "rate":
+            events = required("The event-count column", event_col)
+            person_time = required("The person-time column", time_col)
+            if not (events and person_time):
+                return None
+            params["event_col"] = events
+            params["time_col"] = person_time
+        else:
+            follow_up = required("The follow-up time column", time_col)
+            status = required("The event-status column", status_col)
+            if not (follow_up and status):
+                return None
+            params["time_col"] = follow_up
+            params["status_col"] = status
+            params["tte_method"] = tte_method
+        if endpoint != "tte" or tte_method == "exponential":
+            params["bootstrap_replicates"] = int(replicates)
+            params["bootstrap_seed"] = int(bootstrap_seed)
+        return params
+
+
+def indirect_comparison_form() -> dict | None:
+    method = st.radio(
+        "Comparison method",
+        ["Bucher (published aggregate effects)",
+         "MAIC (individual-level data reweighted to published targets)"],
+        horizontal=True,
+        key="indirect_method",
+    )
+    if method.startswith("Bucher"):
+        return bucher_form()
+    return maic_form()
 
 
 META_FIELDS = {
@@ -808,6 +939,8 @@ def agent_chat():
                         elif etype == "tool_call":
                             agent = AGENT_LABELS.get(str(ev.get("agent")), "Specialist")
                             st.caption(f"{agent} → {ev['tool']}")
+                        elif etype == "tool_request_rejected":
+                            st.caption("The specialist is correcting a rejected tool request.")
                         elif etype == "tool_result":
                             # The harness has already reduced this to a verified
                             # report, but the canonical final report is the only

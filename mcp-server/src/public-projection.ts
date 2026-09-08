@@ -1,3 +1,5 @@
+import { ACTIVE_RUNTIME_PROFILE } from "./runtime-profile.js";
+
 type JsonRecord = Record<string, unknown>;
 
 
@@ -16,21 +18,8 @@ const PRIOR_FIELDS = new Set([
   "a", "b", "mu0", "kappa0", "alpha0", "beta0", "shape", "rate",
 ]);
 
-const REGRESSION_SUITES = [
-  "vera-experiment-designing",
-  "vera-master-experiment-designing",
-  "vera-indirect-comparing",
-  "vera-meta-analyzing",
-  "vera-doe-designing",
-] as const;
-
-const EXPECTED_REGRESSION_PASS_COUNTS: Record<(typeof REGRESSION_SUITES)[number], number> = {
-  "vera-experiment-designing": 31,
-  "vera-master-experiment-designing": 53,
-  "vera-indirect-comparing": 15,
-  "vera-meta-analyzing": 14,
-  "vera-doe-designing": 14,
-};
+const REGRESSION_SUITES = ACTIVE_RUNTIME_PROFILE.skills;
+const EXPECTED_REGRESSION_PASS_COUNTS = ACTIVE_RUNTIME_PROFILE.expected_regression_pass_counts;
 
 export const REGRESSION_STATUS_CHECKS = [
   "declared_all_ok",

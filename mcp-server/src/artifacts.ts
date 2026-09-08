@@ -208,7 +208,11 @@ async function enforceRetention(root: string, protectedPaths: ReadonlySet<string
   }));
   dated.sort((a, b) => b.modified - a.modified);
 
-  const keep = new Set<string>([...activeArtifacts, ...protectedPaths]);
+  // Capacity applies only to authenticated committed outputs. Active staging
+  // runs are protected separately and must never consume these retention slots.
+  const keep = new Set<string>(dated.filter((item) =>
+    activeArtifacts.has(item.path) || protectedPaths.has(item.path)
+  ).map((item) => item.path));
   for (const item of dated) {
     if (await artifactHasLiveLease(item.path)) keep.add(item.path);
   }
@@ -342,7 +346,8 @@ export async function abortManagedArtifactDir(path: string): Promise<void> {
       await rm(resolved, { recursive: true, force: true });
       delete registry.entries[basename(resolved)];
       await writeRegistry(root, registry);
-      await enforceRetention(root);
+      // A failed run only removes its own staging output. Retention (including
+      // changes to configured capacity) is committed by a successful release.
     });
   });
 }

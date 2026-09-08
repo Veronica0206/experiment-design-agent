@@ -22,6 +22,7 @@ this_script <- sub("--file=", "", grep("--file=", commandArgs(FALSE), value = TR
 suite_root <- normalizePath(file.path(dirname(this_script), "..", ".."), mustWork = TRUE)
 
 source_skill <- function(skill, ...) {
+  if (!skill %in% runtime_profile$skills) stop("Statistical engine is unavailable in this runtime profile")
   skill_r <- file.path(suite_root, skill, "scripts", "R")
   for (f in list(...)) source(file.path(skill_r, f), local = FALSE)
 }
@@ -82,7 +83,72 @@ call_filtered <- function(fn, args, exclude = character(0)) {
   res
 }
 
+# Make RSM run-order semantics explicit and verifiable at the public bridge.
+# The private design routine is always asked for its deterministic standard
+# order; this bridge then applies the requested seeded permutation, records the
+# original standard position, and numbers the delivered run order.  A
+# degenerate identity draw is rotated so randomize=TRUE is never observationally
+# identical to the unrandomized contract.
+bind_rsm_run_order <- function(res, randomize, seed) {
+  if (!is.list(res) || !is.data.frame(res$design) || nrow(res$design) < 1)
+    stop("RSM design did not return a nonempty rectangular data frame")
+  metadata_columns <- c("point_type", "run", "std_order")
+  factor_columns <- names(res$design)[
+    !tolower(names(res$design)) %in% metadata_columns
+  ]
+  # Match the public projector's deterministic factor-name order.  Canonical
+  # public aliases use numeric suffix order (factor_2 before factor_10); all
+  # other factor names use stable lexical order.  Never let data-frame column
+  # insertion order define std_order because the public projection renames
+  # columns independently of that insertion order.
+  canonical_alias <- grepl("^factor_[1-9][0-9]*$", factor_columns)
+  alias_suffix <- ifelse(
+    canonical_alias, sub("^factor_", "", factor_columns), ""
+  )
+  factor_column_order <- order(
+    ifelse(canonical_alias, 0L, 1L),
+    ifelse(canonical_alias, nchar(alias_suffix, type = "bytes"), 0L),
+    ifelse(canonical_alias, alias_suffix, factor_columns),
+    method = "radix"
+  )
+  factor_columns <- factor_columns[factor_column_order]
+  point_rank <- match(
+    tolower(as.character(res$design$point_type)),
+    c("factorial", "axial", "edge", "center")
+  )
+  if (!length(factor_columns) || anyNA(point_rank))
+    stop("RSM design has invalid factor or point-type columns")
+  sort_fields <- c(list(point_rank), unname(lapply(
+    factor_columns, function(column) res$design[[column]]
+  )))
+  canonical_order <- do.call(order, c(
+    sort_fields, list(na.last = NA, method = "radix")
+  ))
+  if (length(canonical_order) != nrow(res$design))
+    stop("RSM design cannot be placed in canonical standard order")
+  res$design <- res$design[canonical_order, , drop = FALSE]
+  rownames(res$design) <- NULL
+  n_runs <- nrow(res$design)
+  res$design$std_order <- seq_len(n_runs)
+  order <- seq_len(n_runs)
+  if (isTRUE(randomize)) {
+    set.seed(seed)
+    order <- sample.int(n_runs)
+    if (n_runs > 1 && identical(order, seq_len(n_runs)))
+      order <- c(order[-1], order[1])
+  }
+  res$design <- res$design[order, , drop = FALSE]
+  rownames(res$design) <- NULL
+  res$design$run <- seq_len(n_runs)
+  if (isTRUE(randomize)) res$seed <- seed else res$seed <- NULL
+  res
+}
+
 tryCatch({
+  source(file.path(suite_root, "mcp-server", "r-wrapper", "runtime-profile.R"))
+  runtime_profile <- load_runtime_profile(suite_root)
+  if (!tool_name %in% runtime_profile$tools)
+    stop("Tool is unavailable in this runtime profile")
 
   if (tool_name == "validate_config") {
     source_skill("vera-experiment-designing", "config.R")
@@ -403,15 +469,17 @@ tryCatch({
   } else if (tool_name == "rsm_design") {
     source_skill("vera-doe-designing", "doe.R")
     design <- if (!is.null(params$design)) params$design else "ccd"
+    randomize_requested <- isTRUE(params$randomize)
+    seed_used <- if (!is.null(params$seed)) params$seed else 42L
+    engine_params <- params
+    engine_params$randomize <- FALSE
+    engine_params$seed <- NULL
     if (design == "bbd") {
-      res <- call_filtered(bbd_design, params, exclude = "design")
+      res <- call_filtered(bbd_design, engine_params, exclude = "design")
     } else {
-      res <- call_filtered(ccd_design, params, exclude = "design")
+      res <- call_filtered(ccd_design, engine_params, exclude = "design")
     }
-    # Same seed echo as factorial_design: reproducible randomized run order.
-    if (isTRUE(params$randomize)) {
-      res$seed <- if (!is.null(params$seed)) params$seed else 42
-    }
+    res <- bind_rsm_run_order(res, randomize_requested, seed_used)
     write_result(res)
 
   } else if (tool_name == "randomize") {
@@ -421,13 +489,7 @@ tryCatch({
 
   } else if (tool_name == "run_tests") {
     # Every skill exposed as an MCP tool must have wired tests.
-    skills_to_test <- c(
-      "vera-experiment-designing",
-      "vera-master-experiment-designing",
-      "vera-indirect-comparing",
-      "vera-meta-analyzing",
-      "vera-doe-designing"
-    )
+    skills_to_test <- runtime_profile$skills
     results <- list()
     for (skill in skills_to_test) {
       test_file <- file.path(suite_root, skill, "scripts", "tests", "run_tests.R")
@@ -439,7 +501,7 @@ tryCatch({
       }
       rscript <- file.path(R.home("bin"),
                            paste0("Rscript", if (.Platform$OS.type == "windows") ".exe" else ""))
-      out <- system2(rscript, c("--vanilla", test_file), stdout = TRUE, stderr = TRUE)
+      out <- system2(rscript, c("--vanilla", shQuote(test_file)), stdout = TRUE, stderr = TRUE)
       status  <- attr(out, "status")               # non-NULL only on nonzero exit
       crashed <- !is.null(status) && status != 0
       passes  <- sum(grepl("^TEST .* : PASS$", out))
@@ -450,7 +512,8 @@ tryCatch({
         exit_status = if (is.null(status)) 0L else as.integer(status),
         # Green requires: clean exit, no FAIL lines, AND at least one PASS
         # (so a script that crashes before any test can't read as green).
-        ok = (!crashed) && fails == 0 && passes > 0
+        ok = (!crashed) && fails == 0 &&
+          passes == runtime_profile$expected_regression_pass_counts[[skill]]
       )
     }
     all_ok <- length(results) == length(skills_to_test) &&

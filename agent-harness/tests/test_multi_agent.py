@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -143,6 +144,307 @@ clarify.stop()
 check("ambiguous_route_returns_only_structured_clarification",
       clarify_result.final_answer
       == 'CLARIFICATION_REQUEST {"fields":["analysis_method"]}')
+
+
+def clarified_request(prior_messages, current_message):
+    return json.dumps({
+        "type": "clarified_user_request",
+        "prior_user_messages": prior_messages,
+        "current_user_message": current_message,
+    }, separators=(",", ":"), ensure_ascii=True)
+
+
+study_request = 'Plan a study: null=0.3, alternative=0.5, alpha=0.05, power=0.8.\nLabel: "\u03b2".'
+context_client = FakeClient([
+    route_response("clarify", fields=["endpoint_type"]),
+    route_response("clarify", fields=["alpha_sidedness"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["doe-designer"]),
+])
+context_team = MultiAgentExperimentDesignHarness(anthropic_client=context_client)
+context_executors = {
+    "single-endpoint-designer": FakeExecutor(verified_result(
+        "single-endpoint-designer", "single_endpoint", "context-single", "single",
+    )),
+    "doe-designer": FakeExecutor(verified_result(
+        "doe-designer", "doe", "context-doe", "doe",
+    )),
+}
+context_team._executor = lambda name: context_executors[name]  # type: ignore[method-assign]
+context_team.start()
+consume(context_team.run(study_request))
+consume(context_team.run("Binary endpoint."))
+consume(context_team.run("Two-sided."))
+consume(context_team.run("Now use power=0.9."))
+new_domain_request = "Separate task: create an A/B design for conversion rates 0.1 and 0.12."
+consume(context_team.run(new_domain_request))
+context_team.stop()
+check("router_clarifications_preserve_verbatim_original_study_parameters",
+      context_executors["single-endpoint-designer"].requests[0]
+      == clarified_request([study_request, "Binary endpoint."], "Two-sided."))
+check("normal_domain_continuation_does_not_replay_previously_dispatched_context",
+      context_executors["single-endpoint-designer"].requests
+      == [clarified_request([study_request, "Binary endpoint."], "Two-sided."),
+          "Now use power=0.9."])
+check("rerouting_does_not_copy_previous_domain_requests",
+      context_executors["doe-designer"].requests == [new_domain_request]
+      and context_team._pending_user_messages == []
+      and context_team._pending_messages_seen_by_agent == {})
+
+child_clarify_client = FakeClient([
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+])
+child_clarify_team = MultiAgentExperimentDesignHarness(anthropic_client=child_clarify_client)
+child_clarify_executor = FakeExecutor(RunResult(
+    run_id="child-clarification", agent_name="single-endpoint-designer",
+    domain="single_endpoint",
+    final_answer='CLARIFICATION_REQUEST {"fields":["endpoint_type"]}',
+))
+child_clarify_team._executor = lambda name: child_clarify_executor  # type: ignore[method-assign]
+child_clarify_team.start()
+consume(child_clarify_team.run(study_request))
+consume(child_clarify_team.run("Binary endpoint."))
+child_clarify_team.stop()
+check("child_clarification_uses_existing_conversation_without_duplicate_request",
+      child_clarify_executor.requests == [study_request, "Binary endpoint."])
+
+rerouted_clarification = RunResult(
+    run_id="rerouted-clarification", agent_name="doe-designer", domain="doe",
+    final_answer='CLARIFICATION_REQUEST {"fields":["allocation_ratio"]}',
+)
+episode_client = FakeClient([
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["doe-designer"]),
+    route_response("clarify", fields=["allocation_ratio"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["doe-designer"]),
+])
+episode_team = MultiAgentExperimentDesignHarness(anthropic_client=episode_client)
+episode_executors = {
+    "single-endpoint-designer": FakeExecutor(child_clarify_executor.result),
+    "doe-designer": FakeExecutor(rerouted_clarification),
+}
+episode_team._executor = lambda name: episode_executors[name]  # type: ignore[method-assign]
+episode_team.start()
+consume(episode_team.run(study_request))
+consume(episode_team.run("It is an A/B conversion test."))
+check("child_clarification_rerouting_preserves_original_request_for_new_specialist",
+      episode_executors["doe-designer"].requests == [
+          clarified_request([study_request], "It is an A/B conversion test."),
+      ])
+consume(episode_team.run("Use baseline conversion 0.3."))
+episode_executors["single-endpoint-designer"].result = verified_result(
+    "single-endpoint-designer", "single_endpoint", "episode-completed", "single",
+)
+consume(episode_team.run("Equal allocation."))
+check("child_then_router_clarification_sends_returning_specialist_only_unseen_replies",
+      episode_executors["single-endpoint-designer"].requests == [
+          study_request, clarified_request([
+              "It is an A/B conversion test.", "Use baseline conversion 0.3.",
+          ], "Equal allocation."),
+      ])
+check("completed_clarification_episode_clears_shared_input_and_seen_counters",
+      episode_team._pending_user_messages == []
+      and episode_team._pending_messages_seen_by_agent == {})
+episode_executors["doe-designer"].result = verified_result(
+    "doe-designer", "doe", "episode-next-doe", "doe",
+)
+consume(episode_team.run(new_domain_request))
+episode_team.stop()
+check("completed_child_clarification_input_is_not_replayed_to_later_domain_work",
+      episode_executors["doe-designer"].requests[-1] == new_domain_request)
+
+seen_cancel_client = FakeClient([
+    route_response("dispatch", ["single-endpoint-designer"]),
+    SimpleNamespace(content=[SimpleNamespace(type="text", text="invalid route")]),
+    route_response("dispatch", ["doe-designer"]),
+    route_response("dispatch", ["doe-designer"]),
+])
+seen_cancel_team = MultiAgentExperimentDesignHarness(anthropic_client=seen_cancel_client)
+seen_cancel_executors = {
+    "single-endpoint-designer": FakeExecutor(child_clarify_executor.result),
+    "doe-designer": FakeExecutor(rerouted_clarification),
+}
+seen_cancel_team._executor = lambda name: seen_cancel_executors[name]  # type: ignore[method-assign]
+seen_cancel_team.start()
+consume(seen_cancel_team.run(study_request))
+seen_router_checkpoint = list(seen_cancel_team._router_messages)
+_, seen_route_failure = consume(seen_cancel_team.run("REJECTED-ROUTE"))
+check("routing_failure_preserves_child_clarification_seen_counters",
+      seen_route_failure.stopped == "routing_failed"
+      and seen_cancel_team._pending_user_messages == [study_request]
+      and seen_cancel_team._pending_messages_seen_by_agent == {"single-endpoint-designer": 1}
+      and seen_cancel_team._router_messages == seen_router_checkpoint)
+cancelled_child_clarification = seen_cancel_team.run("CANCELLED-NEW-SPECIALIST")
+for event in cancelled_child_clarification:
+    if event["event"] == "message":
+        cancelled_child_clarification.close()
+        break
+check("cancellation_after_child_clarification_restores_seen_counters_and_conversations",
+      seen_cancel_team._pending_user_messages == [study_request]
+      and seen_cancel_team._pending_messages_seen_by_agent == {"single-endpoint-designer": 1}
+      and seen_cancel_team._router_messages == seen_router_checkpoint
+      and seen_cancel_executors["doe-designer"].requests == [])
+seen_cancel_executors["doe-designer"].result = verified_result(
+    "doe-designer", "doe", "episode-after-cancel", "doe",
+)
+consume(seen_cancel_team.run("It is an A/B conversion test."))
+seen_cancel_team.stop()
+check("cancelled_new_specialist_does_not_skip_unseen_original_request_on_retry",
+      seen_cancel_executors["doe-designer"].requests == [
+          clarified_request([study_request], "It is an A/B conversion test."),
+      ])
+
+
+class RestartableExecutor(FakeExecutor):
+    def stop(self):
+        pass
+
+
+restart_client = FakeClient([
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+])
+restart_team = MultiAgentExperimentDesignHarness(anthropic_client=restart_client)
+restart_team._executors["single-endpoint-designer"] = RestartableExecutor(child_clarify_executor.result)
+restart_team.start()
+consume(restart_team.run(study_request))
+restart_team.stop()
+restarted_executor = RestartableExecutor(verified_result(
+    "single-endpoint-designer", "single_endpoint", "episode-restarted", "single",
+))
+restart_team._executors["single-endpoint-designer"] = restarted_executor
+restart_team.start()
+consume(restart_team.run("Binary endpoint."))
+restart_team.stop()
+check("restarted_child_receives_unresolved_input_lost_with_previous_conversation",
+      restarted_executor.requests == [clarified_request([study_request], "Binary endpoint.")])
+
+evidence_client = FakeClient([
+    route_response("dispatch", ["meta-analysis-analyst"]),
+    route_response("clarify", fields=["alt_param"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+])
+evidence_team = MultiAgentExperimentDesignHarness(anthropic_client=evidence_client)
+evidence_executors = {
+    "meta-analysis-analyst": FakeExecutor(verified_result(
+        "meta-analysis-analyst", "meta_analysis", "context-meta", "PRIVATE-EVIDENCE-0.42",
+    )),
+    "single-endpoint-designer": FakeExecutor(verified_result(
+        "single-endpoint-designer", "single_endpoint", "context-confirmed", "single",
+    )),
+}
+evidence_team._executor = lambda name: evidence_executors[name]  # type: ignore[method-assign]
+evidence_team.start()
+consume(evidence_team.run("Pool my private study rows: SENSITIVE-STUDY-ROWS."))
+consume(evidence_team.run("Use an estimate as the alternative for a new continuous endpoint design."))
+confirmed_estimate = "I confirm the exact estimate 0.42 as the alternative mean for the new design."
+consume(evidence_team.run(confirmed_estimate))
+evidence_team.stop()
+evidence_forwarded = evidence_executors["single-endpoint-designer"].requests[0]
+check("clarified_design_request_preserves_current_turn_estimate_confirmation",
+      json.loads(evidence_forwarded)["current_user_message"] == confirmed_estimate
+      and json.loads(evidence_forwarded)["prior_user_messages"] == [
+          "Use an estimate as the alternative for a new continuous endpoint design.",
+      ])
+check("clarification_context_excludes_prior_evidence_and_unrelated_private_input",
+      "PRIVATE-EVIDENCE" not in evidence_forwarded
+      and "SENSITIVE-STUDY-ROWS" not in evidence_forwarded
+      and "CLARIFICATION_REQUEST" not in evidence_forwarded)
+
+for terminal_kind in ("child_failed", "aggregation_failed"):
+    terminal_client = FakeClient([
+        route_response("clarify", fields=["endpoint_type"]),
+        route_response("dispatch", ["single-endpoint-designer"] + (
+            ["doe-designer"] if terminal_kind == "aggregation_failed" else []
+        )),
+        route_response("dispatch", ["doe-designer"]),
+    ])
+    terminal_team = MultiAgentExperimentDesignHarness(anthropic_client=terminal_client)
+    terminal_child = FakeExecutor(object() if terminal_kind == "child_failed" else verified_result(
+        "single-endpoint-designer", "single_endpoint", "context-after-failure", "single",
+    ))
+    terminal_next = FakeExecutor(verified_result(
+        "doe-designer", "doe", "context-after-failure", "doe",
+    ))
+    terminal_team._executor = lambda name: (  # type: ignore[method-assign]
+        terminal_child if name == "single-endpoint-designer" else terminal_next
+    )
+    terminal_team.start()
+    consume(terminal_team.run(study_request))
+    _, terminal_result = consume(terminal_team.run("Binary endpoint."))
+    consume(terminal_team.run(new_domain_request))
+    terminal_team.stop()
+    check(f"{terminal_kind}_clears_abandoned_clarification_context",
+          terminal_result.stopped == terminal_kind and terminal_child.requests == []
+          and terminal_next.requests == [new_domain_request]
+          and terminal_team._pending_user_messages == []
+          and terminal_team._pending_messages_seen_by_agent == {})
+
+retry_client = FakeClient([
+    route_response("clarify", fields=["endpoint_type"]),
+    SimpleNamespace(content=[SimpleNamespace(type="text", text="invalid route")]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+])
+retry_team = MultiAgentExperimentDesignHarness(anthropic_client=retry_client)
+retry_executor = FakeExecutor(verified_result(
+    "single-endpoint-designer", "single_endpoint", "context-retry", "single",
+))
+retry_team._executor = lambda name: retry_executor  # type: ignore[method-assign]
+retry_team.start()
+consume(retry_team.run(study_request))
+_, rejected_route_result = consume(retry_team.run("REJECTED-ROUTE-REPLY"))
+consume(retry_team.run("Binary endpoint."))
+retry_team.stop()
+check("failed_route_preserves_prior_clarification_without_retaining_failed_reply",
+      rejected_route_result.stopped == "routing_failed"
+      and retry_executor.requests == [clarified_request([study_request], "Binary endpoint.")])
+
+pending_cancel_client = FakeClient([
+    route_response("clarify", fields=["endpoint_type"]),
+    route_response("clarify", fields=["power"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+    route_response("dispatch", ["single-endpoint-designer"]),
+])
+pending_cancel_team = MultiAgentExperimentDesignHarness(anthropic_client=pending_cancel_client)
+pending_cancel_executor = FakeExecutor(verified_result(
+    "single-endpoint-designer", "single_endpoint", "context-cancel", "single",
+))
+pending_cancel_team._executor = lambda name: pending_cancel_executor  # type: ignore[method-assign]
+pending_cancel_team.start()
+consume(pending_cancel_team.run(study_request))
+pending_router_checkpoint = list(pending_cancel_team._router_messages)
+cancelled_clarification = pending_cancel_team.run("CANCELLED-CLARIFICATION")
+next(cancelled_clarification)
+cancelled_clarification.close()
+check("cancelled_clarification_restores_pending_request_and_router_history",
+      pending_cancel_team._pending_user_messages == [study_request]
+      and pending_cancel_team._router_messages == pending_router_checkpoint)
+cancelled_dispatch = pending_cancel_team.run("CANCELLED-ENDPOINT")
+next(cancelled_dispatch)  # accepted route
+next(cancelled_dispatch)  # child start
+next(cancelled_dispatch)  # child progress after writing its request
+cancelled_dispatch.close()
+check("cancelled_dispatch_restores_pending_context_and_child_history",
+      pending_cancel_team._pending_user_messages == [study_request]
+      and pending_cancel_team._router_messages == pending_router_checkpoint
+      and pending_cancel_executor.requests == [])
+consume(pending_cancel_team.run("Binary endpoint."))
+pending_cancel_team.stop()
+check("retry_after_cancellation_forwards_only_committed_clarifications",
+      pending_cancel_executor.requests == [clarified_request([study_request], "Binary endpoint.")])
+
+check("coordinator_projects_request_rejection_without_private_diagnostics",
+      MultiAgentExperimentDesignHarness._value_free_child_event({
+          "event": "tool_request_rejected", "tool": "sample_size",
+          "params": {"private": "PRIVATE-INPUT"}, "diagnostic": "PRIVATE-ERROR",
+      }, {"sample_size"}) == {"event": "tool_request_rejected", "tool": "sample_size"})
+check("coordinator_drops_request_rejection_from_unknown_tool",
+      MultiAgentExperimentDesignHarness._value_free_child_event({
+          "event": "tool_request_rejected", "tool": "unknown_tool",
+      }, {"sample_size"}) is None)
 
 bad_client = FakeClient([SimpleNamespace(content=[SimpleNamespace(
     type="text", text="Use the meta agent",

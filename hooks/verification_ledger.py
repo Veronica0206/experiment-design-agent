@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from governance.registry import RegistryError, get_agent  # noqa: E402
+from governance.runtime_profile import load_runtime_profile  # noqa: E402
 from private_state import (  # noqa: E402
     atomic_write_bytes_at,
     locked_private_directory,
@@ -282,12 +284,38 @@ def _merge_context(ledger: dict[str, Any], data: dict[str, Any], policy: str) ->
 
 def _tool_allowed(agent: dict[str, Any], name: str) -> bool:
     tools = agent["tools"]
-    return f"{SERVER}*" in tools or name in tools
+    installed = {f"{SERVER}{tool}" for tool in load_runtime_profile()["tools"]}
+    return name in installed and (f"{SERVER}*" in tools or name in tools)
 
 
-def _strict_child_response(value: Any) -> str | None:
+# Claude 2.1.233 serializes the completed Agent result for PostToolBatch as
+# final-content blocks followed by ONE separate telemetry block. This is a
+# protocol adapter, not suffix removal from arbitrary child prose. In
+# particular, an embedded/duplicated/malformed footer is never discarded.
+_NATIVE_AGENT_FOOTER = re.compile(
+    r"agentId: (?P<id>[A-Za-z0-9_-]{1,128})"
+    r" \(use SendMessage with to: '(?P=id)', summary: '<5-10 word recap>' to continue this agent\)"
+    r"\n<usage>subagent_tokens: [0-9]{1,16}"
+    r"\ntool_uses: [0-9]{1,16}\nduration_ms: [0-9]{1,16}</usage>"
+)
+_SAFE_FAILURE = "Verification failed; results withheld as not trustworthy."
+
+
+def _reserved_child_metadata(text: str) -> bool:
+    return any(line.startswith(("agentId:", "<usage>")) for line in text.splitlines())
+
+
+def _plain_child_text(text: str) -> str | None:
+    if not text.strip() or _reserved_child_metadata(text):
+        return None
+    if text.startswith(_SAFE_FAILURE) and text != _SAFE_FAILURE:
+        return None
+    return text
+
+
+def _strict_child_response(value: Any, *, serialized: bool = True) -> str | None:
     if isinstance(value, str):
-        return value if value.strip() else None
+        return _plain_child_text(value)
     if isinstance(value, list):
         if not value or not all(
             isinstance(block, dict)
@@ -297,8 +325,13 @@ def _strict_child_response(value: Any) -> str | None:
             for block in value
         ):
             return None
-        text = "\n".join(str(block["text"]) for block in value)
-        return text if text.strip() else None
+        blocks = value
+        if serialized and _NATIVE_AGENT_FOOTER.fullmatch(value[-1]["text"]):
+            if len(value) < 2:
+                return None
+            blocks = value[:-1]
+        text = "\n".join(str(block["text"]) for block in blocks)
+        return _plain_child_text(text)
     if isinstance(value, dict):
         status = value.get("status")
         if ("is_error" in value and value.get("is_error") is not False) or (
@@ -309,7 +342,7 @@ def _strict_child_response(value: Any) -> str | None:
         # Runtime metadata (agent ID, duration, usage) is deliberately ignored;
         # only the completed child's final content crosses the ledger boundary.
         if "content" in value:
-            return _strict_child_response(value["content"])
+            return _strict_child_response(value["content"], serialized=False)
     return None
 
 
@@ -463,7 +496,10 @@ def read_lines(data: dict[str, Any]) -> list[str]:
         return list(ledger["lines"])
 
 
-def clear(data: dict[str, Any]) -> None:
+def clear(data: dict[str, Any], *, preserve_clarification: bool = False) -> None:
+    if preserve_clarification:
+        from prompt_binding import preserve_clarification_context
+        preserve_clarification_context(data)
     try:
         path = ledger_path(data)
         with _locked(path) as directory_fd:
@@ -472,7 +508,8 @@ def clear(data: dict[str, Any]) -> None:
             )
     except (OSError, ValueError):
         pass
-    if data.get("_expdesign_agent_scope") == "experiment-design-coordinator":
+    if (not preserve_clarification
+            and data.get("_expdesign_agent_scope") == "experiment-design-coordinator"):
         try:
             from prompt_binding import clear_prompt_binding
             clear_prompt_binding(data)

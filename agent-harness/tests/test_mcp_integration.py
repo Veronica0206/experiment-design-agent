@@ -201,7 +201,7 @@ with MCPClient() as client:
         )
     check("invalid_design_returns_error_without_result_payload", safe_error)
 
-    expect_tool_error(
+    expect_invalid_request(
         "unknown_top_level_key_rejected",
         lambda: client.call_tool("validate_config", {
             "endpoint_type": "binary", "study_type": "poc",
@@ -209,24 +209,128 @@ with MCPClient() as client:
             "powres": 0.99,
         }),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "resource_limit_rejected",
         lambda: client.call_tool("randomize", {"n": 10001}),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "fractional_seed_rejected",
         lambda: client.call_tool("randomize", {"n": 10, "seed": 1.5}),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "zero_block_size_rejected",
         lambda: client.call_tool("randomize", {
             "n": 10, "method": "block", "block_size": 0,
         }),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "noninteger_factor_levels_rejected",
         lambda: client.call_tool("factorial_design", {
             "n_factors": 2, "levels": 2.5,
+        }),
+    )
+    expect_invalid_request(
+        "wrong_primitive_type_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool("randomize", {"n": "12"}),
+    )
+    expect_invalid_request(
+        "invalid_enum_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool("randomize", {
+            "n": 12, "method": "invalid-enum-value",
+        }),
+    )
+    expect_invalid_request(
+        "missing_required_field_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool("randomize", {}),
+    )
+    expect_invalid_request(
+        "rsm_seed_without_randomization_rejected_before_r",
+        lambda: client.call_tool("rsm_design", {
+            "n_factors": 3, "seed": 123,
+        }),
+    )
+    expect_invalid_request(
+        "nonobject_argument_container_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool("randomize", "DO_NOT_REFLECT"),
+    )
+    expect_invalid_request(
+        "nonstring_tool_name_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool(7, {}),
+    )
+    expect_invalid_request(
+        "bucher_requires_comparisons_before_r",
+        lambda: client.call_tool("indirect_compare", {"method": "bucher"}),
+    )
+    expect_invalid_request(
+        "bucher_rejects_maic_only_fields_before_r",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "bucher",
+            "comparisons": [{
+                "estimate_ab": 0.2, "se_ab": 0.1,
+                "estimate_cb": 0.1, "se_cb": 0.1,
+                "treatment_a": "a", "treatment_c": "c",
+                "common_comparator": "b",
+            }],
+            "ipd_file": "/do-not-reflect",
+        }),
+    )
+    expect_invalid_request(
+        "maic_requires_treatment_arm_before_file_read",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "maic", "ipd_file": "/do-not-reflect",
+            "targets_file": "/do-not-reflect",
+        }),
+    )
+    expect_invalid_request(
+        "maic_rate_requires_event_and_time_columns_before_file_read",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "maic", "ipd_file": "/do-not-reflect",
+            "targets_file": "/do-not-reflect", "treatment_arm": "active",
+            "maic_endpoint_type": "rate",
+        }),
+    )
+    expect_invalid_request(
+        "maic_tte_requires_time_and_status_columns_before_file_read",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "maic", "ipd_file": "/do-not-reflect",
+            "targets_file": "/do-not-reflect", "treatment_arm": "active",
+            "maic_endpoint_type": "tte", "time_col": "time",
+        }),
+    )
+    expect_invalid_request(
+        "maic_rejects_bucher_comparisons_before_file_read",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "maic", "ipd_file": "/do-not-reflect",
+            "targets_file": "/do-not-reflect", "treatment_arm": "active",
+            "comparisons": [{
+                "estimate_ab": 0.2, "se_ab": 0.1,
+                "estimate_cb": 0.1, "se_cb": 0.1,
+                "treatment_a": "a", "treatment_c": "c",
+                "common_comparator": "b",
+            }],
+        }),
+    )
+    expect_invalid_request(
+        "maic_cox_rejects_inert_bootstrap_settings_before_file_read",
+        lambda: client.call_tool("indirect_compare", {
+            "method": "maic", "ipd_file": "/do-not-reflect",
+            "targets_file": "/do-not-reflect", "treatment_arm": "active",
+            "maic_endpoint_type": "tte", "time_col": "time",
+            "status_col": "status", "tte_method": "cox",
+            "bootstrap_replicates": 200,
+        }),
+    )
+    expect_invalid_request(
+        "fixed_meta_rejects_random_effects_inference_method_before_r",
+        lambda: client.call_tool("meta_analyze", {
+            "endpoint_type": "time_to_event", "studies": [{}, {}],
+            "random": False, "inference_method": "hksj",
+        }),
+    )
+    expect_invalid_request(
+        "unknown_tool_uses_fixed_invalid_request_taxonomy",
+        lambda: client.call_tool("not_a_registered_tool", {
+            "secret_value": "must-not-be-reflected",
         }),
     )
     expect_invalid_request(
@@ -253,13 +357,13 @@ with MCPClient() as client:
             "n_factors": 5, "levels": 10,
         }),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "nonpositive_ccd_alpha_rejected",
         lambda: client.call_tool("rsm_design", {
             "n_factors": 2, "design": "ccd", "alpha": 0,
         }),
     )
-    expect_tool_error(
+    expect_invalid_request(
         "invalid_source_ci_level_rejected",
         lambda: client.call_tool("meta_analyze", {
             "endpoint_type": "time_to_event",
@@ -269,6 +373,22 @@ with MCPClient() as client:
                 {"hr": 0.9, "ci_lower": 0.7, "ci_upper": 1.1},
             ],
         }),
+    )
+    malformed_meta = client.call_tool("meta_analyze", {
+        "endpoint_type": "continuous_single",
+        "studies": [
+            {"mean": 1.0, "sd": 1.0, "n": 20},
+            {},
+            {"mean": 1.5, "sd": 1.0, "n": 20},
+        ],
+        "random": False,
+    })
+    check(
+        "malformed_meta_study_remains_a_transparent_drop",
+        malformed_meta.get("n_input") == 3
+        and malformed_meta.get("k_used") == 2
+        and malformed_meta.get("dropped_studies") == 1,
+        malformed_meta,
     )
     expect_tool_error(
         "invalid_go_target_rejected",
@@ -590,7 +710,7 @@ if os.name == "posix":
                         "arms_schedule": {"enter": [0, 2], "leave": [2, 3]},
                     }}),
                 )
-                expect_tool_error(
+                expect_invalid_request(
                     "platform_schedule_noninteger_fails_at_schema_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base,
@@ -607,6 +727,12 @@ if os.name == "posix":
                     "n_periods": 2,
                     "n_per_period": 10,
                     "arms_schedule": {"enter": [1, 1], "leave": [2, 2]},
+                    "shared_control": True,
+                    "ncc_method": "none",
+                    "ncc_weight_decay": 0.9,
+                    "rar_enabled": True,
+                    "rar_burn_in": 10,
+                    "rar_min_alloc": 0.1,
                     "interim_frequency": 1,
                     "futility_threshold": 0.05,
                 }
@@ -616,6 +742,130 @@ if os.name == "posix":
                         lambda key=field, item=value: contract_client.call_tool(
                             "master_simulate",
                             {"config": {**nonplatform_base, key: item}},
+                        ),
+                    )
+                umbrella_base = {
+                    "master_design_type": "umbrella", "endpoint_type": "binary",
+                    "n_subgroups": 2, "null_params": 0.2,
+                    "alt_params": [0.4, 0.4], "n_sims": 1,
+                }
+                for label, config in (
+                    ("umbrella_phase", {**umbrella_base, "phase": "phase2"}),
+                    ("platform_borrowing", {
+                        **platform_base, "borrowing_method": "none",
+                    }),
+                    ("basket_umbrella_method", {
+                        **nonplatform_base, "umbrella_method": "mams",
+                    }),
+                    ("platform_umbrella_method", {
+                        **platform_base, "umbrella_method": "mams",
+                    }),
+                    ("umbrella_ncc_method", {
+                        **umbrella_base, "ncc_method": "none",
+                    }),
+                    ("disabled_soc_data", {
+                        **nonplatform_base, "soc_data": {"means": [0.2, 0.2]},
+                    }),
+                    ("umbrella_n_interims", {
+                        **umbrella_base, "n_interims": 1,
+                    }),
+                    ("basket_n_stages", {
+                        **nonplatform_base, "n_stages": 2,
+                    }),
+                ):
+                    expect_invalid_request(
+                        f"master_rejects_{label}_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "master_simulate", {"config": item},
+                        ),
+                    )
+                method_scoped_master_configs = (
+                    ("tau_prior", {
+                        **nonplatform_base, "borrowing_method": "none",
+                        "tau_prior": {"type": "half_normal", "params": {"scale": 1}},
+                    }),
+                    ("cbhm_calibration", {
+                        **nonplatform_base, "borrowing_method": "none", "cbhm_a": 0.5,
+                    }),
+                    ("simons_prior", {
+                        **nonplatform_base, "borrowing_method": "none",
+                        "homogeneity_prior": 0.5,
+                    }),
+                    ("chen_decision", {
+                        **nonplatform_base, "borrowing_method": "none",
+                        "ia_pruning_alpha": 0.1,
+                    }),
+                    ("drop_count", {
+                        **umbrella_base, "umbrella_method": "mams",
+                        "n_drop_per_stage": [1],
+                    }),
+                    ("umbrella_rar_gamma", {
+                        **umbrella_base, "umbrella_method": "mams", "rar_gamma": 1,
+                    }),
+                    ("derived_selection_rule", {
+                        **umbrella_base, "umbrella_method": "mams",
+                        "selection_rule": "rank_best",
+                    }),
+                    ("ncc_decay", {
+                        **platform_base, "ncc_method": "regression",
+                        "ncc_weight_decay": 0.9,
+                    }),
+                    ("platform_rar_parameters", {
+                        **platform_base, "rar_burn_in": 10,
+                    }),
+                )
+                for label, config in method_scoped_master_configs:
+                    expect_invalid_request(
+                        f"master_rejects_wrong_method_for_{label}_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "master_simulate", {"config": item},
+                        ),
+                    )
+                master_shape_and_endpoint_configs = (
+                    ("short_alt_params", {
+                        **nonplatform_base, "alt_params": [0.4],
+                    }),
+                    ("short_null_params", {
+                        **nonplatform_base, "null_params": [0.2],
+                    }),
+                    ("umbrella_n_arms_mismatch", {
+                        **umbrella_base, "n_arms": 3,
+                    }),
+                    ("continuous_missing_sd", {
+                        **umbrella_base, "endpoint_type": "continuous",
+                        "null_params": 0, "alt_params": [0.5, 0.5],
+                    }),
+                    ("tte_missing_times", {
+                        **umbrella_base, "endpoint_type": "tte",
+                        "null_params": 1, "alt_params": [0.8, 0.8],
+                    }),
+                    ("rate_missing_exposure", {
+                        **umbrella_base, "endpoint_type": "incidence_rate",
+                        "null_params": 1, "alt_params": [0.8, 0.8],
+                    }),
+                    ("binary_wrong_direction", {
+                        **nonplatform_base, "alt_params": [0.1, 0.4],
+                    }),
+                    ("continuous_wrong_direction", {
+                        **umbrella_base, "endpoint_type": "continuous", "sd": 1,
+                        "null_params": 0, "alt_params": [-0.1, 0.5],
+                    }),
+                    ("tte_wrong_direction", {
+                        **umbrella_base, "endpoint_type": "tte",
+                        "accrual_time": 1, "followup_time": 1,
+                        "null_params": 1, "alt_params": [1.2, 0.8],
+                    }),
+                    ("rate_wrong_direction", {
+                        **umbrella_base, "endpoint_type": "incidence_rate",
+                        "exposure_time": 1, "null_params": 1,
+                        "alt_params": [1.2, 0.8],
+                    }),
+                )
+                for label, config in master_shape_and_endpoint_configs:
+                    expect_invalid_request(
+                        f"master_rejects_{label}_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "master_simulate", {"config": item},
                         ),
                     )
                 expect_invalid_request(
@@ -632,11 +882,159 @@ if os.name == "posix":
                         **platform_base, "futility_threshold": 0.05,
                     }}),
                 )
-                expect_tool_error(
+                expect_invalid_request(
                     "legacy_effect_threshold_fails_at_schema_before_r",
                     lambda: contract_client.call_tool("master_simulate", {"config": {
                         **platform_base, "effect_threshold": 0.99,
                     }}),
+                )
+                endpoint_configs = {
+                    "binary": {
+                        "endpoint_type": "binary", "study_type": "confirmatory",
+                        "design": "single_arm", "null_param": 0.2,
+                        "alt_param": 0.4,
+                    },
+                    "continuous": {
+                        "endpoint_type": "continuous", "study_type": "confirmatory",
+                        "design": "single_arm", "null_param": 0,
+                        "alt_param": 1, "sd": 1,
+                    },
+                    "tte": {
+                        "endpoint_type": "tte", "study_type": "confirmatory",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 0.8, "accrual_time": 1, "followup_time": 1,
+                    },
+                    "incidence_rate": {
+                        "endpoint_type": "incidence_rate",
+                        "study_type": "confirmatory", "design": "single_arm",
+                        "null_param": 1, "alt_param": 0.8, "exposure_time": 1,
+                    },
+                }
+                wrong_p2_shapes = {
+                    "binary": {"x_bar": 0.3, "s2": 1, "n": 10},
+                    "continuous": {"x": 3, "n": 10},
+                    "tte": {"x": 3, "n": 10},
+                    "incidence_rate": {"x": 3, "n": 10},
+                }
+                for endpoint, config in endpoint_configs.items():
+                    expect_invalid_request(
+                        f"{endpoint}_rejects_foreign_p2_shape_before_r",
+                        lambda item={**config, "p2_data": wrong_p2_shapes[endpoint]}:
+                            contract_client.call_tool(
+                                "simulate_design", {"config": item},
+                            ),
+                    )
+                poc_binary = {
+                    **endpoint_configs["binary"], "study_type": "poc",
+                }
+                for field, value in (
+                    ("p2_data", {"x": 3, "n": 10}),
+                    ("p3_n", 100),
+                    ("p3_alpha", 0.025),
+                ):
+                    expect_invalid_request(
+                        f"poc_rejects_confirmatory_{field}_before_r",
+                        lambda key=field, item=value: contract_client.call_tool(
+                            "simulate_design", {"config": {**poc_binary, key: item}},
+                        ),
+                    )
+                expect_invalid_request(
+                    "binary_ppos_rejects_responders_above_n_before_r",
+                    lambda: contract_client.call_tool("simulate_design", {
+                        "config": {
+                            **endpoint_configs["binary"],
+                            "p2_data": {"x": 11, "n": 10},
+                        },
+                    }),
+                )
+                controlled_ppos = {
+                    **endpoint_configs["binary"], "design": "controlled",
+                }
+                for label, config in (
+                    ("missing_control", {
+                        **controlled_ppos, "p2_data": {"x": 3, "n": 10},
+                    }),
+                    ("missing_treatment", {
+                        **controlled_ppos, "p2_data_ctrl": {"x": 2, "n": 10},
+                    }),
+                ):
+                    expect_invalid_request(
+                        f"controlled_ppos_rejects_{label}_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "simulate_design", {"config": item},
+                        ),
+                    )
+                for p3_field, value in (
+                    ("p3_n", 100), ("p3_alpha", 0.025),
+                    ("p3_alloc_ratio", 1),
+                ):
+                    expect_invalid_request(
+                        f"ppos_rejects_{p3_field}_without_p2_data_before_r",
+                        lambda key=p3_field, item=value: contract_client.call_tool(
+                            "simulate_design", {
+                                "config": {**endpoint_configs["binary"], key: item},
+                            },
+                        ),
+                    )
+                expect_invalid_request(
+                    "single_arm_ppos_rejects_p3_alloc_ratio_before_r",
+                    lambda: contract_client.call_tool("simulate_design", {
+                        "config": {
+                            **endpoint_configs["binary"],
+                            "p2_data": {"x": 3, "n": 10},
+                            "p3_alloc_ratio": 1,
+                        },
+                    }),
+                )
+                foreign_meta_fields = {
+                    "binary_single": {"mean": 1},
+                    "binary_comparative": {"mean_t": 1},
+                    "continuous_single": {"responders": 1},
+                    "continuous_comparative": {"events_t": 1},
+                    "time_to_event": {"responders": 1},
+                    "incidence_single": {"mean": 1},
+                    "incidence_comparative": {"total_t": 10},
+                }
+                for endpoint, foreign in foreign_meta_fields.items():
+                    expect_invalid_request(
+                        f"meta_{endpoint}_rejects_foreign_fields_before_r",
+                        lambda kind=endpoint, fields=foreign:
+                            contract_client.call_tool("meta_analyze", {
+                                "endpoint_type": kind,
+                                "studies": [fields, {}],
+                            }),
+                    )
+                expect_invalid_request(
+                    "binary_meta_rejects_continuous_measure_before_r",
+                    lambda: contract_client.call_tool("meta_analyze", {
+                        "endpoint_type": "binary_comparative",
+                        "studies": [
+                            {"events_t": 1, "total_t": 10, "events_c": 1,
+                             "total_c": 10, "measure": "mean_difference"},
+                            {},
+                        ],
+                    }),
+                )
+                expect_invalid_request(
+                    "meta_requires_two_usable_studies_before_r",
+                    lambda: contract_client.call_tool("meta_analyze", {
+                        "endpoint_type": "continuous_single",
+                        "studies": [{"mean": 1, "sd": 1, "n": 10}, {}],
+                    }),
+                )
+                expect_invalid_request(
+                    "meta_rejects_mixed_effect_measures_before_r",
+                    lambda: contract_client.call_tool("meta_analyze", {
+                        "endpoint_type": "continuous_comparative",
+                        "studies": [
+                            {"mean_t": 1, "sd_t": 1, "n_t": 10,
+                             "mean_c": 0, "sd_c": 1, "n_c": 10,
+                             "measure": "mean_difference"},
+                            {"mean_t": 1, "sd_t": 1, "n_t": 10,
+                             "mean_c": 0, "sd_c": 1, "n_c": 10,
+                             "measure": "standardized_mean_difference"},
+                        ],
+                    }),
                 )
                 expect_invalid_request(
                     "simple_randomization_rejects_nonequal_ratio_before_r",
@@ -644,7 +1042,190 @@ if os.name == "posix":
                         "n": 12, "ratio": [1, 2], "seed": 42,
                     }),
                 )
-            check("invalid_master_and_randomize_contract_requests_never_reach_r",
+                expect_invalid_request(
+                    "randomize_ratio_must_match_arm_count_before_r",
+                    lambda: contract_client.call_tool("randomize", {
+                        "n": 12, "arms": 3, "ratio": [1, 1],
+                        "method": "block",
+                    }),
+                )
+                expect_invalid_request(
+                    "simple_randomization_rejects_block_size_before_r",
+                    lambda: contract_client.call_tool("randomize", {
+                        "n": 12, "method": "simple", "block_size": 4,
+                    }),
+                )
+                for label, arms in (
+                    ("duplicate", ["A", "A"]),
+                    ("blank", ["A", "   "]),
+                ):
+                    expect_invalid_request(
+                        f"randomize_rejects_{label}_arm_labels_before_r",
+                        lambda labels=arms: contract_client.call_tool(
+                            "randomize", {"n": 12, "arms": labels},
+                        ),
+                    )
+                expect_invalid_request(
+                    "randomize_strata_must_match_n_before_r",
+                    lambda: contract_client.call_tool("randomize", {
+                        "n": 3, "method": "stratified", "strata": ["a", "b"],
+                    }),
+                )
+                expect_invalid_request(
+                    "bbd_factor_range_fails_before_r",
+                    lambda: contract_client.call_tool("rsm_design", {
+                        "n_factors": 2, "design": "bbd",
+                    }),
+                )
+                expect_invalid_request(
+                    "bbd_rejects_inert_alpha_before_r",
+                    lambda: contract_client.call_tool("rsm_design", {
+                        "n_factors": 3, "design": "bbd", "alpha": "face",
+                    }),
+                )
+                expect_invalid_request(
+                    "bbd_rejects_inert_fraction_before_r",
+                    lambda: contract_client.call_tool("rsm_design", {
+                        "n_factors": 3, "design": "bbd", "fraction": 0,
+                    }),
+                )
+                expect_invalid_request(
+                    "ccd_fraction_must_be_below_factor_count_before_r",
+                    lambda: contract_client.call_tool("rsm_design", {
+                        "n_factors": 3, "design": "ccd", "fraction": 3,
+                    }),
+                )
+                expect_invalid_request(
+                    "factorial_seed_without_randomization_fails_before_r",
+                    lambda: contract_client.call_tool("factorial_design", {
+                        "n_factors": 3, "seed": 123,
+                    }),
+                )
+                for endpoint in ("continuous", "tte", "incidence_rate"):
+                    config = {
+                        "endpoint_type": endpoint, "study_type": "poc",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 2 if endpoint == "continuous" else 0.8,
+                    }
+                    expect_invalid_request(
+                        f"{endpoint}_requires_endpoint_specific_fields_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "validate_config", item,
+                        ),
+                    )
+                wrong_endpoint_fields = (
+                    ({
+                        "endpoint_type": "binary", "study_type": "poc",
+                        "design": "single_arm", "null_param": 0.2,
+                        "alt_param": 0.4, "sd": 1,
+                    }, "binary_sd"),
+                    ({
+                        "endpoint_type": "continuous", "study_type": "poc",
+                        "design": "single_arm", "null_param": 0,
+                        "alt_param": 1, "sd": 1, "exposure_time": 1,
+                    }, "continuous_exposure"),
+                    ({
+                        "endpoint_type": "tte", "study_type": "poc",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 0.8, "accrual_time": 1,
+                        "followup_time": 1, "rate_method": "poisson",
+                    }, "tte_rate_method"),
+                    ({
+                        "endpoint_type": "incidence_rate", "study_type": "poc",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 0.8, "exposure_time": 1,
+                        "tte_method": "exponential",
+                    }, "rate_tte_method"),
+                    ({
+                        "endpoint_type": "binary", "study_type": "poc",
+                        "design": "single_arm", "null_param": 0.2,
+                        "alt_param": 0.4, "alloc_ratio": 1,
+                    }, "single_arm_alloc_ratio"),
+                )
+                for config, label in wrong_endpoint_fields:
+                    expect_invalid_request(
+                        f"single_endpoint_rejects_{label}_before_r",
+                        lambda item=config: contract_client.call_tool(
+                            "validate_config", item,
+                        ),
+                    )
+                for endpoint_config, prior, label in (
+                    ({
+                        "endpoint_type": "binary", "study_type": "poc",
+                        "design": "single_arm", "null_param": 0.2,
+                        "alt_param": 0.4,
+                    }, {"shape": 1, "rate": 1}, "binary"),
+                    ({
+                        "endpoint_type": "continuous", "study_type": "poc",
+                        "design": "single_arm", "null_param": 0,
+                        "alt_param": 1, "sd": 1,
+                    }, {"a": 1, "b": 1}, "continuous"),
+                    ({
+                        "endpoint_type": "tte", "study_type": "poc",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 0.8, "accrual_time": 1,
+                        "followup_time": 1,
+                    }, {"a": 1, "b": 1}, "tte"),
+                    ({
+                        "endpoint_type": "incidence_rate", "study_type": "poc",
+                        "design": "single_arm", "null_param": 1,
+                        "alt_param": 0.8, "exposure_time": 1,
+                    }, {"a": 1, "b": 1}, "incidence"),
+                ):
+                    expect_invalid_request(
+                        f"single_endpoint_rejects_{label}_foreign_prior_keys_before_r",
+                        lambda config=endpoint_config, value=prior:
+                            contract_client.call_tool(
+                                "validate_config", {**config, "prior": value},
+                            ),
+                    )
+                expect_invalid_request(
+                    "mean_ab_test_requires_sd_before_r",
+                    lambda: contract_client.call_tool("ab_test", {
+                        "baseline": 10, "effect": 1, "metric": "mean",
+                    }),
+                )
+                for label, arguments in (
+                    ("zero_baseline", {
+                        "baseline": 0, "effect": 0.1,
+                        "metric": "proportion",
+                    }),
+                    ("unit_baseline", {
+                        "baseline": 1, "effect": -0.1,
+                        "metric": "proportion",
+                    }),
+                    ("explicit_sd", {
+                        "baseline": 0.2, "effect": 0.1,
+                        "metric": "proportion", "sd": 1,
+                    }),
+                    ("out_of_range_alternative", {
+                        "baseline": 0.9, "effect": 0.2,
+                        "metric": "proportion",
+                    }),
+                    ("relative_out_of_range_alternative", {
+                        "baseline": 0.6, "effect": 1,
+                        "effect_type": "relative", "metric": "proportion",
+                    }),
+                    ("zero_effect", {
+                        "baseline": 0.2, "effect": 0,
+                        "metric": "proportion",
+                    }),
+                    ("mean_zero_effect", {
+                        "baseline": 10, "effect": 0,
+                        "metric": "mean", "sd": 1,
+                    }),
+                    ("relative_mean_zero_effect", {
+                        "baseline": 0, "effect": 0.1,
+                        "effect_type": "relative", "metric": "mean", "sd": 1,
+                    }),
+                ):
+                    expect_invalid_request(
+                        f"ab_test_rejects_{label}_before_r",
+                        lambda item=arguments: contract_client.call_tool(
+                            "ab_test", item,
+                        ),
+                    )
+            check("invalid_public_contract_requests_never_reach_r",
                   not r_marker.exists(), r_marker)
         finally:
             if old_rscript is None:
@@ -652,7 +1233,7 @@ if os.name == "posix":
             else:
                 os.environ["EXPDESIGN_RSCRIPT"] = old_rscript
 else:
-    check("invalid_master_and_randomize_contract_requests_never_reach_r",
+    check("invalid_public_contract_requests_never_reach_r",
           True, "POSIX-only shim")
 
 if output_dir:

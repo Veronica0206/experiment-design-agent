@@ -211,10 +211,10 @@ checks = {
     "public_assurance_extra_floating_action_rejected": not (
         module.valid_public_assurance_workflow(
             public_workflow.replace(
-                "      - name: Validate the public source-review distribution",
+                "      - name: Validate the runnable public single-endpoint edition",
                 "      - name: Unpinned extra action\n"
                 "        uses: actions/cache@v4\n"
-                "      - name: Validate the public source-review distribution",
+                "      - name: Validate the runnable public single-endpoint edition",
                 1,
             )
         )
@@ -232,6 +232,15 @@ checks = {
             public_workflow.replace(
                 '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py --public-only',
                 'EXPDESIGN_PUBLIC_ONLY=1 "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py',
+            )
+        )
+    ),
+    "public_assurance_missing_response_budget_test_rejected": not (
+        module.valid_public_assurance_workflow(
+            public_workflow.replace(
+                '          "$pythonLocation/bin/python" -I -E -s -S -B '
+                "agent-harness/tests/test_response_budget.py\n",
+                "",
             )
         )
     ),
@@ -644,14 +653,45 @@ with tempfile.TemporaryDirectory() as directory:
     fake_bin = Path(directory)
     fake_claude = fake_bin / "claude"
     fake_claude.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '2.1.226 (Claude Code)'\n",
+        "#!/bin/sh\nprintf '%s\\n' '2.1.233 (Claude Code)'\n",
         encoding="utf-8",
     )
     fake_claude.chmod(0o755)
     canonical_claude = run_with_fake_claude(fake_bin)
     checks["canonical_claude_code_output_is_accepted"] = (
         canonical_claude.returncode == 0
-        and "claude:  2.1.226 (Claude Code)" in canonical_claude.stdout
+        and "claude:  2.1.233 (Claude Code)" in canonical_claude.stdout
+    )
+
+    conflicting_fork = subprocess.run(
+        ["/bin/bash", "tools/bootstrap.sh", "--check-claude-version"],
+        cwd=MODULE_PATH.parents[1],
+        env={**os.environ, "EXPDESIGN_CLAUDE": str(fake_claude),
+             "CLAUDE_CODE_FORK_SUBAGENT": "1"},
+        capture_output=True, text=True, check=False,
+    )
+    checks["fork_mode_environment_override_is_rejected"] = (
+        conflicting_fork.returncode != 0
+        and "requires CLAUDE_CODE_FORK_SUBAGENT=0" in conflicting_fork.stdout + conflicting_fork.stderr
+    )
+    disabled_background = subprocess.run(
+        ["/bin/bash", "tools/bootstrap.sh", "--check-claude-version"],
+        cwd=MODULE_PATH.parents[1],
+        env={**os.environ, "EXPDESIGN_CLAUDE": str(fake_claude),
+             "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": " YES "},
+        capture_output=True, text=True, check=False,
+    )
+    checks["background_disabled_environment_override_is_rejected"] = (
+        disabled_background.returncode != 0
+        and "incompatible with CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+        in disabled_background.stdout + disabled_background.stderr
+    )
+    fake_claude.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '2.1.226 (Claude Code)'\n", encoding="utf-8",
+    )
+    legacy_claude = run_with_fake_claude(fake_bin)
+    checks["unreviewed_legacy_native_protocol_version_rejected"] = (
+        legacy_claude.returncode != 0 and "2.1.233 is required" in legacy_claude.stdout
     )
 
 relative_claude = subprocess.run(
@@ -723,8 +763,8 @@ checks["live_auth_in_release_gate_rejected"] = not module.valid_release_entrypoi
 )
 checks["live_auth_in_harness_gate_rejected"] = not module.valid_release_entrypoints(
     makefile_text.replace(
-        "\t@$(MAKE) validate-python-lock\n",
-        "\t@$(MAKE) validate-python-lock\n\t@$(MAKE) check-claude-live\n",
+        "harness-release-check:\n",
+        "harness-release-check:\n\t@$(MAKE) check-claude-live\n",
         1,
     )
 )

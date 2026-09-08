@@ -23,6 +23,45 @@ _PUBLIC_PROVENANCE_FIELDS = _PUBLIC_PROVENANCE_STRING_FIELDS | {
     "r_package_versions", "config_bound", "input_file_count", "artifact_count",
 }
 
+# The verifier deliberately carries both the structured public result and the
+# canonical report. Bound each representation and their compact envelope before
+# stdout so a scientifically valid but oversized result becomes a small,
+# value-free verification failure rather than overflowing the downstream MCP
+# frame. Node applies a second 4 MiB serialized tool-result boundary, and the
+# Python client accepts a complete frame up to 10 MiB.
+MAX_PUBLIC_RESULT_BYTES = 1 * 1024 * 1024
+MAX_CANONICAL_REPORT_BYTES = 2 * 1024 * 1024
+MAX_VERIFIER_PRESENTABLE_BYTES = 3 * 1024 * 1024
+
+
+def _json_utf8_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, allow_nan=False, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+
+
+def _withhold_oversized_response(response: dict) -> None:
+    """Replace a presentable envelope with one fixed, value-free failure."""
+    for field in ("report", "public_result", "public_result_hash", "report_hash"):
+        response.pop(field, None)
+    response["status"] = "RETRY_REQUIRED"
+    response["presentable"] = False
+    response["checks"] = {**dict(response.get("checks") or {}),
+                          "response_budget": False}
+    response["failures"] = ["check_failed:response_budget"]
+    response["blocked"] = []
+    response["notes"] = []
+
+
+def _presentable_payload_within_budget(
+    public_result: object, report: str, prospective: dict,
+) -> bool:
+    return (
+        len(_json_utf8_bytes(public_result)) <= MAX_PUBLIC_RESULT_BYTES
+        and len(report.encode("utf-8")) <= MAX_CANONICAL_REPORT_BYTES
+        and len(_json_utf8_bytes(prospective)) <= MAX_VERIFIER_PRESENTABLE_BYTES
+    )
+
 
 def validated_public_provenance(value: object) -> dict:
     """Accept only the fixed non-oracular provenance DTO bound to public output."""
@@ -120,12 +159,23 @@ def main() -> int:
                 "provenance_hash": identity.provenance_hash,
             },
         }
-        response["report"] = canonical_report(
+        report = canonical_report(
             tool, args, result, private_rendering_envelope, public_provenance,
         )
-        response["public_result"] = privacy_safe_view(tool, result)
-        response["public_result_hash"] = content_hash(response["public_result"])
-        response["report_hash"] = content_hash(response["report"])
+        public_result = privacy_safe_view(tool, result)
+        public_fields = {
+            "report": report,
+            "public_result": public_result,
+            "public_result_hash": content_hash(public_result),
+            "report_hash": content_hash(report),
+        }
+        prospective = {**response, **public_fields}
+        if not _presentable_payload_within_budget(
+            public_result, report, prospective,
+        ):
+            _withhold_oversized_response(response)
+        else:
+            response.update(public_fields)
     # Keep both raw commitments inside this verifier process. The public DTO
     # has its own commitments above; exposing either raw hash would turn every
     # dropped private value into an offline equality oracle.

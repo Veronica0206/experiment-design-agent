@@ -8,6 +8,8 @@ import io
 import json
 import os
 import queue
+import re
+import shlex
 import signal
 import sys
 import tempfile
@@ -135,7 +137,8 @@ from mcp_client import (CONTROL_TIMEOUT_S, MAX_JSONRPC_MESSAGE_BYTES,
                         MAX_SERVER_STDERR_BYTES, MCP_SERVER_DIR,
                         PRIVATE_ARTIFACT_META_KEY, PRIVATE_PROVENANCE_META_KEY,
                         PUBLIC_TOOL_ERROR_MESSAGES, SERVER_LAUNCHER,
-                        TOOL_TIMEOUT_S, MCPClient, MCPToolError)  # noqa: E402
+                        TOOL_TIMEOUT_S, MCPClient, MCPToolError,
+                        MCPInvalidRequestError)  # noqa: E402
 
 client = MCPClient()
 client._proc = SimpleNamespace(poll=lambda: None, returncode=None)
@@ -160,6 +163,23 @@ _record_check("old_reader_cannot_poison_new_generation", restart_ok)
 
 budget_ok = TOOL_TIMEOUT_S >= 390 and CONTROL_TIMEOUT_S < TOOL_TIMEOUT_S
 _record_check("tool_timeout_covers_valid_server_budget", budget_ok)
+
+response_budget_source = (
+    MCP_SERVER_DIR / "src" / "response-budget.ts"
+).read_text(encoding="utf-8")
+response_budget_match = re.search(
+    r"MAX_PUBLIC_TOOL_RESULT_BYTES\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024",
+    response_budget_source,
+)
+response_budget_bytes = (
+    int(response_budget_match.group(1)) * 1024 * 1024
+    if response_budget_match else 0
+)
+_record_check(
+    "jsonrpc_frame_budget_has_explicit_tool_result_headroom",
+    response_budget_bytes > 0
+    and MAX_JSONRPC_MESSAGE_BYTES >= response_budget_bytes + 1024 * 1024,
+)
 
 timeout_client = MCPClient()
 timeout_client._proc = SimpleNamespace(poll=lambda: None, returncode=None)
@@ -388,10 +408,12 @@ try:
     hostile_error_client.call_tool("indirect_compare", {})
 except MCPToolError as error:
     hostile_error = str(error)
+    hostile_correctable = isinstance(error, MCPInvalidRequestError)
 else:
     hostile_error = ""
+    hostile_correctable = True
 hostile_error_ok = (
-    private_path.decode("ascii") not in hostile_error
+    not hostile_correctable and private_path.decode("ascii") not in hostile_error
     and hostile_error == (
         "Tool request failed [internal_error]: "
         + PUBLIC_TOOL_ERROR_MESSAGES["internal_error"]
@@ -437,9 +459,11 @@ try:
     invalid_request_client.call_tool("factorial_design", {})
 except MCPToolError as error:
     invalid_request_error = str(error)
+    invalid_request_typed = isinstance(error, MCPInvalidRequestError)
 else:
     invalid_request_error = ""
-invalid_request_ok = invalid_request_error == (
+    invalid_request_typed = False
+invalid_request_ok = invalid_request_typed and invalid_request_error == (
     "Tool request failed [invalid_request]: "
     + PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"]
 )
@@ -633,6 +657,128 @@ else:
 cleanup_ok = cleanup_failed_closed and cleanup_client._proc is cleanup_process
 _record_check("failed_process_cleanup_retains_handle", cleanup_ok)
 
+invalid_environment_settings = {
+    "EXPDESIGN_NODE": "node",
+    "EXPDESIGN_RSCRIPT": "Rscript",
+    "EXPDESIGN_PYTHON": "python3",
+    "EXPDESIGN_ALLOWED_READ_ROOTS": f"/approved{os.pathsep}relative",
+    "EXPDESIGN_RUNS_DIR": "relative-runs",
+    "EXPDESIGN_ARTIFACT_MAX_DIRS": "0",
+    "EXPDESIGN_ARTIFACT_RETENTION_DAYS": "1.5",
+}
+invalid_settings_rejected = True
+for invalid_name, invalid_value in invalid_environment_settings.items():
+    try:
+        mcp_client_module._controlled_server_environment({invalid_name: invalid_value})
+    except ValueError:
+        pass
+    else:
+        invalid_settings_rejected = False
+minimal_environment = mcp_client_module._controlled_server_environment({
+    "OPENAI_API_KEY": "must-not-reach-node",
+    "HTTPS_PROXY": "http://must-not-reach-node.invalid",
+    "EXPDESIGN_UNREVIEWED_FLAG": "must-not-reach-node",
+})
+_record_check(
+    "python_spawn_environment_rejects_invalid_controls_and_unknown_names",
+    invalid_settings_rejected
+    and set(minimal_environment) == {
+        "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TZ",
+    },
+)
+
+# Exercise the launcher itself with a stand-in absolute Node executable that
+# records the environment it receives. This covers the direct .mcp.json path,
+# which does not pass through MCPClient's independently closed environment.
+launcher_environment_ok = False
+with tempfile.TemporaryDirectory(prefix="expdesign-launcher-environment-") as temp_root:
+    temp_path = Path(temp_root)
+    captured_environment = temp_path / "environment.txt"
+    node_probe = temp_path / "node-probe"
+    node_probe.write_text(
+        "#!/bin/sh\n"
+        f"/usr/bin/env > {shlex.quote(str(captured_environment))}\n",
+        encoding="utf-8",
+    )
+    node_probe.chmod(0o700)
+    registry_dir = temp_path / "registry"
+    registry_dir.mkdir(mode=0o700)
+    allowed_reads = os.pathsep.join([str(temp_path), str(MCP_SERVER_DIR)])
+    launcher_env = {
+        **os.environ,
+        "EXPDESIGN_NODE": str(node_probe),
+        "EXPDESIGN_RSCRIPT": "/bin/sh",
+        "EXPDESIGN_PYTHON": sys.executable,
+        "EXPDESIGN_ALLOWED_READ_ROOTS": allowed_reads,
+        "EXPDESIGN_RUNS_DIR": str(temp_path / "runs"),
+        "EXPDESIGN_ARTIFACT_LOCK_WAIT_MS": "150",
+        "EXPDESIGN_ARTIFACT_MAX_LEASE_SECONDS": "3600",
+        "EXPDESIGN_ARTIFACT_RETENTION_DAYS": "7",
+        "EXPDESIGN_ARTIFACT_MAX_DIRS": "11",
+        "EXPDESIGN_RUNTIME_REGISTRY_DIR": str(registry_dir),
+        "EXPDESIGN_RUNTIME_REGISTRY_TOKEN": "a" * 64,
+        "EXPDESIGN_RUNTIME_REGISTRY_DEV": "123",
+        "EXPDESIGN_RUNTIME_REGISTRY_INO": "456",
+        "OPENAI_API_KEY": "must-not-reach-node",
+        "ANTHROPIC_API_KEY": "must-not-reach-node",
+        "AWS_SECRET_ACCESS_KEY": "must-not-reach-node",
+        "HTTPS_PROXY": "http://must-not-reach-node.invalid",
+        "npm_config_registry": "https://must-not-reach-node.invalid",
+        "NODE_OPTIONS": "--require=/must-not-reach-node.cjs",
+        "NODE_PATH": "/must-not-reach-node-modules",
+        "PYTHONPATH": "/must-not-reach-node-python",
+        "LD_LIBRARY_PATH": "/must-not-reach-node-native",
+        "DYLD_LIBRARY_PATH": "/must-not-reach-node-native",
+        "EXPDESIGN_UNREVIEWED_FLAG": "must-not-reach-node",
+        "HOME": "/must-not-reach-node-home",
+        "TMPDIR": "/must-not-reach-node-tmp",
+        "LANG": "hostile_LOCALE",
+        "TZ": "Hostile/Timezone",
+    }
+    launcher_probe = mcp_client_module.subprocess.run(
+        ["/bin/sh", str(SERVER_LAUNCHER)],
+        cwd=MCP_SERVER_DIR,
+        env=launcher_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if launcher_probe.returncode == 0 and captured_environment.is_file():
+        received = dict(
+            line.split("=", 1)
+            for line in captured_environment.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        rejected_names = {
+            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY",
+            "HTTPS_PROXY", "npm_config_registry", "NODE_OPTIONS", "NODE_PATH",
+            "PYTHONPATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+            "EXPDESIGN_UNREVIEWED_FLAG",
+        }
+        launcher_environment_ok = (
+            not rejected_names.intersection(received)
+            and received.get("PATH") == mcp_client_module._CONTROLLED_SERVER_PATH
+            and received.get("HOME") in {"/", "/var/empty"}
+            and received.get("HOME") != launcher_env["HOME"]
+            and received.get("TMPDIR") == "/tmp"
+            and received.get("LANG") == "C"
+            and received.get("LC_ALL") == "C"
+            and received.get("TZ") == "UTC"
+            and received.get("EXPDESIGN_NODE") == str(node_probe)
+            and received.get("EXPDESIGN_RSCRIPT") == "/bin/sh"
+            and received.get("EXPDESIGN_PYTHON") == sys.executable
+            and received.get("EXPDESIGN_ALLOWED_READ_ROOTS") == allowed_reads
+            and received.get("EXPDESIGN_RUNS_DIR") == str(temp_path / "runs")
+            and received.get("EXPDESIGN_ARTIFACT_MAX_DIRS") == "11"
+            and received.get("EXPDESIGN_RUNTIME_REGISTRY_DIR") == str(registry_dir)
+            and received.get("EXPDESIGN_RUNTIME_REGISTRY_TOKEN") == "a" * 64
+            and received.get("R_LIBS") == ""
+            and received.get("R_DEFAULT_PACKAGES")
+            == "datasets,utils,grDevices,graphics,stats,methods"
+        )
+_record_check("direct_launcher_exec_uses_closed_reviewed_environment", launcher_environment_ok)
+
 if PUBLIC_ONLY:
     _finish_checks("public_only_protocol_boundary")
 
@@ -664,12 +810,46 @@ class PartialStartupProcess:
 partial_process = PartialStartupProcess()
 spawn_calls = []
 original_popen = mcp_client_module.subprocess.Popen
-original_path = os.environ.get("PATH")
-original_node_options = os.environ.get("NODE_OPTIONS")
-original_node_path = os.environ.get("NODE_PATH")
-os.environ["PATH"] = "/private/hostile-path"
-os.environ["NODE_OPTIONS"] = "--require=/private/hostile-preload.js"
-os.environ["NODE_PATH"] = "/private/hostile-modules"
+spawn_environment_overrides = {
+    "PATH": "/private/hostile-path",
+    "HOME": "/private/hostile-home",
+    "TMPDIR": "/private/hostile-tmp",
+    "LANG": "hostile_LOCALE",
+    "TZ": "Hostile/Timezone",
+    "EXPDESIGN_NODE": "/bin/sh",
+    "EXPDESIGN_RSCRIPT": "/bin/sh",
+    "EXPDESIGN_PYTHON": sys.executable,
+    "EXPDESIGN_ALLOWED_READ_ROOTS": str(MCP_SERVER_DIR),
+    "EXPDESIGN_RUNS_DIR": "/tmp/expdesign-test-runs",
+    "EXPDESIGN_ARTIFACT_LOCK_WAIT_MS": "150",
+    "EXPDESIGN_ARTIFACT_MAX_LEASE_SECONDS": "3600",
+    "EXPDESIGN_ARTIFACT_RETENTION_DAYS": "7",
+    "EXPDESIGN_ARTIFACT_MAX_DIRS": "11",
+    "EXPDESIGN_RUNTIME_REGISTRY_DIR": "/private/hostile-registry",
+    "EXPDESIGN_RUNTIME_REGISTRY_TOKEN": "ambient-hostile-registry-token",
+    "EXPDESIGN_RUNTIME_REGISTRY_DEV": "999",
+    "EXPDESIGN_RUNTIME_REGISTRY_INO": "999",
+    "EXPDESIGN_RUNTIME_SERVER_PID": "999",
+    "EXPDESIGN_RUNTIME_NONCE": "ambient-hostile-nonce",
+    "EXPDESIGN_RUNTIME_TARGET_CWD": "/private/hostile-cwd",
+    "EXPDESIGN_UNREVIEWED_FLAG": "must-not-reach-node",
+    "OPENAI_API_KEY": "must-not-reach-node",
+    "ANTHROPIC_API_KEY": "must-not-reach-node",
+    "AWS_SECRET_ACCESS_KEY": "must-not-reach-node",
+    "HTTPS_PROXY": "http://must-not-reach-node.invalid",
+    "npm_config_registry": "https://must-not-reach-node.invalid",
+    "NODE_OPTIONS": "--require=/private/hostile-preload.js",
+    "NODE_PATH": "/private/hostile-modules",
+    "PYTHONPATH": "/private/hostile-python",
+    "LD_LIBRARY_PATH": "/private/hostile-native-loader",
+    "DYLD_LIBRARY_PATH": "/private/hostile-native-loader",
+}
+_missing_environment_value = object()
+original_spawn_environment = {
+    name: os.environ.get(name, _missing_environment_value)
+    for name in spawn_environment_overrides
+}
+os.environ.update(spawn_environment_overrides)
 
 
 def fake_popen(args, **kwargs):
@@ -690,18 +870,23 @@ else:
     partial_failed = False
 finally:
     mcp_client_module.subprocess.Popen = original_popen
-    if original_path is None:
-        os.environ.pop("PATH", None)
-    else:
-        os.environ["PATH"] = original_path
-    for key, original in (
-        ("NODE_OPTIONS", original_node_options), ("NODE_PATH", original_node_path),
-    ):
-        if original is None:
+    for key, original in original_spawn_environment.items():
+        if original is _missing_environment_value:
             os.environ.pop(key, None)
         else:
             os.environ[key] = original
 
+spawned_environment = spawn_calls[0][1].get("env", {}) if spawn_calls else {}
+expected_spawned_names = {
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TZ",
+    "EXPDESIGN_NODE", "EXPDESIGN_RSCRIPT", "EXPDESIGN_PYTHON",
+    "EXPDESIGN_ALLOWED_READ_ROOTS", "EXPDESIGN_RUNS_DIR",
+    "EXPDESIGN_ARTIFACT_LOCK_WAIT_MS",
+    "EXPDESIGN_ARTIFACT_MAX_LEASE_SECONDS",
+    "EXPDESIGN_ARTIFACT_RETENTION_DAYS", "EXPDESIGN_ARTIFACT_MAX_DIRS",
+    "EXPDESIGN_RUNTIME_REGISTRY_DIR", "EXPDESIGN_RUNTIME_REGISTRY_TOKEN",
+    "EXPDESIGN_RUNTIME_REGISTRY_DEV", "EXPDESIGN_RUNTIME_REGISTRY_INO",
+}
 partial_cleanup_ok = (
     partial_failed and not partial_process.alive and partial_client._proc is None
     and len(spawn_calls) == 1
@@ -711,14 +896,26 @@ partial_cleanup_ok = (
     and spawn_calls[0][1].get("text") is False
     and spawn_calls[0][1].get("bufsize") == 0
     and spawn_calls[0][0][0] != "node"
-    and spawn_calls[0][1].get("env", {}).get("PATH") == "/private/hostile-path"
-    and "NODE_OPTIONS" not in spawn_calls[0][1].get("env", {})
-    and "NODE_PATH" not in spawn_calls[0][1].get("env", {})
-    and "EXPDESIGN_RUNTIME_REGISTRY_DIR" in spawn_calls[0][1].get("env", {})
-    and "EXPDESIGN_RUNTIME_REGISTRY_TOKEN" in spawn_calls[0][1].get("env", {})
+    and set(spawned_environment) == expected_spawned_names
+    and spawned_environment.get("PATH") == mcp_client_module._CONTROLLED_SERVER_PATH
+    and spawned_environment.get("HOME") in {"/", "/var/empty"}
+    and spawned_environment.get("TMPDIR") == "/tmp"
+    and spawned_environment.get("LANG") == "C"
+    and spawned_environment.get("LC_ALL") == "C"
+    and spawned_environment.get("TZ") == "UTC"
+    and spawned_environment.get("EXPDESIGN_NODE") == "/bin/sh"
+    and spawned_environment.get("EXPDESIGN_RSCRIPT") == "/bin/sh"
+    and spawned_environment.get("EXPDESIGN_PYTHON") == sys.executable
+    and spawned_environment.get("EXPDESIGN_ALLOWED_READ_ROOTS") == str(MCP_SERVER_DIR)
+    and spawned_environment.get("EXPDESIGN_RUNS_DIR") == "/tmp/expdesign-test-runs"
+    and spawned_environment.get("EXPDESIGN_ARTIFACT_MAX_DIRS") == "11"
+    and spawned_environment.get("EXPDESIGN_RUNTIME_REGISTRY_DIR")
+    != spawn_environment_overrides["EXPDESIGN_RUNTIME_REGISTRY_DIR"]
+    and spawned_environment.get("EXPDESIGN_RUNTIME_REGISTRY_TOKEN")
+    != spawn_environment_overrides["EXPDESIGN_RUNTIME_REGISTRY_TOKEN"]
     and partial_client._runtime_registry is None
 )
-_record_check("partial_startup_cleans_process_and_ignores_hostile_node_path", partial_cleanup_ok)
+_record_check("partial_startup_cleans_process_and_closes_spawn_environment", partial_cleanup_ok)
 
 
 def identity_probe_available() -> bool:

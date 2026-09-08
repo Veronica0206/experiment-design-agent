@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
@@ -32,7 +32,6 @@ import {
   FingerprintPromiseCache,
   fingerprintMutableEngineRuntime,
   hashFramedFields,
-  REGRESSION_SKILLS,
   shutdownActiveRuntimeProbeProcesses,
   waitForSharedPromise,
   type PythonRuntimeSnapshot,
@@ -46,10 +45,13 @@ import {
 } from "./artifacts.js";
 import {
   InvalidRequestToolError,
-  publicToolErrorResponse,
 } from "./tool-errors.js";
 import { PINNED_RUNTIME_SUPERVISOR_COMMITMENT } from "./runtime-supervisor.js";
 import { normalizedAllocationWeights } from "./allocation-ratio.js";
+import { boundedToolResult } from "./response-budget.js";
+import { RepositoryToolBoundary } from "./tool-boundary.js";
+import { ACTIVE_RUNTIME_PROFILE, loadRuntimeProfile } from "./runtime-profile.js";
+export { ACTIVE_RUNTIME_PROFILE } from "./runtime-profile.js";
 
 const SERVER_VERSION = "1.1.0";
 const PRIVATE_PROVENANCE_META_KEY = "experiment-design/private-provenance";
@@ -60,16 +62,15 @@ const MCP_ROOT = join(SUITE_ROOT, "mcp-server");
 const MAX_STARTUP_DEPENDENCY_FILES = 20_000;
 const MAX_STARTUP_DEPENDENCY_BYTES = 256 * 1024 * 1024;
 export const MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE =
-  "Experiment Design MCP startup refused: the required private statistical " +
-  "engine installation is unavailable. This public portfolio copy is not a " +
-  "standalone executable distribution; use an authorized complete installation.";
+  "Experiment Design MCP startup refused: the statistical engine installation " +
+  "required by the repository runtime profile is unavailable.";
 
 // This is an availability preflight, not a scientific or release-readiness
 // attestation. The later runtime fingerprint and regression gates remain the
-// authority for bytes and behavior. Keep this list limited to the private R
+// authority for bytes and behavior. Keep this list limited to the maintained R
 // entry files directly sourced by the public dispatcher plus every required
 // regression entrypoint.
-export const REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES: readonly string[] = [
+const ALL_ENGINE_RUNTIME_FILES: readonly string[] = [
   "vera-experiment-designing/scripts/R/config.R",
   "vera-experiment-designing/scripts/R/sample_size.R",
   "vera-experiment-designing/scripts/R/bayesian.R",
@@ -92,8 +93,17 @@ export const REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES: readonly string[] = [
   "vera-indirect-comparing/scripts/R/indirect_comparison.R",
   "vera-meta-analyzing/scripts/R/meta_endpoint_core.R",
   "vera-doe-designing/scripts/R/doe.R",
-  ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/tests/run_tests.R`),
+  ...["vera-experiment-designing", "vera-master-experiment-designing",
+    "vera-doe-designing", "vera-indirect-comparing", "vera-meta-analyzing"]
+    .map((skill) => `${skill}/scripts/tests/run_tests.R`),
 ];
+
+export function requiredEngineRuntimeFiles(suiteRoot = SUITE_ROOT): readonly string[] {
+  const profile = loadRuntimeProfile(suiteRoot);
+  return ALL_ENGINE_RUNTIME_FILES.filter((path) => profile.skills.includes(path.split("/")[0]));
+}
+
+export const REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES = requiredEngineRuntimeFiles();
 
 class MissingPrivateEngineInstallationError extends Error {
   constructor() {
@@ -103,11 +113,11 @@ class MissingPrivateEngineInstallationError extends Error {
 }
 
 /**
- * Refuse executable startup when the private engine installation is absent.
+ * Refuse executable startup when any engine required by the profile is absent.
  *
  * This check intentionally has no environment-variable bypass. It runs only
  * from executable main, before the MCP transport is connected, so importing
- * this module remains side-effect free and an incomplete public clone never
+ * this module does not connect a transport and an incomplete installation never
  * advertises tools it cannot execute.
  */
 export function assertRequiredPrivateEngineInstallation(
@@ -120,7 +130,7 @@ export function assertRequiredPrivateEngineInstallation(
     throw new MissingPrivateEngineInstallationError();
   }
 
-  for (const relativePath of REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES) {
+  for (const relativePath of requiredEngineRuntimeFiles(canonicalRoot)) {
     const candidate = resolve(canonicalRoot, ...relativePath.split("/"));
     if (!candidate.startsWith(`${canonicalRoot}${sep}`)) {
       throw new MissingPrivateEngineInstallationError();
@@ -277,6 +287,8 @@ export const STARTUP_RUNTIME_FINGERPRINT = fingerprintStartupRuntime(
     ),
     join(MCP_ROOT, "package.json"),
     join(MCP_ROOT, "package-lock.json"),
+    join(SUITE_ROOT, "governance", "runtime-profiles.json"),
+    join(SUITE_ROOT, "governance", "runtime_profile.mjs"),
   ],
   installedProductionDependencyRoots(MCP_ROOT),
   process.version,
@@ -288,6 +300,9 @@ type BoundRuntime = { r: RRuntimeSnapshot; python: PythonRuntimeSnapshot };
 const runtimeByEngineFingerprint = new Map<string, BoundRuntime>();
 
 async function engineFingerprint(signal?: AbortSignal): Promise<string> {
+  if (JSON.stringify(loadRuntimeProfile(SUITE_ROOT)) !== JSON.stringify(ACTIVE_RUNTIME_PROFILE)) {
+    throw new Error("Repository runtime profile changed after server startup");
+  }
   // R and Python modules are loaded by a fresh child process for each call, so
   // recompute their hashes at provenance time rather than freezing startup state.
   const rRuntime = await currentRRuntimeSnapshot(signal);
@@ -383,17 +398,18 @@ const registerStrictTool = (
   description: string,
   shape: z.ZodRawShape,
   handler: (params: any, signal: AbortSignal) => Promise<any>,
-) => server.registerTool(name, {
+) => {
+  if (!ACTIVE_RUNTIME_PROFILE.tools.includes(name)) return;
+  toolBoundary.register(
+  name,
   description,
-  inputSchema: z.object(shape).strict(),
-}, async (params, extra) => {
-  try {
+  z.object(shape).strict(),
+  async (params, signal) => {
     assertFiniteNumericInputs(params);
-    return await handler(params, extra.signal);
-  } catch (error) {
-    return publicToolErrorResponse(name, error);
-  }
-});
+    return boundedToolResult(await handler(params, signal));
+  },
+  );
+};
 
 function domainParams(params: Record<string, unknown>): Record<string, unknown> {
   const { verification_id: _verificationId, ...domain } = params;
@@ -837,8 +853,8 @@ const singleEndpointParams = {
   design: z.enum(["single_arm", "controlled"]),
   null_param: z.number(),
   alt_param: z.number(),
-  sd: z.number().optional(),
-  alloc_ratio: z.number().optional(),
+  sd: z.number().positive().optional(),
+  alloc_ratio: z.number().positive().optional(),
   alphas: z.union([
     z.number().gt(0).lt(1),
     z.array(z.number().gt(0).lt(1)).min(1).max(MAX_GRID_VALUES),
@@ -856,12 +872,59 @@ const singleEndpointParams = {
     .describe("Posterior probability threshold for Consider (default 0.60)"),
   go_target: z.number().optional()
     .describe("Go/No-Go posterior target: P(theta > go_target | data). Default: midpoint of null/alt (geometric mean for tte)"),
-  accrual_time: z.number().optional(),
-  followup_time: z.number().optional(),
-  exposure_time: z.number().optional(),
+  accrual_time: z.number().positive().optional(),
+  followup_time: z.number().positive().optional(),
+  exposure_time: z.number().positive().optional(),
   tte_method: tteMethod,
   rate_method: rateMethod,
 };
+
+const SINGLE_ENDPOINT_SCOPED_FIELDS = [
+  "sd", "accrual_time", "followup_time", "exposure_time",
+  "tte_method", "rate_method",
+] as const;
+const SINGLE_ENDPOINT_ALLOWED_SCOPED_FIELDS: Record<string, ReadonlySet<string>> = {
+  binary: new Set(),
+  continuous: new Set(["sd"]),
+  tte: new Set(["accrual_time", "followup_time", "tte_method"]),
+  incidence_rate: new Set(["exposure_time", "rate_method"]),
+};
+
+function assertSingleEndpointFieldScope(params: Record<string, unknown>): void {
+  const endpoint = String(params.endpoint_type);
+  const allowed = SINGLE_ENDPOINT_ALLOWED_SCOPED_FIELDS[endpoint];
+  if (!allowed) return;
+  const foreignFields = SINGLE_ENDPOINT_SCOPED_FIELDS.filter(
+    (field) => params[field] !== undefined && !allowed.has(field),
+  );
+  if (foreignFields.length > 0) {
+    throw new InvalidRequestToolError(
+      `endpoint_type='${endpoint}' does not accept ${foreignFields.join(", ")}`,
+    );
+  }
+  if (params.design === "single_arm" && params.alloc_ratio !== undefined) {
+    throw new InvalidRequestToolError(
+      "alloc_ratio is accepted only for controlled single-endpoint designs",
+    );
+  }
+  const prior = params.prior;
+  if (prior && typeof prior === "object" && !Array.isArray(prior)) {
+    const expectedPriorKeys: Record<string, readonly string[]> = {
+      binary: ["a", "b"],
+      continuous: ["alpha0", "beta0", "kappa0", "mu0"],
+      tte: ["rate", "shape"],
+      incidence_rate: ["rate", "shape"],
+    };
+    const actual = Object.keys(prior as Record<string, unknown>).sort();
+    const expected = expectedPriorKeys[endpoint];
+    if (actual.length !== expected.length ||
+        actual.some((key, index) => key !== expected[index])) {
+      throw new InvalidRequestToolError(
+        "custom prior keys do not match the selected endpoint_type",
+      );
+    }
+  }
+}
 
 const p2DataSchema = z.union([
   z.object({ x: z.number().int().nonnegative(), n: z.number().int().positive() }).strict(),
@@ -881,6 +944,7 @@ const strictPath = z.string().min(1).max(4096).refine(
 );
 
 function assertSingleEndpointParams(params: Record<string, unknown>): void {
+  assertSingleEndpointFieldScope(params);
   const go = Number(params.go_threshold ?? 0.90);
   const consider = Number(params.consider_threshold ?? 0.60);
   if (!(consider < go)) {
@@ -889,8 +953,42 @@ function assertSingleEndpointParams(params: Record<string, unknown>): void {
   const endpoint = params.endpoint_type;
   const nullParam = Number(params.null_param);
   const altParam = Number(params.alt_param);
-  if ((endpoint === "binary" || endpoint === "continuous") && !(altParam > nullParam)) {
-    throw new InvalidRequestToolError("alt_param > null_param is required for this endpoint");
+  if (endpoint === "binary") {
+    if (nullParam < 0 || nullParam > 1 || altParam < 0 || altParam > 1) {
+      throw new InvalidRequestToolError("binary endpoint parameters must lie in [0,1]");
+    }
+    if (!(altParam > nullParam)) {
+      throw new InvalidRequestToolError("binary alt_param must exceed null_param");
+    }
+  } else if (endpoint === "continuous") {
+    if (!(altParam > nullParam)) {
+      throw new InvalidRequestToolError("continuous alt_param must exceed null_param");
+    }
+    if (!(Number(params.sd) > 0)) {
+      throw new InvalidRequestToolError("continuous endpoints require a positive sd");
+    }
+  } else if (endpoint === "tte") {
+    if (!(nullParam > 0 && altParam > 0 && altParam < nullParam)) {
+      throw new InvalidRequestToolError(
+        "tte endpoint parameters must be positive with alt_param below null_param",
+      );
+    }
+    if (!(Number(params.accrual_time) > 0 && Number(params.followup_time) > 0)) {
+      throw new InvalidRequestToolError(
+        "tte endpoints require positive accrual_time and followup_time",
+      );
+    }
+  } else if (endpoint === "incidence_rate") {
+    if (nullParam < 0 || altParam < 0 || altParam === nullParam) {
+      throw new InvalidRequestToolError(
+        "incidence-rate parameters must be non-negative and distinct",
+      );
+    }
+    if (!(Number(params.exposure_time) > 0)) {
+      throw new InvalidRequestToolError(
+        "incidence-rate endpoints require a positive exposure_time",
+      );
+    }
   }
   if (params.design === "single_arm" && params.p2_data_ctrl !== undefined) {
     throw new InvalidRequestToolError("p2_data_ctrl is not valid for a single-arm design");
@@ -909,10 +1007,11 @@ function assertSingleEndpointParams(params: Record<string, unknown>): void {
   }
 }
 
-const server = new McpServer({
-  name: "experiment-design",
-  version: SERVER_VERSION,
-});
+const server = new Server(
+  { name: "experiment-design", version: SERVER_VERSION },
+  { capabilities: { tools: { listChanged: false } } },
+);
+const toolBoundary = new RepositoryToolBoundary(server);
 
 // --- Tool: validate_config ---
 
@@ -981,8 +1080,56 @@ registerStrictTool(
   async (params, signal) => {
     const config = params.config as Record<string, unknown>;
     assertSingleEndpointParams(config);
-    if (config.design === "controlled" && config.p2_data && !config.p2_data_ctrl) {
-      throw new InvalidRequestToolError("controlled confirmatory PPOS requires p2_data_ctrl");
+    const pposFields = [
+      "p2_data", "p2_data_ctrl", "p3_n", "p3_alloc_ratio", "p3_alpha",
+    ] as const;
+    if (config.study_type !== "confirmatory" && pposFields.some(
+      (field) => config[field] !== undefined,
+    )) {
+      throw new InvalidRequestToolError(
+        "PPOS data and confirmatory-stage settings require study_type='confirmatory'",
+      );
+    }
+    const p2KeysByEndpoint: Record<string, readonly string[]> = {
+      binary: ["n", "x"],
+      continuous: ["n", "s2", "x_bar"],
+      tte: ["events", "person_time"],
+      incidence_rate: ["count", "exposure"],
+    };
+    const expectedP2Keys = p2KeysByEndpoint[String(config.endpoint_type)];
+    for (const field of ["p2_data", "p2_data_ctrl"] as const) {
+      const data = config[field] as Record<string, unknown> | undefined;
+      if (data === undefined) continue;
+      const keys = Object.keys(data).sort();
+      if (keys.length !== expectedP2Keys.length ||
+          keys.some((key, index) => key !== expectedP2Keys[index])) {
+        throw new InvalidRequestToolError(
+          `${field} does not match endpoint_type='${String(config.endpoint_type)}'`,
+        );
+      }
+      if (config.endpoint_type === "binary" && Number(data.x) > Number(data.n)) {
+        throw new InvalidRequestToolError(
+          `${field} binary responders cannot exceed its sample size`,
+        );
+      }
+    }
+    const hasP2Data = config.p2_data !== undefined;
+    const hasP2ControlData = config.p2_data_ctrl !== undefined;
+    if (config.design === "controlled" && hasP2Data !== hasP2ControlData) {
+      throw new InvalidRequestToolError(
+        "controlled confirmatory PPOS requires paired p2_data and p2_data_ctrl",
+      );
+    }
+    const p3Fields = ["p3_n", "p3_alloc_ratio", "p3_alpha"] as const;
+    if (!hasP2Data && p3Fields.some((field) => config[field] !== undefined)) {
+      throw new InvalidRequestToolError(
+        "confirmatory-stage PPOS settings require p2_data",
+      );
+    }
+    if (config.design !== "controlled" && config.p3_alloc_ratio !== undefined) {
+      throw new InvalidRequestToolError(
+        "p3_alloc_ratio is accepted only for controlled designs",
+      );
     }
     if (params.n_oc !== undefined) {
       if (config.design === "controlled" && typeof params.n_oc === "number") {
@@ -1019,6 +1166,27 @@ const PLATFORM_ONLY_MASTER_FIELDS = [
   "shared_control", "ncc_method", "ncc_weight_decay", "rar_enabled",
   "rar_burn_in", "rar_min_alloc", "interim_frequency", "futility_threshold",
 ] as const;
+const BASKET_ONLY_MASTER_FIELDS = [
+  "n_per_subgroup", "borrowing_method", "phase", "n_interims",
+  "n_per_interim", "go_threshold", "nogo_threshold", "tau_prior",
+  "homogeneity_prior", "response_prior", "cbhm_a", "cbhm_b",
+  "ia_pruning_alpha", "chen_strategy",
+] as const;
+const UMBRELLA_ONLY_MASTER_FIELDS = [
+  "umbrella_method", "n_arms", "n_stages", "n_per_arm_stage",
+  "futility_boundaries", "n_drop_per_stage", "rar_gamma",
+  "selection_rule", "power_type",
+] as const;
+const MASTER_ENDPOINT_SCOPED_FIELDS = [
+  "sd", "accrual_time", "followup_time", "exposure_time",
+  "tte_method", "rate_method",
+] as const;
+const MASTER_ENDPOINT_ALLOWED_FIELDS: Record<string, ReadonlySet<string>> = {
+  binary: new Set(),
+  continuous: new Set(["sd"]),
+  tte: new Set(["accrual_time", "followup_time", "tte_method"]),
+  incidence_rate: new Set(["exposure_time", "rate_method"]),
+};
 const PLATFORM_INTERIM_UNAVAILABLE_MESSAGE =
   "interim_frequency/futility_threshold are unavailable for this endpoint and " +
   "NCC method because no consistent interim model is implemented";
@@ -1086,7 +1254,6 @@ registerStrictTool(
       n_arms: z.number().int().min(2).max(50).optional(),
       n_stages: z.number().int().min(1).max(20).optional(),
       n_per_arm_stage: z.number().int().min(2).max(100000).optional(),
-      sd: z.number().optional(),
       futility_boundaries: z.array(z.number()).min(1).max(20).optional()
         .describe("Umbrella: stage-wise futility boundaries, length n_stages (default: calculated)"),
       n_drop_per_stage: z.array(z.number().int().nonnegative()).max(19).optional()
@@ -1123,6 +1290,7 @@ registerStrictTool(
       futility_threshold: z.number().gt(0).lt(1).optional()
         .describe("Platform binary/continuous with ncc_method='none' only: posterior probability threshold for early futility stopping (default 0.05). Early efficacy stopping is not exposed."),
       // Endpoint-specific
+      sd: z.number().positive().optional(),
       accrual_time: z.number().positive().optional(),
       followup_time: z.number().positive().optional(),
       exposure_time: z.number().positive().optional(),
@@ -1137,9 +1305,153 @@ registerStrictTool(
     const domain = { ...identityDomain };
     const cfgForBudget = domain.config as Record<string, unknown>;
     const designType = String(cfgForBudget.master_design_type);
+    const nSubgroups = Number(cfgForBudget.n_subgroups);
+    if (cfgForBudget.soc_data !== undefined) {
+      throw new InvalidRequestToolError(
+        "soc_data is reserved for a disabled prototype and is not accepted",
+      );
+    }
+    if (designType !== "basket" && BASKET_ONLY_MASTER_FIELDS.some(
+      (field) => cfgForBudget[field] !== undefined,
+    )) {
+      throw new InvalidRequestToolError(
+        "basket-only configuration fields require master_design_type='basket'",
+      );
+    }
+    if (designType !== "umbrella" && UMBRELLA_ONLY_MASTER_FIELDS.some(
+      (field) => cfgForBudget[field] !== undefined,
+    )) {
+      throw new InvalidRequestToolError(
+        "umbrella-only configuration fields require master_design_type='umbrella'",
+      );
+    }
+    const borrowingMethod = String(cfgForBudget.borrowing_method ?? "");
+    if (cfgForBudget.tau_prior !== undefined && borrowingMethod !== "full_bhm") {
+      throw new InvalidRequestToolError(
+        "tau_prior requires borrowing_method='full_bhm'",
+      );
+    }
+    if ((cfgForBudget.cbhm_a !== undefined || cfgForBudget.cbhm_b !== undefined) &&
+        borrowingMethod !== "cbhm") {
+      throw new InvalidRequestToolError(
+        "cbhm calibration fields require borrowing_method='cbhm'",
+      );
+    }
+    if ((cfgForBudget.homogeneity_prior !== undefined ||
+         cfgForBudget.response_prior !== undefined) &&
+        borrowingMethod !== "simons_bayesian") {
+      throw new InvalidRequestToolError(
+        "Simon's prior fields require borrowing_method='simons_bayesian'",
+      );
+    }
+    if ((cfgForBudget.ia_pruning_alpha !== undefined ||
+         cfgForBudget.chen_strategy !== undefined) &&
+        borrowingMethod !== "chen_confirmatory") {
+      throw new InvalidRequestToolError(
+        "Chen decision fields require borrowing_method='chen_confirmatory'",
+      );
+    }
+    const umbrellaMethod = String(cfgForBudget.umbrella_method ?? "mams");
+    if (designType === "umbrella" && cfgForBudget.n_arms !== undefined &&
+        Number(cfgForBudget.n_arms) !== nSubgroups) {
+      throw new InvalidRequestToolError(
+        "umbrella n_arms must equal n_subgroups",
+      );
+    }
+    const derivedSelectionRule = umbrellaMethod === "drop_the_losers"
+      ? "rank_best"
+      : "threshold";
+    if (designType === "umbrella" && cfgForBudget.selection_rule !== undefined &&
+        cfgForBudget.selection_rule !== derivedSelectionRule) {
+      throw new InvalidRequestToolError(
+        "selection_rule must match the selected umbrella_method",
+      );
+    }
+    if (cfgForBudget.n_drop_per_stage !== undefined &&
+        umbrellaMethod !== "drop_the_losers") {
+      throw new InvalidRequestToolError(
+        "n_drop_per_stage requires umbrella_method='drop_the_losers'",
+      );
+    }
+    if (cfgForBudget.rar_gamma !== undefined &&
+        umbrellaMethod !== "bayesian_adaptive_randomization") {
+      throw new InvalidRequestToolError(
+        "rar_gamma requires umbrella_method='bayesian_adaptive_randomization'",
+      );
+    }
+    if (cfgForBudget.ncc_weight_decay !== undefined &&
+        cfgForBudget.ncc_method !== "time_machine") {
+      throw new InvalidRequestToolError(
+        "ncc_weight_decay requires ncc_method='time_machine'",
+      );
+    }
+    if ((cfgForBudget.rar_burn_in !== undefined ||
+         cfgForBudget.rar_min_alloc !== undefined) &&
+        cfgForBudget.rar_enabled !== true) {
+      throw new InvalidRequestToolError(
+        "platform RAR settings require rar_enabled=true",
+      );
+    }
+    const allowedEndpointFields = MASTER_ENDPOINT_ALLOWED_FIELDS[
+      String(cfgForBudget.endpoint_type)
+    ];
+    if (allowedEndpointFields && MASTER_ENDPOINT_SCOPED_FIELDS.some(
+      (field) => cfgForBudget[field] !== undefined &&
+        !allowedEndpointFields.has(field),
+    )) {
+      throw new InvalidRequestToolError(
+        "master configuration contains fields for a different endpoint_type",
+      );
+    }
+    const altParams = cfgForBudget.alt_params as number[];
+    const nullParams = cfgForBudget.null_params;
+    if (altParams.length !== nSubgroups ||
+        (Array.isArray(nullParams) && nullParams.length !== nSubgroups)) {
+      throw new InvalidRequestToolError(
+        "master parameter arrays must contain exactly n_subgroups values",
+      );
+    }
+    const endpointType = String(cfgForBudget.endpoint_type);
+    if (endpointType === "continuous" &&
+        !(typeof cfgForBudget.sd === "number" && cfgForBudget.sd > 0)) {
+      throw new InvalidRequestToolError("continuous master designs require a positive scalar sd");
+    }
+    if (endpointType === "tte" &&
+        !(Number(cfgForBudget.accrual_time) > 0 &&
+          Number(cfgForBudget.followup_time) > 0)) {
+      throw new InvalidRequestToolError(
+        "time-to-event master designs require positive accrual_time and followup_time",
+      );
+    }
+    if (endpointType === "incidence_rate" &&
+        !(Number(cfgForBudget.exposure_time) > 0)) {
+      throw new InvalidRequestToolError(
+        "incidence-rate master designs require a positive exposure_time",
+      );
+    }
+    const nullValues = Array.isArray(nullParams)
+      ? nullParams.map(Number)
+      : Array<number>(nSubgroups).fill(Number(nullParams));
+    const alternativeValues = altParams.map(Number);
+    const directionIsValid = alternativeValues.every((alternative, index) => {
+      const nullValue = nullValues[index];
+      if (endpointType === "binary") {
+        return nullValue >= 0 && nullValue <= 1 &&
+          alternative >= 0 && alternative <= 1 && alternative > nullValue;
+      }
+      if (endpointType === "continuous") return alternative > nullValue;
+      if (endpointType === "tte" || endpointType === "incidence_rate") {
+        return nullValue > 0 && alternative > 0 && alternative < nullValue;
+      }
+      return false;
+    });
+    if (!directionIsValid) {
+      throw new InvalidRequestToolError(
+        "master null and alternative parameters violate endpoint bounds or direction",
+      );
+    }
     const nSims = typeof cfgForBudget.n_sims === "number"
       ? cfgForBudget.n_sims : 10000;
-    const nSubgroups = cfgForBudget.n_subgroups as number;
     let platformBudget: { nPeriods: number; nPerPeriod: number } | undefined;
     if (designType === "platform") {
       if (PLATFORM_REQUIRED_MASTER_FIELDS.some(
@@ -1208,14 +1520,6 @@ registerStrictTool(
     if (designType === "basket" && Number(cfgForBudget.nogo_threshold ?? 0.10) >= Number(cfgForBudget.go_threshold ?? 0.90)) {
       throw new InvalidRequestToolError("nogo_threshold must be below go_threshold");
     }
-    if (cfgForBudget.endpoint_type === "binary") {
-      const nulls = Array.isArray(cfgForBudget.null_params) ? cfgForBudget.null_params : [cfgForBudget.null_params];
-      const alts = cfgForBudget.alt_params as number[];
-      if ([...nulls, ...alts].some((value) => Number(value) < 0 || Number(value) > 1)) {
-        throw new InvalidRequestToolError("binary endpoint parameters must lie in [0,1]");
-      }
-    }
-    const borrowingMethod = String(cfgForBudget.borrowing_method ?? "");
     if (["snti", "sep_gibbs", "wathen_sti"].includes(borrowingMethod)) {
       throw new InvalidRequestToolError(
         `borrowing_method='${borrowingMethod}' is disabled because the available treatment-only likelihood does not identify a treatment effect`,
@@ -1320,6 +1624,73 @@ registerStrictTool(
 
 // --- Tool: indirect_compare ---
 
+const BUCHER_TOP_LEVEL_FIELDS = new Set(["method", "comparisons"]);
+
+function assertIndirectComparisonParams(params: Record<string, unknown>): void {
+  if (params.method === "bucher") {
+    if (!Array.isArray(params.comparisons)) {
+      throw new InvalidRequestToolError("bucher requires comparisons");
+    }
+    if (Object.keys(params).some((key) => !BUCHER_TOP_LEVEL_FIELDS.has(key))) {
+      throw new InvalidRequestToolError(
+        "bucher does not accept MAIC-only settings",
+      );
+    }
+    return;
+  }
+
+  if (params.method !== "maic") {
+    throw new InvalidRequestToolError("unsupported indirect-comparison method");
+  }
+  if (params.comparisons !== undefined) {
+    throw new InvalidRequestToolError("maic does not accept Bucher comparisons");
+  }
+  for (const field of ["ipd_file", "targets_file", "treatment_arm"] as const) {
+    if (typeof params[field] !== "string" || !params[field]) {
+      throw new InvalidRequestToolError(`maic requires ${field}`);
+    }
+  }
+
+  const endpoint = String(params.maic_endpoint_type ?? "binary");
+  const has = (field: string): boolean => params[field] !== undefined;
+  if (endpoint === "binary" || endpoint === "continuous") {
+    if (["event_col", "time_col", "status_col", "tte_method"].some(has)) {
+      throw new InvalidRequestToolError(
+        "binary/continuous MAIC does not accept rate or TTE column settings",
+      );
+    }
+  } else if (endpoint === "rate") {
+    if (!has("event_col") || !has("time_col")) {
+      throw new InvalidRequestToolError(
+        "rate MAIC requires event_col and time_col",
+      );
+    }
+    if (["outcome_col", "status_col", "tte_method"].some(has)) {
+      throw new InvalidRequestToolError(
+        "rate MAIC does not accept outcome, status, or TTE-model settings",
+      );
+    }
+  } else if (endpoint === "tte") {
+    if (!has("time_col") || !has("status_col")) {
+      throw new InvalidRequestToolError(
+        "TTE MAIC requires time_col and status_col",
+      );
+    }
+    if (["outcome_col", "event_col"].some(has)) {
+      throw new InvalidRequestToolError(
+        "TTE MAIC does not accept outcome or rate-event columns",
+      );
+    }
+    const tteMethod = String(params.tte_method ?? "cox");
+    if (tteMethod === "cox" &&
+        (has("bootstrap_replicates") || has("bootstrap_seed"))) {
+      throw new InvalidRequestToolError(
+        "Cox MAIC does not accept non-Cox bootstrap settings",
+      );
+    }
+  }
+}
+
 registerStrictTool(
   "indirect_compare",
   "Run an indirect treatment comparison: Bucher method for published aggregate data, or MAIC for IPD-vs-published comparisons. Returns effect estimates, SEs, CIs, and assumption audits.",
@@ -1342,15 +1713,15 @@ registerStrictTool(
     ipd_file: strictPath.optional(),
     targets_file: strictPath.optional(),
     output_dir: strictPath.optional(),
-    treatment_arm: z.string().max(MAX_LABEL_CHARS).optional().describe("MAIC: active-arm label in the IPD arm column (required for method='maic')"),
-    comparator_arm: z.string().max(MAX_LABEL_CHARS).optional().describe("MAIC: comparator-arm label in the IPD; omit for unanchored"),
-    arm_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: name of the arm/treatment column in the IPD CSV (default 'arm')"),
+    treatment_arm: z.string().min(1).max(MAX_LABEL_CHARS).optional().describe("MAIC: active-arm label in the IPD arm column (required for method='maic')"),
+    comparator_arm: z.string().min(1).max(MAX_LABEL_CHARS).optional().describe("MAIC: comparator-arm label in the IPD; omit for unanchored"),
+    arm_col: z.string().min(1).max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: name of the arm/treatment column in the IPD CSV (default 'arm')"),
     maic_endpoint_type: z.enum(["binary", "continuous", "rate", "tte"]).optional().describe("MAIC: outcome type in the IPD (default 'binary')"),
-    outcome_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: outcome column (binary/continuous) in the IPD CSV (default 'response')"),
-    event_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-count column in the IPD CSV (required for maic_endpoint_type='rate')"),
-    time_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: person-time/follow-up column in the IPD CSV (required for 'rate' and 'tte')"),
-    status_col: z.string().max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-status (0/1) column in the IPD CSV (required for maic_endpoint_type='tte')"),
-    covariates: z.array(z.string().max(MAX_COLUMN_NAME_CHARS)).max(MAX_COVARIATES).optional()
+    outcome_col: z.string().min(1).max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: outcome column (binary/continuous) in the IPD CSV (default 'response')"),
+    event_col: z.string().min(1).max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-count column in the IPD CSV (required for maic_endpoint_type='rate')"),
+    time_col: z.string().min(1).max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: person-time/follow-up column in the IPD CSV (required for 'rate' and 'tte')"),
+    status_col: z.string().min(1).max(MAX_COLUMN_NAME_CHARS).optional().describe("MAIC: event-status (0/1) column in the IPD CSV (required for maic_endpoint_type='tte')"),
+    covariates: z.array(z.string().min(1).max(MAX_COLUMN_NAME_CHARS)).min(1).max(MAX_COVARIATES).optional()
       .describe("MAIC: covariate columns to weight on (default: every column in the targets CSV)"),
     tte_method: z.enum(["cox", "exponential"]).optional()
       .describe("MAIC tte analysis model: 'cox' (default, weighted Cox PH) or 'exponential' (base-R person-time proxy)"),
@@ -1366,6 +1737,7 @@ registerStrictTool(
   },
   async (params, signal) => {
     const identityDomain = domainParams(params);
+    assertIndirectComparisonParams(identityDomain);
     const domain = { ...identityDomain };
     let managedOutput: string | undefined;
     let inputSnapshot: string | undefined;
@@ -1373,12 +1745,11 @@ registerStrictTool(
     let completed = false;
     try {
       if (domain.method === "maic") {
-        if (typeof domain.ipd_file !== "string" || typeof domain.targets_file !== "string") {
-          throw new InvalidRequestToolError("maic requires ipd_file and targets_file");
-        }
+        const ipdFile = domain.ipd_file as string;
+        const targetsFile = domain.targets_file as string;
         const [ipdBytes, targetsBytes] = await Promise.all([
-          readAllowedFile(domain.ipd_file),
-          readAllowedFile(domain.targets_file),
+          readAllowedFile(ipdFile),
+          readAllowedFile(targetsFile),
         ]);
         const ipdRows = boundedCsvRows(ipdBytes, MAX_IPD_ROWS, "IPD CSV");
         boundedCsvRows(targetsBytes, MAX_TARGET_ROWS, "target CSV");
@@ -1463,6 +1834,96 @@ const metaStudySchema = z.object({
   person_time_t: z.number().positive().optional(), person_time_c: z.number().positive().optional(),
 }).strict();
 
+const META_STUDY_FIELDS_BY_ENDPOINT: Record<string, ReadonlySet<string>> = {
+  binary_single: new Set(["responders", "total", "continuity"]),
+  binary_comparative: new Set([
+    "events_t", "total_t", "events_c", "total_c", "continuity", "measure",
+  ]),
+  continuous_single: new Set(["mean", "sd", "n"]),
+  continuous_comparative: new Set([
+    "mean_t", "sd_t", "n_t", "mean_c", "sd_c", "n_c", "measure",
+  ]),
+  time_to_event: new Set([
+    "hr", "ci_lower", "ci_upper", "log_hr", "se", "source_ci_level",
+  ]),
+  incidence_single: new Set(["events", "person_time"]),
+  incidence_comparative: new Set([
+    "events_t", "person_time_t", "events_c", "person_time_c",
+  ]),
+};
+const BINARY_META_MEASURES = new Set([
+  "risk_difference", "log_risk_ratio", "log_odds_ratio",
+]);
+const CONTINUOUS_META_MEASURES = new Set([
+  "mean_difference", "standardized_mean_difference",
+]);
+
+function assertMetaStudyFieldScope(
+  endpoint: string,
+  studies: ReadonlyArray<Record<string, unknown>>,
+): void {
+  const allowed = META_STUDY_FIELDS_BY_ENDPOINT[endpoint];
+  if (!allowed) return;
+  for (const study of studies) {
+    if (Object.keys(study).some((field) => !allowed.has(field))) {
+      throw new InvalidRequestToolError(
+        `meta-analysis studies contain fields not accepted for endpoint_type='${endpoint}'`,
+      );
+    }
+    const measure = study.measure;
+    if (measure !== undefined &&
+        ((endpoint === "binary_comparative" && !BINARY_META_MEASURES.has(String(measure))) ||
+         (endpoint === "continuous_comparative" &&
+          !CONTINUOUS_META_MEASURES.has(String(measure))))) {
+      throw new InvalidRequestToolError(
+        `meta-analysis measure is not accepted for endpoint_type='${endpoint}'`,
+      );
+    }
+  }
+}
+
+function isUsableMetaStudy(
+  endpoint: string,
+  study: Record<string, unknown>,
+): boolean {
+  const numeric = (field: string) => typeof study[field] === "number" &&
+    Number.isFinite(study[field]);
+  const positive = (field: string) => numeric(field) && Number(study[field]) > 0;
+  const nonnegative = (field: string) => numeric(field) && Number(study[field]) >= 0;
+  if (endpoint === "binary_single") {
+    return nonnegative("responders") && positive("total") &&
+      Number(study.responders) <= Number(study.total);
+  }
+  if (endpoint === "binary_comparative") {
+    return nonnegative("events_t") && positive("total_t") &&
+      nonnegative("events_c") && positive("total_c") &&
+      Number(study.events_t) <= Number(study.total_t) &&
+      Number(study.events_c) <= Number(study.total_c);
+  }
+  if (endpoint === "continuous_single") {
+    return numeric("mean") && positive("sd") && positive("n");
+  }
+  if (endpoint === "continuous_comparative") {
+    return numeric("mean_t") && positive("sd_t") && positive("n_t") &&
+      numeric("mean_c") && positive("sd_c") && positive("n_c");
+  }
+  if (endpoint === "time_to_event") {
+    const hasEffect = positive("hr") || numeric("log_hr");
+    const hasUncertainty = positive("se") ||
+      (positive("ci_lower") && positive("ci_upper") &&
+       Number(study.ci_lower) < Number(study.ci_upper));
+    return hasEffect && hasUncertainty;
+  }
+  if (endpoint === "incidence_single") {
+    return nonnegative("events") && positive("person_time");
+  }
+  if (endpoint === "incidence_comparative") {
+    return nonnegative("events_t") && positive("person_time_t") &&
+      nonnegative("events_c") && positive("person_time_c");
+  }
+  return false;
+}
+
 registerStrictTool(
   "meta_analyze",
   "Run a fixed-effect or random-effects meta-analysis across studies. Supports binary (logit), continuous (mean difference), time-to-event (log-HR), and incidence rate endpoints. Returns pooled estimate, CI, heterogeneity (Q, I², tau²), per-study effects, and n_input/k_used/dropped_studies so any study exclusion is visible.",
@@ -1481,7 +1942,41 @@ registerStrictTool(
     inference_method: z.enum(["hksj", "dl_z"]).optional()
       .describe("Random-effects inference (default hksj; dl_z available for compatibility)"),
   },
-  async (params, signal) => runTool("meta_analyze", params, signal)
+  async (params, signal) => {
+    const endpoint = String(params.endpoint_type);
+    const studies = params.studies as Array<Record<string, unknown>>;
+    assertMetaStudyFieldScope(
+      endpoint,
+      studies,
+    );
+    const usableStudies = studies.filter((study) => isUsableMetaStudy(endpoint, study));
+    if (usableStudies.length < 2) {
+      throw new InvalidRequestToolError(
+        "meta-analysis requires at least two usable studies for the selected endpoint",
+      );
+    }
+    const defaultMeasure = endpoint === "binary_comparative"
+      ? "log_odds_ratio"
+      : endpoint === "continuous_comparative"
+        ? "mean_difference"
+        : undefined;
+    if (defaultMeasure) {
+      const effectiveMeasures = new Set(
+        usableStudies.map((study) => String(study.measure ?? defaultMeasure)),
+      );
+      if (effectiveMeasures.size !== 1) {
+        throw new InvalidRequestToolError(
+          "all usable meta-analysis studies must use the same effect measure",
+        );
+      }
+    }
+    if (params.random === false && params.inference_method !== undefined) {
+      throw new InvalidRequestToolError(
+        "fixed-effect meta-analysis does not accept random-effects inference_method",
+      );
+    }
+    return runTool("meta_analyze", params, signal);
+  }
 );
 
 // --- Tool: ab_test ---
@@ -1495,7 +1990,7 @@ registerStrictTool(
     effect: z.number().describe("Minimum detectable effect (absolute delta, or relative fraction of baseline if effect_type='relative')"),
     metric: z.enum(["proportion", "mean"]).optional(),
     effect_type: z.enum(["absolute", "relative"]).optional(),
-    sd: z.number().optional().describe("Standard deviation (required for metric='mean')"),
+    sd: z.number().positive().optional().describe("Standard deviation (required for metric='mean')"),
     alpha: z.number().gt(0).lt(1).optional()
       .describe("Total type-I error probability interpreted according to sided"),
     power: z.number().gt(0).lt(1).optional(),
@@ -1503,7 +1998,44 @@ registerStrictTool(
       .describe("Test sidedness: 1 for one-sided, 2 for two-sided (default 2)"),
     ratio: z.number().positive().optional().describe("Allocation ratio n_treatment / n_control (default 1)"),
   },
-  async (params, signal) => runTool("ab_test", params, signal)
+  async (params, signal) => {
+    const metric = String(params.metric ?? "proportion");
+    const effectiveMde = params.effect_type === "relative"
+      ? Number(params.baseline) * Number(params.effect)
+      : Number(params.effect);
+    if (effectiveMde === 0) {
+      throw new InvalidRequestToolError(
+        "A/B tests require a nonzero effective minimum detectable effect",
+      );
+    }
+    if (metric === "proportion" &&
+        !(Number(params.baseline) > 0 && Number(params.baseline) < 1)) {
+      throw new InvalidRequestToolError(
+        "proportion A/B tests require baseline strictly between zero and one",
+      );
+    }
+    if (metric === "proportion" && params.sd !== undefined) {
+      throw new InvalidRequestToolError(
+        "proportion A/B tests do not accept sd",
+      );
+    }
+    if (metric === "proportion") {
+      const baseline = Number(params.baseline);
+      const effect = Number(params.effect);
+      const alternative = params.effect_type === "relative"
+        ? baseline * (1 + effect)
+        : baseline + effect;
+      if (!(alternative > 0 && alternative < 1) || alternative === baseline) {
+        throw new InvalidRequestToolError(
+          "proportion A/B tests require a distinct alternative proportion in (0,1)",
+        );
+      }
+    }
+    if (metric === "mean" && !(Number(params.sd) > 0)) {
+      throw new InvalidRequestToolError("mean A/B tests require a positive sd");
+    }
+    return runTool("ab_test", params, signal);
+  }
 );
 
 // --- Tool: factorial_design ---
@@ -1530,6 +2062,11 @@ registerStrictTool(
   async (params, signal) => {
     const fraction = Number(params.fraction ?? 0);
     const nFactors = Number(params.n_factors);
+    if (params.seed !== undefined && params.randomize !== true) {
+      throw new InvalidRequestToolError(
+        "factorial seed is accepted only when randomize=true",
+      );
+    }
     if (fraction >= nFactors) {
       throw new InvalidRequestToolError("fraction must be below n_factors");
     }
@@ -1597,12 +2134,33 @@ registerStrictTool(
     n_factors: z.number().int().min(2).max(8),
     design: z.enum(["ccd", "bbd"]).optional(),
     center_points: z.number().int().min(0).max(1000).optional(),
-    alpha: z.union([z.enum(["rotatable", "face"]), z.number().positive()]).optional().describe("Positive CCD axial distance (default 'rotatable'); not read by design='bbd'"),
-    fraction: z.number().int().min(0).optional().describe("CCD: fractionate the factorial core, e.g. 1 for a half-fraction; not read by design='bbd'"),
+    alpha: z.union([z.enum(["rotatable", "face"]), z.number().positive()]).optional().describe("Positive CCD axial distance (default 'rotatable'); rejected for design='bbd'"),
+    fraction: z.number().int().min(0).optional().describe("CCD: fractionate the factorial core, e.g. 1 for a half-fraction; rejected for design='bbd'"),
     randomize: z.boolean().optional(),
     seed: z.number().int().min(0).max(2147483647).optional().describe("Integer RNG seed for run-order randomization (default 42); echoed in the result when randomize=true"),
   },
-  async (params, signal) => runTool("rsm_design", params, signal)
+  async (params, signal) => {
+    const design = String(params.design ?? "ccd");
+    const nFactors = Number(params.n_factors);
+    if (params.seed !== undefined && params.randomize !== true) {
+      throw new InvalidRequestToolError(
+        "RSM seed is accepted only when randomize=true",
+      );
+    }
+    if (design === "bbd") {
+      if (nFactors < 3 || nFactors > 5) {
+        throw new InvalidRequestToolError("Box-Behnken designs require 3-5 factors");
+      }
+      if (params.alpha !== undefined || params.fraction !== undefined) {
+        throw new InvalidRequestToolError(
+          "Box-Behnken designs do not accept CCD-only alpha or fraction settings",
+        );
+      }
+    } else if (Number(params.fraction ?? 0) >= nFactors) {
+      throw new InvalidRequestToolError("CCD fraction must be below n_factors");
+    }
+    return runTool("rsm_design", params, signal);
+  }
 );
 
 // --- Tool: randomize ---
@@ -1615,7 +2173,12 @@ registerStrictTool(
     n: z.number().int().min(1).max(10000),
     arms: z.union([
       z.number().int().min(2).max(100),
-      z.array(z.string().max(MAX_LABEL_CHARS)).min(2).max(100),
+      z.array(
+        z.string().min(1).max(MAX_LABEL_CHARS).refine(
+          (label) => label.trim().length > 0,
+          "arm labels may not be blank",
+        ),
+      ).min(2).max(100),
     ]).optional().describe("Number of arms, or explicit arm names"),
     method: z.enum(["simple", "block", "stratified"]).optional(),
     block_size: z.number().int().min(1).max(10000).optional()
@@ -1628,6 +2191,34 @@ registerStrictTool(
   async (params, signal) => {
     const method = String(params.method ?? "simple");
     const ratio = params.ratio as number[] | undefined;
+    if (method === "simple" && params.block_size !== undefined) {
+      throw new InvalidRequestToolError(
+        "block_size is accepted only for block or stratified randomization",
+      );
+    }
+    if (Array.isArray(params.arms) && new Set(params.arms).size !== params.arms.length) {
+      throw new InvalidRequestToolError("treatment arm labels must be unique");
+    }
+    const armCount = Array.isArray(params.arms)
+      ? params.arms.length
+      : Number(params.arms ?? 2);
+    if (ratio && ratio.length !== armCount) {
+      throw new InvalidRequestToolError(
+        "allocation ratio length must equal the number of treatment arms",
+      );
+    }
+    const strata = params.strata as unknown[] | undefined;
+    if (method === "stratified") {
+      if (!strata || strata.length !== Number(params.n)) {
+        throw new InvalidRequestToolError(
+          "stratified randomization requires one stratum label per unit",
+        );
+      }
+    } else if (strata !== undefined) {
+      throw new InvalidRequestToolError(
+        "strata are accepted only for method='stratified'",
+      );
+    }
     const normalizedRatio = ratio
       ? normalizedAllocationWeights(ratio)
       : undefined;

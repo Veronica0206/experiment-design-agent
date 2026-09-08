@@ -3,7 +3,7 @@ import { accessSync, constants, readFileSync, realpathSync, statSync } from "nod
 import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { domainTools } from "./domain_tool_policy.mjs";
+import { activeDomainTools } from "./domain_tool_policy.mjs";
 
 const mode = process.argv[2];
 const agentScope = process.argv[3];
@@ -23,6 +23,7 @@ const mcpPrefix = "mcp__experiment-design__";
 class HookIdentityError extends Error {}
 
 function registryAgents() {
+  const domainTools = activeDomainTools();
   const registry = JSON.parse(readFileSync(registryPath, "utf8"));
   if (!registry || typeof registry !== "object" || Array.isArray(registry)
       || Object.keys(registry).sort().join(",") !== "agents,schema_version"
@@ -196,6 +197,20 @@ function main() {
       return 2;
     }
     validateHookIdentity(data, agent, agentScope);
+    if (agent.role === "coordinator" && ["capture", "bind"].includes(mode)
+        && process.env.CLAUDE_CODE_FORK_SUBAGENT !== "0") {
+      process.stderr.write("INTERNAL_ERROR. Coordinator requires CLAUDE_CODE_FORK_SUBAGENT=0 before Claude starts; restart with the project's foreground settings.");
+      return 2;
+    }
+    // Claude 2.1.233 removes run_in_background from Agent's schema when this
+    // boolean is true, even with fork mode off. Match its trimmed bool parser.
+    if (agent.role === "coordinator" && ["capture", "bind"].includes(mode)
+        && ["1", "true", "yes", "on"].includes(
+          (process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? "").trim().toLowerCase(),
+        )) {
+      process.stderr.write("INTERNAL_ERROR. Coordinator's explicit foreground contract is incompatible with CLAUDE_CODE_DISABLE_BACKGROUND_TASKS; unset that preference or start another session after setting it false.");
+      return 2;
+    }
     data._expdesign_agent_scope = agentScope;
     const input = JSON.stringify(data);
     const path = join(hookDirectory, script);

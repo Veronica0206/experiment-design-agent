@@ -14,6 +14,9 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from public_release_policy import public_path_error
+
 
 EXPECTED_OWNER = "Veronica0206"
 EXPECTED_FULL_NAME = "Veronica0206/experiment-design-agent"
@@ -27,7 +30,7 @@ EXPECTED_AUTHOR_NAME = "VERA Public Release"
 EXPECTED_AUTHOR_EMAIL = "Veronica0206@users.noreply.github.com"
 EXPECTED_COMMIT_MESSAGE = "Sync reviewed public portfolio distribution"
 EXPECTED_PUBLIC_ASSURANCE_SHA256 = (
-    "898c0bd0347b9967f1f4ac95eef15632e86af778cb6cb0aea6efdc3e0788dbb5"
+    "72e661c80c85464ca812787fe7059850d6ef715153ff4ae76bd950ec6643078e"
 )
 APPROVED_GIT_PATHS = {
     "/usr/bin/git",
@@ -50,6 +53,7 @@ ALLOWED_LOCAL_CONFIG = {
 ALLOWED_PUBLIC_BUILD_OUTPUTS = {
     PurePosixPath("mcp-server/node_modules"),
     PurePosixPath("mcp-server/dist"),
+    PurePosixPath("agent-harness/.venv"),
 }
 
 
@@ -190,13 +194,9 @@ def _tree_paths(root: Path, object_id: str) -> tuple[list[str], str | None]:
 
 def _validate_public_paths(paths: list[str]) -> int:
     for relative in paths:
-        path = PurePosixPath(relative)
-        if path.is_absolute() or ".." in path.parts or str(path) != relative:
-            return fail(f"unsafe public-tree path: {relative!r}")
-        if any(part.casefold().startswith("vera-") for part in path.parts):
-            return fail(f"vera-* path components are forbidden publicly: {relative}")
-        if path.name.casefold().endswith(".skill.enc"):
-            return fail(f"encrypted skill bundles are forbidden publicly: {relative}")
+        error = public_path_error(relative)
+        if error:
+            return fail(f"{error}: {relative}")
     print(f"Strict public path policy passed ({len(paths)} entries)")
     return 0
 

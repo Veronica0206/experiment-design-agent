@@ -55,11 +55,14 @@ import {
   assertFiniteNumericInputs,
   MISSING_PRIVATE_ENGINE_INSTALLATION_MESSAGE,
   REQUIRED_PRIVATE_ENGINE_RUNTIME_FILES,
+  requiredEngineRuntimeFiles,
+  assertRequiredPrivateEngineInstallation,
   fingerprintStartupRuntime,
   installedProductionDependencyRoots,
   STARTUP_RUNTIME_FINGERPRINT,
   readAllowedFile,
 } from "../dist/index.js";
+import { ACTIVE_RUNTIME_PROFILE, loadRuntimeProfile } from "../dist/runtime-profile.js";
 import { publicRegressionStatus } from "../dist/public-projection.js";
 import {
   MAX_VERIFIER_STDOUT_BYTES,
@@ -70,6 +73,7 @@ import {
   killRuntimeProcessTree,
   MAX_SUPERVISOR_PROGRAM_BYTES,
   PINNED_RUNTIME_SUPERVISOR_COMMITMENT,
+  parseLinuxProcessGroupStat,
   runtimeSupervisorProgramCommitment,
   spawnRuntimeProcess,
 } from "../dist/runtime-supervisor.js";
@@ -79,6 +83,12 @@ import {
   publicToolErrorResponse,
 } from "../dist/tool-errors.js";
 import { normalizedAllocationWeights } from "../dist/allocation-ratio.js";
+import { testManagedLifecycles } from "./managed-lifecycle.mjs";
+import {
+  boundedToolResult,
+  MAX_PUBLIC_TOOL_RESULT_BYTES,
+  ToolResultBudgetError,
+} from "../dist/response-budget.js";
 
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -142,6 +152,24 @@ const workspace = realpathSync(
 );
 
 try {
+  // /proc also contains kernel threads outside every user process group.
+  // Parse their real field layout on every host so macOS CI catches this Linux
+  // boundary without mocking process.platform or weakening leader validation.
+  const groupRows = [
+    "2 (kthreadd) S 0 0 0 0 -1 0 0 0 0",
+    "412 (runtime helper (worker)) S 1 412 412 0 -1 0 0 0 0",
+    "413 (sleep) S 412 412 412 0 -1 0 0 0 0",
+    "510 (unrelated) S 1 510 510 0 -1 0 0 0 0",
+  ];
+  assert.deepEqual(groupRows.map(parseLinuxProcessGroupStat), [0, 412, 412, 510]);
+  assert.equal(groupRows.filter((row) => parseLinuxProcessGroupStat(row) === 412).length, 2);
+  for (const malformed of ["2 kthreadd S 0 0", "2 (kthreadd) S 0",
+    "2 (kthreadd) S 0 -1", "2 (kthreadd) S 0 invalid",
+    "2 (kthreadd) S 0 9007199254740992"]) {
+    assert.throws(() => parseLinuxProcessGroupStat(malformed), /malformed/);
+  }
+  console.log("TEST linux_process_group_scan_accepts_kernel_threads_and_rejects_malformed_rows : PASS");
+  await testManagedLifecycles();
   const outsideInput = join(workspace, "outside-input.csv");
   writeFileSync(outsideInput, "value\n1\n", { mode: 0o600 });
   let privatePathError;
@@ -201,6 +229,130 @@ try {
     },
   );
   console.log("TEST mcp_tool_errors_are_path_free_with_private_diagnostics : PASS");
+
+  const budgetProbe = { content: [{ type: "text", text: "bounded" }] };
+  const exactBudget = Buffer.byteLength(JSON.stringify(budgetProbe), "utf8");
+  assert.equal(MAX_PUBLIC_TOOL_RESULT_BYTES, 4 * 1024 * 1024);
+  assert.deepEqual(boundedToolResult(budgetProbe, exactBudget + 1), budgetProbe);
+  assert.deepEqual(boundedToolResult(budgetProbe, exactBudget), budgetProbe);
+  assert.throws(
+    () => boundedToolResult(budgetProbe, exactBudget - 1),
+    ToolResultBudgetError,
+  );
+  let toJsonCalls = 0;
+  const statefulResult = {
+    toJSON() {
+      toJsonCalls += 1;
+      return { content: [{ type: "text", text: "stable" }] };
+    },
+  };
+  const statefulSnapshot = boundedToolResult(statefulResult, 1024);
+  assert.equal(toJsonCalls, 1);
+  statefulResult.toJSON = () => {
+    throw new Error("a post-check serializer must never run");
+  };
+  assert.deepEqual(statefulSnapshot, {
+    content: [{ type: "text", text: "stable" }],
+  });
+  console.log("TEST serialized_tool_result_budget_is_exact_and_snapshotted : PASS");
+
+  const budgetServer = spawn(
+    process.execPath,
+    ["tests/response-budget-server.mjs"],
+    { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const budgetServerClosed = new Promise((resolve) => budgetServer.once("close", resolve));
+  const budgetResponses = new Map();
+  const budgetFrames = new Map();
+  let budgetStdout = "";
+  let budgetStderr = "";
+  budgetServer.stdout.on("data", (chunk) => {
+    budgetStdout += chunk.toString();
+    for (;;) {
+      const newline = budgetStdout.indexOf("\n");
+      if (newline < 0) break;
+      const line = budgetStdout.slice(0, newline);
+      budgetStdout = budgetStdout.slice(newline + 1);
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      if (message.id !== undefined) {
+        budgetResponses.set(message.id, message);
+        budgetFrames.set(message.id, Buffer.byteLength(`${line}\n`, "utf8"));
+      }
+    }
+  });
+  budgetServer.stderr.on("data", (chunk) => { budgetStderr += chunk.toString(); });
+  budgetServer.stdin.write(JSON.stringify({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05", capabilities: {},
+      clientInfo: { name: "response-budget-regression", version: "1" },
+    },
+  }) + "\n");
+  budgetServer.stdin.write(
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}\n',
+  );
+  for (const [id, name] of [[2, "max_result"], [3, "over_result"]]) {
+    budgetServer.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id, method: "tools/call",
+      params: { name, arguments: {} },
+    }) + "\n");
+  }
+  const publicBoundaryProbes = [
+    [4, "strict_probe", { count: 1, unknown: "do-not-reflect" }],
+    [5, "strict_probe", { count: "do-not-reflect" }],
+    [6, "strict_probe", { count: 3 }],
+    [7, "not_a_registered_tool", { secret: "do-not-reflect" }],
+    [8, 7, {}],
+    [9, "strict_probe", "do-not-reflect"],
+  ];
+  for (const [id, name, arguments_] of publicBoundaryProbes) {
+    budgetServer.stdin.write(JSON.stringify({
+      jsonrpc: "2.0", id, method: "tools/call",
+      params: { name, arguments: arguments_ },
+    }) + "\n");
+  }
+  const budgetDeadline = Date.now() + 15_000;
+  while (Date.now() < budgetDeadline &&
+         ![1, 2, 3, 4, 5, 6, 7, 8, 9].every((id) => budgetResponses.has(id))) {
+    await pause(20);
+  }
+  budgetServer.kill("SIGTERM");
+  await budgetServerClosed;
+  assert.ok(
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].every((id) => budgetResponses.has(id)),
+    budgetStderr,
+  );
+  const maximumResult = budgetResponses.get(2).result;
+  assert.equal(
+    Buffer.byteLength(JSON.stringify(maximumResult), "utf8"),
+    MAX_PUBLIC_TOOL_RESULT_BYTES,
+  );
+  assert.ok(budgetFrames.get(2) > MAX_PUBLIC_TOOL_RESULT_BYTES);
+  assert.ok(budgetFrames.get(2) < 10 * 1024 * 1024);
+  assert.deepEqual(JSON.parse(budgetResponses.get(3).result.content[0].text), {
+    error: {
+      code: "internal_error",
+      message: PUBLIC_TOOL_ERROR_MESSAGES.internal_error,
+    },
+  });
+  assert.ok(budgetFrames.get(3) < 1024);
+  console.log("TEST maximum_tool_result_and_one_byte_over_cross_real_stdio_safely : PASS");
+
+  const fixedInvalidRequest = JSON.stringify({
+    error: {
+      code: "invalid_request",
+      message: PUBLIC_TOOL_ERROR_MESSAGES.invalid_request,
+    },
+  });
+  for (const [id] of publicBoundaryProbes) {
+    const response = budgetResponses.get(id);
+    assert.equal(response.result?.isError, true, JSON.stringify(response));
+    assert.equal(response.result?.content?.length, 1, JSON.stringify(response));
+    assert.equal(response.result?.content?.[0]?.text, fixedInvalidRequest);
+    assert.equal(JSON.stringify(response).includes("do-not-reflect"), false);
+  }
+  console.log("TEST public_lifecycle_exercises_fixed_value_free_tool_boundary : PASS");
 
   const overflow = JSON.parse('{"go_target":1e309,"nested":[{"value":-1e309}]}');
   assert.equal(overflow.go_target, Infinity);
@@ -328,7 +480,7 @@ try {
     appendFileSync(mutatingRuntimeFile, "x");
   }, 1);
   try {
-    await assert.rejects(mutatingHash, /changed while reading/);
+    await assert.rejects(mutatingHash, /changed while (opening|reading)/);
   } finally {
     clearInterval(mutationTimer);
   }
@@ -542,6 +694,8 @@ try {
         ...startupFilesWithoutSupervisor,
         join(process.cwd(), "package.json"),
         join(process.cwd(), "package-lock.json"),
+        join(process.cwd(), "..", "governance", "runtime-profiles.json"),
+        join(process.cwd(), "..", "governance", "runtime_profile.mjs"),
       ],
       installedProductionDependencyRoots(process.cwd()),
       process.version,
@@ -554,6 +708,8 @@ try {
         ...startupFilesWithoutSupervisor,
         join(process.cwd(), "package.json"),
         join(process.cwd(), "package-lock.json"),
+        join(process.cwd(), "..", "governance", "runtime-profiles.json"),
+        join(process.cwd(), "..", "governance", "runtime_profile.mjs"),
       ],
       installedProductionDependencyRoots(process.cwd()),
       process.version,
@@ -573,7 +729,10 @@ try {
 
   const engineRoot = join(workspace, "engine-runtime-manifest");
   const maintainedEngineFiles = Object.values(ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES)
-    .flatMap((category) => category);
+    .flatMap((category) => category)
+    .filter((path) => ACTIVE_RUNTIME_PROFILE.name === "complete" || !path.startsWith(".claude/agents/") ||
+      ["design-verifier.md", "experiment-design-coordinator.md", "experiment-designer.md", "single-endpoint-designer.md"]
+        .some((name) => path === `.claude/agents/${name}`));
   const syntheticEngineFiles = [
     ...maintainedEngineFiles,
     ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/tests/run_tests.R`),
@@ -584,6 +743,8 @@ try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     writeFileSync(path, `runtime source: ${relativePath}\n`, { mode: 0o600 });
   }
+  const profileSource = readFileSync(join(process.cwd(), "..", "governance", "runtime-profiles.json"), "utf8");
+  writeFileSync(join(engineRoot, "governance", "runtime-profiles.json"), profileSource);
   const listedEngineFiles = new Set(mutableEngineFiles(engineRoot));
   for (const relativePath of maintainedEngineFiles) {
     assert.equal(
@@ -608,7 +769,7 @@ try {
     ...REGRESSION_SKILLS.map((skill) => `${skill}/scripts/R/runtime_fixture.R`),
   ]) {
     const path = join(engineRoot, ...relativePath.split("/"));
-    appendFileSync(path, `mutation: ${relativePath}\n`);
+    appendFileSync(path, relativePath === "governance/runtime-profiles.json" ? "\n" : `mutation: ${relativePath}\n`);
     const mutatedFingerprint = await fingerprintMutableEngineRuntime(
       engineRoot, "runtime-seed",
     );
@@ -656,7 +817,10 @@ try {
     appendFileSync(mutatingEngineSource, "x");
   }, 1);
   try {
-    await assert.rejects(mutatingEngineFingerprint, /changed while reading/);
+    await assert.rejects(
+      mutatingEngineFingerprint,
+      /changed while (?:opening|reading)/,
+    );
   } finally {
     clearInterval(engineMutationTimer);
     unlinkSync(mutatingEngineSource);
@@ -699,7 +863,7 @@ try {
   }
   const expectedRequiredEngineFiles = [
     ...new Set([
-      ...dispatcherEngineFiles,
+      ...dispatcherEngineFiles.filter((path) => ACTIVE_RUNTIME_PROFILE.skills.includes(path.split("/")[0])),
       ...REGRESSION_SKILLS.map(
         (skill) => `${skill}/scripts/tests/run_tests.R`,
       ),
@@ -730,6 +894,17 @@ try {
     join(publicCopyMcpRoot, "node_modules"),
     "dir",
   );
+
+  mkdirSync(join(publicCopyRoot, "governance"));
+  cpSync(join(process.cwd(), "..", "governance", "runtime_profile.mjs"),
+    join(publicCopyRoot, "governance", "runtime_profile.mjs"));
+  const singleProfileManifest = JSON.parse(profileSource);
+  singleProfileManifest.active = "single-endpoint";
+  writeFileSync(join(publicCopyRoot, "governance", "runtime-profiles.json"),
+    JSON.stringify(singleProfileManifest, null, 2) + "\n");
+  assert.equal(loadRuntimeProfile(publicCopyRoot).name, "single-endpoint");
+  assert.equal(requiredEngineRuntimeFiles(publicCopyRoot).length, 7);
+  assert.equal(requiredEngineRuntimeFiles(publicCopyRoot).every((path) => path.startsWith("vera-experiment-designing/")), true);
 
   const incompleteImportProbe = spawnSync(process.execPath, [
     "--input-type=module", "-e", 'await import("./dist/index.js")',
@@ -772,6 +947,20 @@ try {
   assert.equal(incompleteExecutableProbe.stderr.includes(publicCopyRoot), false);
   assert.equal(incompleteExecutableProbe.stderr.includes("vera-"), false);
   console.log("TEST executable_preflight_refuses_incomplete_public_copy_before_mcp_connect : PASS");
+
+  for (const relativePath of requiredEngineRuntimeFiles(publicCopyRoot)) {
+    const target = join(publicCopyRoot, relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "# availability fixture only\n");
+  }
+  assert.doesNotThrow(() => assertRequiredPrivateEngineInstallation(publicCopyRoot));
+  const missingCoreFile = join(publicCopyRoot, "vera-experiment-designing/scripts/R/ppos.R");
+  unlinkSync(missingCoreFile);
+  assert.throws(() => assertRequiredPrivateEngineInstallation(publicCopyRoot), /required by the repository runtime profile is unavailable/);
+  singleProfileManifest.active = "complete";
+  writeFileSync(join(publicCopyRoot, "governance/runtime-profiles.json"), JSON.stringify(singleProfileManifest));
+  assert.throws(() => assertRequiredPrivateEngineInstallation(publicCopyRoot), /required by the repository runtime profile is unavailable/);
+  console.log("TEST runtime_profiles_require_exact_installed_core_without_skipping : PASS");
 
   if (publicOnly) {
     console.log("TEST public_only_lifecycle_stops_after_public_preflight : PASS");
@@ -865,23 +1054,391 @@ try {
         n_factors: 5, fraction: 1, levels: 3,
       } },
     }) + "\n");
+    const contractRequests = [
+      [9, "validate_config", {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, unknown_field: "do-not-reflect",
+      }],
+      [10, "randomize", { n: "12" }],
+      [11, "randomize", { n: 10001 }],
+      [12, "randomize", { n: 12, method: "invalid-enum-value" }],
+      [13, "randomize", {}],
+      [14, "not_a_registered_tool", { secret_value: "do-not-reflect" }],
+      [15, "randomize", { n: 12, arms: 3, ratio: [1, 1] }],
+      [16, "randomize", {
+        n: 3, method: "stratified", strata: ["a", "b"],
+      }],
+      [17, "rsm_design", { n_factors: 2, design: "bbd" }],
+      [18, "rsm_design", {
+        n_factors: 3, design: "bbd", alpha: "face",
+      }],
+      [19, "rsm_design", { n_factors: 3, design: "ccd", fraction: 3 }],
+      [20, "validate_config", {
+        endpoint_type: "continuous", study_type: "poc", design: "single_arm",
+        null_param: 0, alt_param: 1,
+      }],
+      [21, "validate_config", {
+        endpoint_type: "tte", study_type: "poc", design: "single_arm",
+        null_param: 1, alt_param: 0.8,
+      }],
+      [22, "validate_config", {
+        endpoint_type: "incidence_rate", study_type: "poc", design: "single_arm",
+        null_param: 1, alt_param: 0.8,
+      }],
+      [23, "ab_test", { baseline: 10, effect: 1, metric: "mean" }],
+      [24, "rsm_design", { n_factors: 3, seed: 123 }],
+      [25, "randomize", "do-not-reflect"],
+      [26, "randomize", ["do-not-reflect"]],
+      [27, 7, {}],
+      [28, undefined, {}],
+      [29, "indirect_compare", { method: "bucher" }],
+      [30, "indirect_compare", {
+        method: "bucher", comparisons: [{
+          estimate_ab: 0.2, se_ab: 0.1, estimate_cb: 0.1, se_cb: 0.1,
+          treatment_a: "a", treatment_c: "c", common_comparator: "b",
+        }], ipd_file: "/do-not-reflect",
+      }],
+      [31, "indirect_compare", {
+        method: "maic", ipd_file: "/do-not-reflect",
+        targets_file: "/do-not-reflect",
+      }],
+      [32, "indirect_compare", {
+        method: "maic", ipd_file: "/do-not-reflect",
+        targets_file: "/do-not-reflect", treatment_arm: "active",
+        maic_endpoint_type: "rate",
+      }],
+      [33, "indirect_compare", {
+        method: "maic", ipd_file: "/do-not-reflect",
+        targets_file: "/do-not-reflect", treatment_arm: "active",
+        maic_endpoint_type: "tte", time_col: "time",
+      }],
+      [34, "indirect_compare", {
+        method: "maic", ipd_file: "/do-not-reflect",
+        targets_file: "/do-not-reflect", treatment_arm: "active",
+        comparisons: [{
+          estimate_ab: 0.2, se_ab: 0.1, estimate_cb: 0.1, se_cb: 0.1,
+          treatment_a: "a", treatment_c: "c", common_comparator: "b",
+        }],
+      }],
+      [35, "indirect_compare", {
+        method: "maic", ipd_file: "/do-not-reflect",
+        targets_file: "/do-not-reflect", treatment_arm: "active",
+        maic_endpoint_type: "tte", time_col: "time", status_col: "status",
+        tte_method: "cox", bootstrap_replicates: 200,
+      }],
+      [36, "meta_analyze", {
+        endpoint_type: "time_to_event", studies: [{}, {}], random: false,
+        inference_method: "hksj",
+      }],
+      [37, "master_simulate", { config: {
+        master_design_type: "umbrella", endpoint_type: "binary",
+        n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+        phase: "phase2",
+      } }],
+      [38, "master_simulate", { config: {
+        master_design_type: "platform", endpoint_type: "binary",
+        n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+        borrowing_method: "none",
+      } }],
+      [39, "master_simulate", { config: {
+        master_design_type: "basket", endpoint_type: "binary",
+        n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+        umbrella_method: "mams",
+      } }],
+      [40, "master_simulate", { config: {
+        master_design_type: "basket", endpoint_type: "binary",
+        n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+        ncc_method: "none",
+      } }],
+      [41, "master_simulate", { config: {
+        master_design_type: "basket", endpoint_type: "binary",
+        n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+        soc_data: { means: [0.2, 0.2] },
+      } }],
+      [42, "simulate_design", { config: {
+        endpoint_type: "binary", study_type: "confirmatory",
+        design: "single_arm", null_param: 0.2, alt_param: 0.4,
+        p2_data: { x_bar: 0.3, s2: 1, n: 10 },
+      } }],
+      [43, "simulate_design", { config: {
+        endpoint_type: "binary", study_type: "confirmatory",
+        design: "controlled", null_param: 0.2, alt_param: 0.4,
+        p2_data: { x: 3, n: 10 },
+      } }],
+      [44, "simulate_design", { config: {
+        endpoint_type: "binary", study_type: "confirmatory",
+        design: "controlled", null_param: 0.2, alt_param: 0.4,
+        p2_data_ctrl: { x: 2, n: 10 },
+      } }],
+      [45, "simulate_design", { config: {
+        endpoint_type: "binary", study_type: "confirmatory",
+        design: "single_arm", null_param: 0.2, alt_param: 0.4,
+        p3_n: 100,
+      } }],
+      [46, "simulate_design", { config: {
+        endpoint_type: "binary", study_type: "confirmatory",
+        design: "single_arm", null_param: 0.2, alt_param: 0.4,
+        p2_data: { x: 3, n: 10 }, p3_alloc_ratio: 1,
+      } }],
+      [47, "meta_analyze", {
+        endpoint_type: "binary_single",
+        studies: [{ responders: 3, total: 10, hr: 0.8 }, {}],
+      }],
+      [48, "ab_test", { baseline: 0, effect: 0.1, metric: "proportion" }],
+      [49, "ab_test", {
+        baseline: 0.2, effect: 0.1, metric: "proportion", sd: 1,
+      }],
+      [50, "randomize", { n: 12, method: "simple", block_size: 4 }],
+      [51, "randomize", { n: 12, arms: ["A", "A"] }],
+      [52, "randomize", { n: 12, arms: ["A", "   "] }],
+      [53, "factorial_design", { n_factors: 3, seed: 123 }],
+      [54, "validate_config", {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, sd: 1,
+      }],
+      [55, "validate_config", {
+        endpoint_type: "continuous", study_type: "poc", design: "single_arm",
+        null_param: 0, alt_param: 1, sd: 1, exposure_time: 1,
+      }],
+      [56, "validate_config", {
+        endpoint_type: "tte", study_type: "poc", design: "single_arm",
+        null_param: 1, alt_param: 0.8, accrual_time: 1, followup_time: 1,
+        rate_method: "poisson",
+      }],
+      [57, "validate_config", {
+        endpoint_type: "incidence_rate", study_type: "poc", design: "single_arm",
+        null_param: 1, alt_param: 0.8, exposure_time: 1,
+        tte_method: "exponential",
+      }],
+      [58, "validate_config", {
+        endpoint_type: "binary", study_type: "poc", design: "single_arm",
+        null_param: 0.2, alt_param: 0.4, alloc_ratio: 1,
+      }],
+    ];
+    let nextContractId = 59;
+    const addContractRequest = (name, arguments_) => {
+      contractRequests.push([nextContractId, name, arguments_]);
+      nextContractId += 1;
+    };
+    const basketContractBase = {
+      master_design_type: "basket", endpoint_type: "binary",
+      n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+      n_sims: 1,
+    };
+    const umbrellaContractBase = {
+      master_design_type: "umbrella", endpoint_type: "binary",
+      n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+      n_sims: 1,
+    };
+    const platformContractBase = {
+      master_design_type: "platform", endpoint_type: "binary",
+      n_subgroups: 2, null_params: 0.2, alt_params: [0.4, 0.4],
+      n_periods: 2, n_per_period: 10,
+      arms_schedule: { enter: [1, 1], leave: [2, 2] }, n_sims: 1,
+    };
+    const basketOnlyFieldValues = {
+      n_per_subgroup: 10, borrowing_method: "none", phase: "phase2",
+      n_interims: 1, n_per_interim: 2, go_threshold: 0.9,
+      nogo_threshold: 0.1,
+      tau_prior: { type: "half_normal", params: { scale: 1 } },
+      homogeneity_prior: 0.5, response_prior: 0.5,
+      cbhm_a: 0.5, cbhm_b: 0.5, ia_pruning_alpha: 0.1,
+      chen_strategy: "d1",
+    };
+    for (const [field, value] of Object.entries(basketOnlyFieldValues)) {
+      addContractRequest("master_simulate", {
+        config: { ...umbrellaContractBase, [field]: value },
+      });
+    }
+    const umbrellaOnlyFieldValues = {
+      umbrella_method: "mams", n_arms: 2, n_stages: 2,
+      n_per_arm_stage: 10, futility_boundaries: [0, 0],
+      n_drop_per_stage: [1], rar_gamma: 1,
+      selection_rule: "rank_best", power_type: "one_minimum",
+    };
+    for (const [field, value] of Object.entries(umbrellaOnlyFieldValues)) {
+      addContractRequest("master_simulate", {
+        config: { ...basketContractBase, [field]: value },
+      });
+    }
+    const platformOnlyFieldValues = {
+      n_periods: 2, n_per_period: 10,
+      arms_schedule: { enter: [1, 1], leave: [2, 2] },
+      shared_control: true, ncc_method: "none", ncc_weight_decay: 0.9,
+      rar_enabled: true, rar_burn_in: 10, rar_min_alloc: 0.1,
+      interim_frequency: 1, futility_threshold: 0.05,
+    };
+    for (const [field, value] of Object.entries(platformOnlyFieldValues)) {
+      addContractRequest("master_simulate", {
+        config: { ...basketContractBase, [field]: value },
+      });
+    }
+    for (const config of [
+      { ...basketContractBase, borrowing_method: "none",
+        tau_prior: { type: "half_normal", params: { scale: 1 } } },
+      { ...basketContractBase, borrowing_method: "none", cbhm_a: 0.5 },
+      { ...basketContractBase, borrowing_method: "none", homogeneity_prior: 0.5 },
+      { ...basketContractBase, borrowing_method: "none", ia_pruning_alpha: 0.1 },
+      { ...umbrellaContractBase, umbrella_method: "mams", n_drop_per_stage: [1] },
+      { ...umbrellaContractBase, umbrella_method: "mams", rar_gamma: 1 },
+      { ...umbrellaContractBase, umbrella_method: "mams",
+        selection_rule: "rank_best" },
+      { ...platformContractBase, ncc_method: "regression", ncc_weight_decay: 0.9 },
+      { ...platformContractBase, rar_burn_in: 10 },
+    ]) addContractRequest("master_simulate", { config });
+    for (const config of [
+      { ...basketContractBase, alt_params: [0.4] },
+      { ...basketContractBase, null_params: [0.2] },
+      { ...umbrellaContractBase, n_arms: 3 },
+      { ...umbrellaContractBase, endpoint_type: "continuous",
+        null_params: 0, alt_params: [0.5, 0.5] },
+      { ...umbrellaContractBase, endpoint_type: "tte",
+        null_params: 1, alt_params: [0.8, 0.8] },
+      { ...umbrellaContractBase, endpoint_type: "incidence_rate",
+        null_params: 1, alt_params: [0.8, 0.8] },
+      { ...basketContractBase, alt_params: [0.1, 0.4] },
+      { ...umbrellaContractBase, endpoint_type: "continuous", sd: 1,
+        null_params: 0, alt_params: [-0.1, 0.5] },
+      { ...umbrellaContractBase, endpoint_type: "tte", accrual_time: 1,
+        followup_time: 1, null_params: 1, alt_params: [1.2, 0.8] },
+      { ...umbrellaContractBase, endpoint_type: "incidence_rate",
+        exposure_time: 1, null_params: 1, alt_params: [1.2, 0.8] },
+      { ...basketContractBase, alt_params: [1.2, 0.4] },
+      { ...umbrellaContractBase, endpoint_type: "continuous", sd: 1,
+        exposure_time: 1, null_params: 0, alt_params: [0.5, 0.5] },
+    ]) addContractRequest("master_simulate", { config });
+    const binarySingleEndpoint = {
+      endpoint_type: "binary", study_type: "poc", design: "single_arm",
+      null_param: 0.2, alt_param: 0.4,
+    };
+    for (const [endpointConfig, prior] of [
+      [binarySingleEndpoint, { shape: 1, rate: 1 }],
+      [{ endpoint_type: "continuous", study_type: "poc", design: "single_arm",
+         null_param: 0, alt_param: 1, sd: 1 }, { a: 1, b: 1 }],
+      [{ endpoint_type: "tte", study_type: "poc", design: "single_arm",
+         null_param: 1, alt_param: 0.8, accrual_time: 1, followup_time: 1 },
+       { a: 1, b: 1 }],
+      [{ endpoint_type: "incidence_rate", study_type: "poc",
+         design: "single_arm", null_param: 1, alt_param: 0.8,
+         exposure_time: 1 }, { a: 1, b: 1 }],
+    ]) addContractRequest("validate_config", { ...endpointConfig, prior });
+    const pocPposValues = {
+      p2_data: { x: 2, n: 10 }, p2_data_ctrl: { x: 2, n: 10 },
+      p3_n: 100, p3_alloc_ratio: 1, p3_alpha: 0.025,
+    };
+    for (const [field, value] of Object.entries(pocPposValues)) {
+      addContractRequest("simulate_design", {
+        config: { ...binarySingleEndpoint, [field]: value },
+      });
+    }
+    addContractRequest("simulate_design", { config: {
+      ...binarySingleEndpoint, study_type: "confirmatory",
+      p2_data: { x: 11, n: 10 },
+    } });
+    const oneUsableMetaStudy = {
+      binary_single: { responders: 2, total: 10 },
+      binary_comparative: { events_t: 2, total_t: 10, events_c: 1, total_c: 10 },
+      continuous_single: { mean: 1, sd: 1, n: 10 },
+      continuous_comparative: {
+        mean_t: 1, sd_t: 1, n_t: 10, mean_c: 0, sd_c: 1, n_c: 10,
+      },
+      time_to_event: { hr: 0.8, se: 0.1 },
+      incidence_single: { events: 2, person_time: 10 },
+      incidence_comparative: {
+        events_t: 2, person_time_t: 10, events_c: 1, person_time_c: 10,
+      },
+    };
+    for (const [endpoint_type, study] of Object.entries(oneUsableMetaStudy)) {
+      addContractRequest("meta_analyze", {
+        endpoint_type, studies: [study, {}],
+      });
+    }
+    addContractRequest("meta_analyze", {
+      endpoint_type: "continuous_comparative",
+      studies: [
+        { ...oneUsableMetaStudy.continuous_comparative,
+          measure: "mean_difference" },
+        { ...oneUsableMetaStudy.continuous_comparative,
+          measure: "standardized_mean_difference" },
+      ],
+    });
+    for (const arguments_ of [
+      { baseline: 0.9, effect: 0.2, metric: "proportion" },
+      { baseline: 0.6, effect: 1, effect_type: "relative", metric: "proportion" },
+      { baseline: 0.2, effect: 0, metric: "proportion" },
+      { baseline: 10, effect: 0, metric: "mean", sd: 1 },
+      { baseline: 0, effect: 0.1, effect_type: "relative", metric: "mean", sd: 1 },
+    ]) addContractRequest("ab_test", arguments_);
+    for (const [id, name, arguments_] of contractRequests) {
+      child.stdin.write(JSON.stringify({
+        jsonrpc: "2.0", id, method: "tools/call",
+        params: { name, arguments: arguments_ },
+      }) + "\n");
+    }
+    const expectedIds = Array.from(
+      { length: nextContractId - 2 },
+      (_value, index) => index + 2,
+    );
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline &&
-           ![2, 3, 4, 5, 6, 7, 8].every((id) => responses.has(id))) {
+           !expectedIds.every((id) => responses.has(id))) {
       await pause(20);
     }
     child.kill("SIGTERM");
     await childClosed;
-    assert.ok([2, 3, 4, 5, 6, 7, 8].every((id) => responses.has(id)), stderr);
-    for (const id of [2, 3, 4, 5, 6, 7, 8]) {
+    assert.ok(expectedIds.every((id) => responses.has(id)), stderr);
+    const expectedPublicError = JSON.stringify({
+      error: {
+        code: "invalid_request",
+        message: PUBLIC_TOOL_ERROR_MESSAGES.invalid_request,
+      },
+    });
+    for (const id of expectedIds) {
       const message = responses.get(id);
       assert.equal(message.result?.isError, true, JSON.stringify(message));
+      assert.equal(message.result?.content?.length, 1, JSON.stringify(message));
+      assert.equal(message.result?.content?.[0]?.type, "text", JSON.stringify(message));
+      assert.equal(message.result?.content?.[0]?.text, expectedPublicError);
+      assert.equal(JSON.stringify(message).includes("do-not-reflect"), false);
     }
     assert.equal(existsSync(rMarker), false, "an invalid request reached the R handler");
-    console.log("TEST raw_mcp_numeric_collection_string_and_workload_guards_fail_before_r : PASS");
+    console.log("TEST raw_mcp_schema_taxonomy_and_cross_field_guards_fail_before_r : PASS");
   } else {
-    console.log("TEST raw_mcp_numeric_collection_string_and_workload_guards_fail_before_r : SKIP");
+    console.log("TEST raw_mcp_schema_taxonomy_and_cross_field_guards_fail_before_r : SKIP");
   }
+
+  const dispatcherPath = join(process.cwd(), "r-wrapper", "dispatcher.R");
+  const rsmOrderProbe = [
+    `parsed <- parse(file=${JSON.stringify(dispatcherPath)})`,
+    "assignment <- NULL",
+    "for (expr in parsed) {",
+    "  if (is.call(expr) && identical(expr[[1L]], as.name('<-')) &&",
+    "      identical(as.character(expr[[2L]]), 'bind_rsm_run_order')) assignment <- expr",
+    "}",
+    "stopifnot(!is.null(assignment))",
+    "scope <- new.env(parent=baseenv())",
+    "eval(assignment, envir=scope)",
+    "lexical <- scope$bind_rsm_run_order(list(design=data.frame(",
+    "  B=c(-1,1,-1,1), A=c(-1,-1,1,1), point_type=rep('factorial',4)",
+    ")), FALSE, 42L)$design",
+    "stopifnot(identical(as.numeric(lexical$A), c(-1,-1,1,1)))",
+    "stopifnot(identical(as.numeric(lexical$B), c(-1,1,-1,1)))",
+    "stopifnot(identical(lexical$std_order, 1:4), identical(lexical$run, 1:4))",
+    "numeric_alias <- scope$bind_rsm_run_order(list(design=data.frame(",
+    "  factor_10=c(-1,-1,1,1), factor_2=c(-1,1,-1,1),",
+    "  point_type=rep('factorial',4)",
+    ")), FALSE, 42L)$design",
+    "stopifnot(identical(as.numeric(numeric_alias$factor_2), c(-1,-1,1,1)))",
+    "stopifnot(identical(as.numeric(numeric_alias$factor_10), c(-1,1,-1,1)))",
+    "stopifnot(identical(numeric_alias$std_order, 1:4), identical(numeric_alias$run, 1:4))",
+  ].join("\n");
+  const rsmOrderResult = spawnSync(
+    RSCRIPT_EXECUTABLE,
+    ["--vanilla", "-e", rsmOrderProbe],
+    { encoding: "utf8", env: sanitizedRChildEnvironment(), timeout: 10_000 },
+  );
+  assert.equal(rsmOrderResult.status, 0, rsmOrderResult.stderr);
+  console.log("TEST rsm_standard_order_uses_public_canonical_factor_order : PASS");
 
   const safeRResult = join(workspace, "safe-r-result.json");
   writeFileSync(safeRResult, '{"ok":true}', { mode: 0o600 });

@@ -34,7 +34,10 @@ from private_state import (  # noqa: E402
 from verification_ledger import context_principal  # noqa: E402
 
 
-BINDING_VERSION = 2
+BINDING_VERSION = 3
+EPISODE_VERSION = 1
+MAX_CLARIFICATION_TURNS = 16
+MAX_REQUEST_BYTES = 131072
 AGENT_TOOL = "Agent"
 KEY_BYTES = 32
 ALLOWED_AGENT_INPUT_FIELDS = frozenset({
@@ -152,12 +155,73 @@ def _child_phase(child: str) -> str:
         raise ValueError(str(exc)) from exc
 
 
-def _binding(context: dict[str, str], commitment: str) -> dict[str, Any]:
+def _episode_name(context: dict[str, str]) -> str:
+    identity = json.dumps(_episode_context(context), sort_keys=True, separators=(",", ":"))
+    return "episode-" + hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+
+
+def _episode_context(context: dict[str, str]) -> dict[str, str]:
+    return {key: context[key] for key in ("session_id", "principal", "scope")}
+
+
+def _validate_turns(turns: Any, context: dict[str, str]) -> list[dict[str, Any]]:
+    if not isinstance(turns, list) or len(turns) >= MAX_CLARIFICATION_TURNS:
+        raise ValueError("clarification history exceeds the supported turn limit")
+    ids: set[str] = set()
+    total = 0
+    for turn in turns:
+        if not isinstance(turn, dict) or set(turn) != {"context", "commitment", "bytes"}:
+            raise ValueError("clarification turn has an invalid schema")
+        previous = turn["context"]
+        if (not isinstance(previous, dict) or set(previous) != set(context)
+                or _episode_context(previous) != _episode_context(context)
+                or not isinstance(previous.get("prompt_id"), str)
+                or not previous["prompt_id"] or "\0" in previous["prompt_id"]
+                or previous["prompt_id"] in ids):
+            raise ValueError("clarification history has invalid turn identities")
+        ids.add(previous["prompt_id"])
+        digest = turn["commitment"]
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            raise ValueError("clarification commitment is invalid")
+        size = turn["bytes"]
+        if type(size) is not int or size < 0:
+            raise ValueError("clarification byte count is invalid")
+        total += size
+    if total > MAX_REQUEST_BYTES:
+        raise ValueError("clarification history exceeds the supported byte limit")
+    return turns
+
+
+def _read_episode(directory_fd: int, context: dict[str, str]) -> dict[str, Any]:
+    empty = {"version": EPISODE_VERSION, "metadata": _episode_context(context),
+             "turns": [], "phase": None}
+    try:
+        value = json.loads(read_bytes_at(
+            directory_fd, _episode_name(context), "clarification episode",
+        ).decode("utf-8"))
+    except FileNotFoundError:
+        return empty
+    if (not isinstance(value, dict) or set(value) != set(empty)
+            or value["version"] != EPISODE_VERSION
+            or value["metadata"] != empty["metadata"]
+            or value["phase"] not in {None, "planning", "evidence"}):
+        raise ValueError("clarification episode has an invalid schema or context")
+    _validate_turns(value["turns"], context)
+    return value
+
+
+def _binding(
+    context: dict[str, str], commitment: str, prompt_bytes: int,
+    episode: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "version": BINDING_VERSION,
         "metadata": context,
         "commitment": commitment,
-        "dispatch_phase": None,
+        "prompt_bytes": prompt_bytes,
+        "prior_turns": episode["turns"],
+        "dispatch_phase": episode["phase"],
         "dispatched_children": [],
     }
 
@@ -165,7 +229,7 @@ def _binding(context: dict[str, str], commitment: str) -> dict[str, Any]:
 def _validate_binding(value: Any, context: dict[str, str]) -> dict[str, Any]:
     expected_fields = {
         "version", "metadata", "commitment", "dispatch_phase",
-        "dispatched_children",
+        "dispatched_children", "prompt_bytes", "prior_turns",
     }
     if not isinstance(value, dict) or set(value) != expected_fields:
         raise ValueError("prompt binding has an invalid schema")
@@ -178,6 +242,13 @@ def _validate_binding(value: Any, context: dict[str, str]) -> dict[str, Any]:
         bytes.fromhex(commitment)
     except ValueError as exc:
         raise ValueError("prompt binding commitment is invalid") from exc
+    turns = _validate_turns(value["prior_turns"], context)
+    if any(turn["context"]["prompt_id"] == context["prompt_id"] for turn in turns):
+        raise ValueError("current prompt is already in the clarification history")
+    size = value["prompt_bytes"]
+    if (type(size) is not int or size < 0
+            or size + sum(turn["bytes"] for turn in turns) > MAX_REQUEST_BYTES):
+        raise ValueError("request exceeds the supported byte limit")
     children = value.get("dispatched_children")
     phase = value.get("dispatch_phase")
     coordinator = _coordinator(context["scope"])
@@ -187,7 +258,7 @@ def _validate_binding(value: Any, context: dict[str, str]) -> dict[str, Any]:
             or any(child not in coordinator["allowed_children"] for child in children)):
         raise ValueError("prompt binding has invalid dispatch state")
     if not children:
-        if phase is not None:
+        if phase is not None and (not turns or phase not in {"planning", "evidence"}):
             raise ValueError("prompt binding has an orphaned dispatch phase")
     elif phase not in {"planning", "evidence"} or any(
         _child_phase(child) != phase for child in children
@@ -227,7 +298,7 @@ def _atomic_write(directory_fd: int, name: str, value: dict[str, Any]) -> None:
     )
 
 
-def capture_prompt(data: dict[str, Any]) -> None:
+def capture_prompt(data: dict[str, Any]) -> int:
     """Capture one raw user prompt as a private keyed commitment."""
     if data.get("hook_event_name") != "UserPromptSubmit":
         raise ValueError("capture accepts only UserPromptSubmit input")
@@ -237,20 +308,68 @@ def capture_prompt(data: dict[str, Any]) -> None:
     context = _context(data)
     path = _root() / f"{_binding_key(context)}.json"
     with _locked(path) as directory_fd:
+        episode = _read_episode(directory_fd, context)
         expected = _binding(
             context,
             _commitment(_secret(directory_fd), context, prompt),
+            len(prompt.encode("utf-8")), episode,
         )
+        _validate_binding(expected, context)
         try:
             current = _read_binding(directory_fd, path.name, context)
         except FileNotFoundError:
             _atomic_write(directory_fd, path.name, expected)
-            return
+            return len(expected["prior_turns"])
         if not hmac.compare_digest(current["commitment"], expected["commitment"]):
             raise ValueError("a different prompt is already bound to this prompt identity")
+        if current["prior_turns"] != expected["prior_turns"]:
+            raise ValueError("clarification history changed for this prompt identity")
+        return len(current["prior_turns"])
 
 
-def authorize_agent_dispatch(data: dict[str, Any]) -> None:
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("clarification envelope contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _authorize_request(
+    secret: bytes, context: dict[str, str], value: dict[str, Any], prompt: str,
+) -> str:
+    current = prompt
+    if len(prompt.encode("utf-8")) > MAX_REQUEST_BYTES * 6 + 512:
+        raise ValueError("Agent request exceeds the supported byte limit")
+    previous = value["prior_turns"]
+    if previous:
+        envelope = json.loads(prompt, object_pairs_hook=_unique_object)
+        if (not isinstance(envelope, dict)
+                or set(envelope) != {"type", "prior_user_messages", "current_user_message"}
+                or envelope["type"] != "clarified_user_request"
+                or not isinstance(envelope["prior_user_messages"], list)
+                or len(envelope["prior_user_messages"]) != len(previous)
+                or not all(isinstance(item, str) for item in envelope["prior_user_messages"])
+                or not isinstance(envelope["current_user_message"], str)):
+            raise ValueError("Agent requires the complete host-bound clarification envelope")
+        for turn, message in zip(previous, envelope["prior_user_messages"]):
+            digest = _commitment(secret, turn["context"], message)
+            if not hmac.compare_digest(turn["commitment"], digest):
+                raise ValueError("Agent changed, omitted, or reordered a prior user message")
+        current = envelope["current_user_message"]
+        prompt = json.dumps({
+            "type": "clarified_user_request",
+            "prior_user_messages": envelope["prior_user_messages"],
+            "current_user_message": current,
+        }, ensure_ascii=True, separators=(",", ":"))
+    expected = _commitment(secret, context, current)
+    if not hmac.compare_digest(value["commitment"], expected):
+        raise ValueError("Agent prompt does not match the current raw user prompt")
+    return prompt
+
+
+def authorize_agent_dispatch(data: dict[str, Any]) -> dict[str, Any]:
     """Allow only an exact, synchronous dispatch of the captured user prompt."""
     if data.get("hook_event_name") != "PreToolUse" or data.get("tool_name") != AGENT_TOOL:
         raise ValueError("dispatch binding accepts only PreToolUse Agent input")
@@ -273,9 +392,10 @@ def authorize_agent_dispatch(data: dict[str, Any]) -> None:
     path = _root() / f"{_binding_key(context)}.json"
     with _locked(path) as directory_fd:
         value = _read_binding(directory_fd, path.name, context)
-        expected = _commitment(_secret(directory_fd), context, prompt)
-        if not hmac.compare_digest(value["commitment"], expected):
-            raise ValueError("Agent prompt does not match the current raw user prompt")
+        episode = _read_episode(directory_fd, context)
+        if episode["turns"] != value["prior_turns"]:
+            raise ValueError("clarification history changed before dispatch")
+        prompt = _authorize_request(_secret(directory_fd), context, value, prompt)
         dispatched = value["dispatched_children"]
         if child in dispatched:
             raise ValueError("the same child may be dispatched only once per user prompt")
@@ -288,6 +408,31 @@ def authorize_agent_dispatch(data: dict[str, Any]) -> None:
         value["dispatch_phase"] = phase
         value["dispatched_children"] = [*dispatched, child]
         _atomic_write(directory_fd, path.name, value)
+        return {**tool_input, "prompt": prompt}
+
+
+def preserve_clarification_context(data: dict[str, Any]) -> None:
+    """Keep only commitments to unresolved user input after an accepted question."""
+    context = _context(data)
+    path = _root() / f"{_binding_key(context)}.json"
+    with _locked(path) as directory_fd:
+        try:
+            value = _read_binding(directory_fd, path.name, context)
+        except FileNotFoundError:
+            # No captured request means there is nothing safe to preserve.
+            return
+        episode = _read_episode(directory_fd, context)
+        if episode["turns"] != value["prior_turns"]:
+            raise ValueError("cannot retire stale clarification context")
+        turns = [*value["prior_turns"], {
+            "context": context, "commitment": value["commitment"],
+            "bytes": value["prompt_bytes"],
+        }]
+        _validate_turns(turns, context)
+        _atomic_write(directory_fd, _episode_name(context), {
+            **episode, "turns": turns, "phase": value["dispatch_phase"],
+        })
+        unlink_owned_regular_at(directory_fd, path.name, "prompt commitment ledger")
 
 
 def clear_prompt_binding(data: dict[str, Any]) -> None:
@@ -296,6 +441,17 @@ def clear_prompt_binding(data: dict[str, Any]) -> None:
         context = _context(data)
         path = _root() / f"{_binding_key(context)}.json"
         with _locked(path) as directory_fd:
+            try:
+                value = _read_binding(directory_fd, path.name, context)
+            except FileNotFoundError:
+                value = None
+            if value is not None:
+                episode = _read_episode(directory_fd, context)
+                if episode["turns"] != value["prior_turns"]:
+                    raise ValueError("cannot clear stale clarification context")
+                unlink_owned_regular_at(
+                    directory_fd, _episode_name(context), "clarification episode",
+                )
             unlink_owned_regular_at(
                 directory_fd, path.name, "prompt commitment ledger",
             )

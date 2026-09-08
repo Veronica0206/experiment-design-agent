@@ -161,9 +161,9 @@ export function runRscript(
     // stdout is "ignore": the dispatcher returns data via the output file, and
     // sourced R scripts cat() loading banners to stdout. Piping-but-not-draining
     // it risks a 64KB-buffer deadlock, so we drop it at the OS level.
-    // detached: true makes the child a process-group leader (darwin/linux) so
-    // the timeout can kill the WHOLE group: run_tests spawns grandchildren via
-    // system2 that would otherwise survive a kill of the direct child alone.
+    // On darwin/linux the detached supervisor keeps group ownership until R
+    // and its descendants finish, including when R exits before a grandchild.
+    // Closing this handle therefore ends the entire managed runtime group.
     const proc = spawnRuntimeProcess(RSCRIPT_EXECUTABLE, args, {
       stdio: ["ignore", "ignore", "pipe"],
       detached: true,

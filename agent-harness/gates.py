@@ -18,16 +18,25 @@ import io
 import math
 import os
 import stat
+import sys
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from fractions import Fraction
-from itertools import product
+from itertools import combinations, product
 from pathlib import Path
 from statistics import NormalDist
 from typing import Any
 
+SUITE_ROOT = Path(__file__).resolve().parent.parent
+if str(SUITE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SUITE_ROOT))
+
+from governance.runtime_profile import load_runtime_profile
+
 from artifact_download import MAX_ARTIFACT_BYTES
+from final_report import (DESIGN_METADATA_COLUMNS, factor_name_sort_key,
+                          normalized_design_metadata_column)
 from verification import (VerificationStatus, normalize_platform_analysis_methods,
                           platform_interim_reason_code)
 
@@ -83,7 +92,7 @@ def _r_vector(payload: Any, key: str) -> Any:
 
 # ── #3 Regression suite ────────────────────────────────────────────
 
-EXPECTED_REGRESSION_SUITE_COUNT = 5
+EXPECTED_REGRESSION_SUITE_COUNT = len(load_runtime_profile()["skills"])
 REGRESSION_STATUS_FIELDS = {
     "all_ok", "suite_count", "passed_suite_count", "failed_suite_count", "checks",
 }
@@ -1898,10 +1907,25 @@ def _design_rows(design) -> list[dict]:
 def _factor_columns(rows: list[dict]) -> list[str]:
     if not rows:
         return []
-    return [k for k in rows[0]
-            if isinstance(k, str)
-            and k not in ("point_type", "run", "std_order")
-            and _num(rows[0].get(k))]
+    return sorted(
+        [k for k in rows[0]
+         if isinstance(k, str)
+         and normalized_design_metadata_column(k) is None
+         and _num(rows[0].get(k))],
+        key=factor_name_sort_key,
+    )
+
+
+def _design_metadata_value(row: dict, canonical_name: str) -> Any:
+    """Read one metadata value through the shared case-insensitive contract.
+
+    Duplicate spellings such as ``point_type`` plus ``POINT_TYPE`` are
+    ambiguous and therefore return ``None``; matrix-shape validation rejects
+    the duplicate separately.
+    """
+    matches = [value for key, value in row.items()
+               if normalized_design_metadata_column(key) == canonical_name]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _requested_factorial_generators(
@@ -2019,15 +2043,20 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
         and raw_requested_replicates >= 1 else None
     )
 
-    metadata_columns = {"point_type", "run", "std_order"}
     factor_shape_valid = design_rows_valid and bool(cols) and all(
         all(isinstance(key, str) for key in row)
         and
         {
             key for key in row
-            if isinstance(key, str) and key not in metadata_columns
+            if (isinstance(key, str)
+                and normalized_design_metadata_column(key) is None)
         } == set(cols)
         and all(_num(row.get(column)) for column in cols)
+        and all(
+            sum(normalized_design_metadata_column(key) == metadata_name
+                for key in row) <= 1
+            for metadata_name in DESIGN_METADATA_COLUMNS
+        )
         for row in rows
     )
     checks["factor_matrix_numeric_and_rectangular"] = factor_shape_valid
@@ -2433,77 +2462,504 @@ def check_factorial(result: dict, args: dict) -> GateVerdict:
                        blocked=blocked)
 
 
+def _bounded_integer(value: Any, minimum: int, maximum: int | None = None) -> int | None:
+    """Return an exact JSON integer inside bounds (booleans never qualify)."""
+    if not _num(value) or int(value) != value or value < minimum:
+        return None
+    integer = int(value)
+    if maximum is not None and integer > maximum:
+        return None
+    return integer
+
+
 def check_rsm(result: dict, args: dict) -> GateVerdict:
-    """Point-type geometry of response-surface designs: CCD run counts decompose
-    as factorial + 2k axial + centers with axial points on ±alpha, one factor at
-    a time; Box-Behnken as edge + center runs."""
+    """Bind an RSM matrix to its effective request and validate its geometry.
+
+    Counts alone are not evidence of a CCD or Box-Behnken design.  This gate
+    checks the raw matrix, its point labels, the effective defaults, and every
+    public request field that can alter the returned design.
+    """
     checks: dict[str, bool] = {}
     failures: list[str] = []
-    blocked: list[str] = []
-    if not isinstance(result, dict):
-        return GateVerdict(passed=False, failures=["no parseable result"])
+
+    def require(name: str, condition: Any, message: str) -> bool:
+        passed = bool(condition)
+        checks[name] = passed
+        if not passed:
+            failures.append(message)
+        return passed
+
+    if not isinstance(result, dict) or not result:
+        return GateVerdict(
+            passed=False,
+            checks={"rsm_result_is_nonempty_object": False},
+            failures=["RSM result must be a nonempty object"],
+        )
+    checks["rsm_result_is_nonempty_object"] = True
     if result.get("error"):
-        return GateVerdict(passed=False, checks={"no_tool_error": False},
-                           failures=[f"tool returned error: {result['error']}"])
-    dtype = result.get("type")
-    n_runs = result.get("n_runs")
-    rows = _design_rows(result.get("design"))
-    checks["design_present"] = bool(rows) and _num(n_runs)
-    if not checks["design_present"]:
-        failures.append("RSM design matrix or n_runs is missing")
-    elif len(rows) != n_runs:
-        checks["n_runs_matches_design"] = False
-        failures.append(f"n_runs={n_runs} but design has {len(rows)} rows")
-    else:
-        checks["n_runs_matches_design"] = True
-    if dtype == "central_composite":
-        parts = [result.get("n_factorial"), result.get("n_axial"),
-                 result.get("n_center")]
-        k = result.get("n_factors")
-        if not (all(_num(p) for p in parts) and _num(k) and _num(result.get("alpha"))):
-            failures.append("CCD output missing n_factorial/n_axial/n_center/n_factors/alpha")
-        if all(_num(p) for p in parts) and _num(n_runs):
-            ok = sum(parts) == n_runs
-            checks["ccd_counts_decompose"] = ok
-            if not ok:
-                failures.append(f"n_runs={n_runs} != factorial+axial+center="
-                                f"{sum(parts)}")
-        if _num(k) and _num(result.get("n_axial")):
-            ok = result["n_axial"] == 2 * k
-            checks["axial_is_2k"] = ok
-            if not ok:
-                failures.append(f"n_axial={result['n_axial']} != 2k={2 * k}")
-        a = result.get("alpha")
-        cols = _factor_columns(rows)
-        if _num(a):
-            checks["alpha_positive"] = a > 0
-            if a <= 0:
-                failures.append("CCD alpha must be positive")
-        if rows and cols and _num(a) and a > 0:
-            bad_axial = 0
-            for r in rows:
-                if r.get("point_type") != "axial":
-                    continue
-                vals = [r.get(c) for c in cols if _num(r.get(c))]
-                nz = [v for v in vals if abs(v) > 1e-9]
-                if len(nz) != 1 or not _close(abs(nz[0]), a, 1e-3):
-                    bad_axial += 1
-            checks["axial_on_alpha"] = bad_axial == 0
-            if bad_axial:
-                failures.append(f"{bad_axial} axial row(s) not at ±alpha={a}")
-    elif dtype == "box_behnken":
-        parts = [result.get("n_edge"), result.get("n_center")]
-        if not all(_num(p) for p in parts):
-            failures.append("Box-Behnken output missing n_edge/n_center")
-        if all(_num(p) for p in parts) and _num(n_runs):
-            ok = sum(parts) == n_runs
-            checks["bbd_counts_decompose"] = ok
-            if not ok:
-                failures.append(f"n_runs={n_runs} != edge+center={sum(parts)}")
-    else:
-        failures.append(f"RSM output has unsupported or missing type={dtype!r}")
-    return GateVerdict(passed=not failures, checks=checks, failures=failures,
-                       blocked=blocked)
+        return GateVerdict(
+            passed=False,
+            checks={**checks, "no_tool_error": False},
+            failures=[f"tool returned error: {result['error']}"],
+        )
+
+    request = args if isinstance(args, dict) else {}
+    require(
+        "rsm_arguments_are_object", isinstance(args, dict),
+        "RSM arguments must be an object",
+    )
+    requested_n_factors = _bounded_integer(request.get("n_factors"), 2, 8)
+    require(
+        "rsm_requested_n_factors_valid", requested_n_factors is not None,
+        "RSM n_factors must be an integer from 2 through 8",
+    )
+    requested_design = request.get("design", "ccd")
+    require(
+        "rsm_requested_design_valid", requested_design in {"ccd", "bbd"},
+        "RSM design must be 'ccd' or 'bbd'",
+    )
+
+    requested_centers = _bounded_integer(
+        request.get("center_points", requested_n_factors), 0, 1000,
+    )
+    require(
+        "rsm_requested_center_count_valid", requested_centers is not None,
+        "RSM center_points must be a nonnegative integer",
+    )
+    requested_randomize = request.get("randomize", False)
+    randomize_valid = isinstance(requested_randomize, bool)
+    require(
+        "rsm_requested_randomize_valid", randomize_valid,
+        "RSM randomize must be boolean",
+    )
+    requested_seed = _bounded_integer(request.get("seed", 42), 0, 2147483647)
+    require(
+        "rsm_requested_seed_valid", requested_seed is not None,
+        "RSM seed must be an integer from 0 through 2147483647",
+    )
+    require(
+        "rsm_seed_requires_randomization",
+        randomize_valid and (requested_randomize is True or "seed" not in request),
+        "RSM seed is inert unless randomize=true",
+    )
+
+    raw_design = result.get("design")
+    rows_are_objects = (
+        isinstance(raw_design, list) and bool(raw_design)
+        and all(isinstance(row, dict) for row in raw_design)
+    )
+    require(
+        "rsm_design_rows_are_objects", rows_are_objects,
+        "RSM design must be a nonempty list containing only row objects",
+    )
+    rows = list(raw_design) if rows_are_objects else []
+    cols = _factor_columns(rows)
+
+    # Every row has the exact same factor keys and finite numeric coordinates.
+    # Metadata is recognized through the shared case-insensitive contract.
+    # The run/std_order columns are bound below and therefore must be complete,
+    # numeric, and consistent with the canonical row geometry.
+    metadata_shape_valid = bool(rows)
+    if rows:
+        for metadata_name in DESIGN_METADATA_COLUMNS:
+            counts = [sum(
+                normalized_design_metadata_column(key) == metadata_name
+                for key in row
+            ) for row in rows]
+            if metadata_name == "point_type":
+                metadata_shape_valid = metadata_shape_valid and all(
+                    count == 1 for count in counts
+                )
+            else:
+                metadata_shape_valid = metadata_shape_valid and (
+                    all(count == 0 for count in counts)
+                    or (
+                        all(count == 1 for count in counts)
+                        and all(_num(_design_metadata_value(row, metadata_name))
+                                for row in rows)
+                    )
+                )
+    factor_shape_valid = rows_are_objects and bool(cols) and metadata_shape_valid and all(
+        all(isinstance(key, str) for key in row)
+        and {
+            key for key in row
+            if (isinstance(key, str)
+                and normalized_design_metadata_column(key) is None)
+        } == set(cols)
+        and all(_num(row.get(column)) for column in cols)
+        for row in rows
+    )
+    require(
+        "rsm_factor_matrix_numeric_and_rectangular", factor_shape_valid,
+        "RSM design has missing, extra, nonnumeric, nonfinite, or ambiguous columns",
+    )
+
+    result_n_factors = _bounded_integer(result.get("n_factors"), 1)
+    require(
+        "rsm_factor_columns_match_result", factor_shape_valid
+        and result_n_factors == len(cols),
+        "RSM factor columns do not match result n_factors",
+    )
+    require(
+        "rsm_n_factors_matches_request", requested_n_factors is not None
+        and result_n_factors == requested_n_factors,
+        "RSM result n_factors does not match the effective request",
+    )
+
+    n_runs = _bounded_integer(result.get("n_runs"), 1)
+    require(
+        "rsm_n_runs_matches_design", rows_are_objects
+        and n_runs == len(rows),
+        "RSM n_runs does not match the number of raw design rows",
+    )
+
+    identity_order = list(range(1, len(rows) + 1))
+    run_order = [
+        _bounded_integer(_design_metadata_value(row, "run"), 1)
+        for row in rows
+    ] if rows_are_objects else []
+    standard_order = [
+        _bounded_integer(_design_metadata_value(row, "std_order"), 1)
+        for row in rows
+    ] if rows_are_objects else []
+    order_metadata_complete = (
+        n_runs == len(rows)
+        and run_order == identity_order
+        and len(standard_order) == len(identity_order)
+        and all(value is not None for value in standard_order)
+        and sorted(standard_order) == identity_order
+    )
+    require(
+        "rsm_run_order_metadata_complete", order_metadata_complete,
+        "RSM run/std_order metadata must bind every delivered row exactly once",
+    )
+    point_rank = {"factorial": 0, "axial": 1, "edge": 2, "center": 3}
+
+    def canonical_row_key(row: dict) -> tuple[Any, ...] | None:
+        point_type = _design_metadata_value(row, "point_type")
+        if not isinstance(point_type, str):
+            return None
+        normalized = point_type.casefold()
+        if normalized not in point_rank or not all(_num(row.get(col)) for col in cols):
+            return None
+        return (point_rank[normalized], *(row[col] for col in cols))
+
+    row_keys = [canonical_row_key(row) for row in rows] if factor_shape_valid else []
+    canonical_keys = sorted(row_keys) if row_keys and all(
+        key is not None for key in row_keys
+    ) else []
+    std_order_matches_rows = (
+        order_metadata_complete
+        and len(canonical_keys) == len(rows)
+        and all(
+            standard_order[index] is not None
+            and canonical_keys[standard_order[index] - 1] == row_keys[index]
+            for index in range(len(rows))
+        )
+    )
+    require(
+        "rsm_std_order_matches_canonical_rows", std_order_matches_rows,
+        "RSM std_order metadata does not match the public canonical row order",
+    )
+    randomization_state_matches = (
+        std_order_matches_rows and randomize_valid
+        and (
+            requested_randomize is True and standard_order != identity_order
+            or requested_randomize is False and standard_order == identity_order
+        )
+    )
+    require(
+        "rsm_randomization_state_matches_request", randomization_state_matches,
+        "RSM run order does not match the effective randomization request",
+    )
+
+    expected_type = {
+        "ccd": "central_composite",
+        "bbd": "box_behnken",
+    }.get(requested_design)
+    require(
+        "rsm_type_matches_request", expected_type is not None
+        and result.get("type") == expected_type,
+        "RSM result type does not match the effective requested design",
+    )
+
+    seed_binding_ok = (
+        randomize_valid and requested_seed is not None
+        and (
+            requested_randomize is True
+            and _bounded_integer(result.get("seed"), 0, 2147483647)
+            == requested_seed
+            or requested_randomize is False and "seed" not in result
+        )
+    )
+    require(
+        "rsm_randomization_seed_matches_request", seed_binding_ok,
+        "RSM seed echo does not match the effective randomization request",
+    )
+
+    point_types = [
+        value.casefold() if isinstance(value, str) else None
+        for value in (
+            _design_metadata_value(row, "point_type") for row in rows
+        )
+    ] if factor_shape_valid else []
+    point_counts = Counter(point_types)
+
+    if requested_design == "ccd":
+        requested_fraction = _bounded_integer(request.get("fraction", 0), 0)
+        fraction_valid = (
+            requested_fraction is not None
+            and requested_n_factors is not None
+            and requested_fraction < requested_n_factors
+        )
+        require(
+            "ccd_fraction_valid", fraction_valid,
+            "CCD fraction must be an integer below n_factors",
+        )
+
+        requested_alpha = request.get("alpha", "rotatable")
+        alpha_request_valid = (
+            requested_alpha in {"rotatable", "face"}
+            if isinstance(requested_alpha, str)
+            else _num(requested_alpha) and requested_alpha > 0
+        )
+        require(
+            "ccd_alpha_request_valid", alpha_request_valid,
+            "CCD alpha must be 'rotatable', 'face', or a positive number",
+        )
+
+        expected_factorial = (
+            2 ** (requested_n_factors - requested_fraction)
+            if fraction_valid else None
+        )
+        expected_axial = (
+            2 * requested_n_factors
+            if requested_n_factors is not None else None
+        )
+        expected_alpha_type = (
+            requested_alpha if isinstance(requested_alpha, str) else "custom"
+        ) if alpha_request_valid else None
+        if expected_factorial is not None and alpha_request_valid:
+            if requested_alpha == "rotatable":
+                expected_alpha = expected_factorial ** 0.25
+            elif requested_alpha == "face":
+                expected_alpha = 1.0
+            else:
+                expected_alpha = requested_alpha
+        else:
+            expected_alpha = None
+        result_alpha = result.get("alpha")
+        alpha_matches = (
+            _num(result_alpha) and result_alpha > 0
+            and expected_alpha is not None
+            and result.get("alpha_type") == expected_alpha_type
+            and _close(result_alpha, expected_alpha, 1e-3)
+        )
+        require(
+            "ccd_alpha_matches_request", alpha_matches,
+            "CCD alpha value/type does not match the effective request",
+        )
+
+        declared_factorial = _bounded_integer(result.get("n_factorial"), 1)
+        declared_axial = _bounded_integer(result.get("n_axial"), 1)
+        declared_centers = _bounded_integer(result.get("n_center"), 0)
+        declared_counts_match = (
+            expected_factorial is not None
+            and declared_factorial == expected_factorial
+            and declared_axial == expected_axial
+            and declared_centers == requested_centers
+            and n_runs is not None
+            and n_runs == declared_factorial + declared_axial + declared_centers
+        )
+        require(
+            "ccd_declared_counts_match_request", declared_counts_match,
+            "CCD declared component counts do not match the effective request",
+        )
+        actual_counts_match = (
+            factor_shape_valid and declared_counts_match
+            and set(point_counts) <= {"factorial", "axial", "center"}
+            and point_counts["factorial"] == declared_factorial
+            and point_counts["axial"] == declared_axial
+            and point_counts["center"] == declared_centers
+        )
+        require(
+            "ccd_point_type_counts_match", actual_counts_match,
+            "CCD point_type counts do not match the declared components",
+        )
+
+        factorial_rows = [
+            row for row, point_type in zip(rows, point_types)
+            if point_type == "factorial"
+        ]
+        factorial_vectors = [tuple(row[column] for column in cols)
+                             for row in factorial_rows]
+        factorial_geometry = (
+            actual_counts_match and expected_factorial is not None
+            and all(value in (-1, 1)
+                    for vector in factorial_vectors for value in vector)
+            and len(set(factorial_vectors)) == expected_factorial
+        )
+        if factorial_geometry and requested_fraction == 0:
+            factorial_geometry = set(factorial_vectors) == set(
+                product((-1, 1), repeat=len(cols))
+            )
+        elif factorial_geometry:
+            # The engine returns regular fractions: the run vectors form a
+            # subgroup of the +/-1 factorial group.  This rejects an arbitrary
+            # unique subset with the right size while remaining independent of
+            # any private generator labels.
+            factorial_set = set(factorial_vectors)
+            identity = (1,) * len(cols)
+            factorial_geometry = identity in factorial_set and all(
+                tuple(left[index] * right[index]
+                      for index in range(len(cols))) in factorial_set
+                for left in factorial_set for right in factorial_set
+            )
+        require(
+            "ccd_factorial_core_geometry", factorial_geometry,
+            "CCD factorial core is not the requested unique +/-1 design",
+        )
+        main_effects_estimable = factorial_geometry and all(
+            sum(vector[index] for vector in factorial_vectors) == 0
+            for index in range(len(cols))
+        ) and all(
+            sum(vector[left] * vector[right] for vector in factorial_vectors) == 0
+            for left, right in combinations(range(len(cols)), 2)
+        )
+        require(
+            "ccd_factorial_main_effects_estimable", main_effects_estimable,
+            "CCD factorial core aliases or fails to balance main effects",
+        )
+
+        axial_rows = [
+            row for row, point_type in zip(rows, point_types)
+            if point_type == "axial"
+        ]
+        axial_positions: set[tuple[int, int]] = set()
+        axial_geometry = actual_counts_match and alpha_matches
+        if axial_geometry:
+            for row in axial_rows:
+                nonzero = [
+                    index for index, column in enumerate(cols)
+                    if abs(row[column]) > 1e-9
+                ]
+                if (
+                    len(nonzero) != 1
+                    or any(abs(row[column]) > 1e-9
+                           for index, column in enumerate(cols)
+                           if index != nonzero[0])
+                    or not _close(abs(row[cols[nonzero[0]]]), result_alpha, 1e-3)
+                ):
+                    axial_geometry = False
+                    break
+                axial_positions.add((
+                    nonzero[0], 1 if row[cols[nonzero[0]]] > 0 else -1,
+                ))
+            axial_geometry = axial_geometry and axial_positions == {
+                (index, sign)
+                for index in range(len(cols)) for sign in (-1, 1)
+            }
+        require(
+            "ccd_axial_geometry", axial_geometry,
+            "CCD axial rows are not the complete +/-alpha axis set",
+        )
+
+        center_rows = [
+            row for row, point_type in zip(rows, point_types)
+            if point_type == "center"
+        ]
+        center_geometry = actual_counts_match and all(
+            abs(row[column]) <= 1e-9
+            for row in center_rows for column in cols
+        )
+        require(
+            "ccd_center_geometry", center_geometry,
+            "CCD center rows are not all-zero coordinate vectors",
+        )
+
+    elif requested_design == "bbd":
+        bbd_dimension_valid = (
+            requested_n_factors is not None
+            and 3 <= requested_n_factors <= 5
+        )
+        require(
+            "bbd_n_factors_supported", bbd_dimension_valid,
+            "Box-Behnken designs require three through five factors",
+        )
+        require(
+            "bbd_inapplicable_parameters_absent",
+            "alpha" not in request and "fraction" not in request,
+            "Box-Behnken requests must not supply inert alpha or fraction settings",
+        )
+
+        expected_edges = (
+            4 * math.comb(requested_n_factors, 2)
+            if bbd_dimension_valid else None
+        )
+        declared_edges = _bounded_integer(result.get("n_edge"), 1)
+        declared_centers = _bounded_integer(result.get("n_center"), 0)
+        declared_counts_match = (
+            expected_edges is not None
+            and declared_edges == expected_edges
+            and declared_centers == requested_centers
+            and n_runs is not None
+            and n_runs == declared_edges + declared_centers
+        )
+        require(
+            "bbd_declared_counts_match_request", declared_counts_match,
+            "Box-Behnken declared counts do not match the effective request",
+        )
+        actual_counts_match = (
+            factor_shape_valid and declared_counts_match
+            and set(point_counts) <= {"edge", "center"}
+            and point_counts["edge"] == declared_edges
+            and point_counts["center"] == declared_centers
+        )
+        require(
+            "bbd_point_type_counts_match", actual_counts_match,
+            "Box-Behnken point_type counts do not match the declared components",
+        )
+
+        edge_rows = [
+            row for row, point_type in zip(rows, point_types)
+            if point_type == "edge"
+        ]
+        edge_vectors = [tuple(row[column] for column in cols) for row in edge_rows]
+        expected_edge_vectors: set[tuple[int, ...]] = set()
+        for left, right in combinations(range(len(cols)), 2):
+            for left_sign, right_sign in product((-1, 1), repeat=2):
+                vector = [0] * len(cols)
+                vector[left] = left_sign
+                vector[right] = right_sign
+                expected_edge_vectors.add(tuple(vector))
+        edge_geometry = (
+            actual_counts_match
+            and all(value in (-1, 0, 1)
+                    for vector in edge_vectors for value in vector)
+            and all(sum(value != 0 for value in vector) == 2
+                    for vector in edge_vectors)
+            and set(edge_vectors) == expected_edge_vectors
+            and len(edge_vectors) == len(expected_edge_vectors)
+        )
+        require(
+            "bbd_edge_geometry", edge_geometry,
+            "Box-Behnken edge rows are not the complete two-factor +/-1 set",
+        )
+
+        center_rows = [
+            row for row, point_type in zip(rows, point_types)
+            if point_type == "center"
+        ]
+        center_geometry = actual_counts_match and all(
+            abs(row[column]) <= 1e-9
+            for row in center_rows for column in cols
+        )
+        require(
+            "bbd_center_geometry", center_geometry,
+            "Box-Behnken center rows are not all-zero coordinate vectors",
+        )
+
+    return GateVerdict(passed=not failures, checks=checks, failures=failures)
 
 
 # ── Shared tool → cheap design-check mapping ───────────────────────

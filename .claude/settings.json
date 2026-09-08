@@ -1,3 +1,6 @@
 {
-  "hooks": {}
+  "hooks": {},
+  "env": {
+    "CLAUDE_CODE_FORK_SUBAGENT": "0"
+  }
 }

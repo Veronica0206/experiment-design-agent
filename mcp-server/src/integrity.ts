@@ -15,17 +15,10 @@ import {
   spawnRuntimeProcess,
 } from "./runtime-supervisor.js";
 
-export const REGRESSION_SKILLS = [
-  "vera-experiment-designing",
-  "vera-master-experiment-designing",
-  "vera-doe-designing",
-  "vera-indirect-comparing",
-  "vera-meta-analyzing",
-] as const;
+import { ACTIVE_RUNTIME_PROFILE, loadRuntimeProfile } from "./runtime-profile.js";
 
-export const TRACKED_R_PACKAGES = [
-  "jsonlite", "survival", "Exact", "mvtnorm", "MAMS",
-] as const;
+export const REGRESSION_SKILLS = ACTIVE_RUNTIME_PROFILE.skills;
+export const TRACKED_R_PACKAGES = ACTIVE_RUNTIME_PROFILE.r_packages;
 
 export const TRACKED_R_BASE_PACKAGES = [
   "base", "stats", "graphics", "grDevices", "utils", "datasets", "methods",
@@ -889,6 +882,8 @@ export const ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES = {
   core: [
     "mcp-server/launch-server.sh",
     "mcp-server/r-wrapper/dispatcher.R",
+    "mcp-server/r-wrapper/runtime-profile.R",
+    "mcp-server/src/runtime-profile.ts",
     "mcp-server/src/runtime-supervisor.ts",
   ],
   agentHarness: [
@@ -907,6 +902,9 @@ export const ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES = {
     "governance/__init__.py",
     "governance/agents.json",
     "governance/registry.py",
+    "governance/runtime-profiles.json",
+    "governance/runtime_profile.py",
+    "governance/runtime_profile.mjs",
   ],
   verificationHooks: [
     "hooks/describe_domain_policy.mjs",
@@ -937,20 +935,25 @@ export const ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES = {
 
 /** Files whose bytes determine analysis, orchestration, or verification behavior. */
 export function mutableEngineFiles(suiteRoot: string): string[] {
+  const profile = loadRuntimeProfile(suiteRoot);
   return [
     ...Object.values(ENGINE_RUNTIME_RELATIVE_FILE_CATEGORIES)
       .flatMap((category) => category)
+      .filter((path) => profile.name === "complete" || !path.startsWith(".claude/agents/") ||
+        ["design-verifier.md", "experiment-design-coordinator.md",
+          "experiment-designer.md", "single-endpoint-designer.md"]
+          .some((name) => path === `.claude/agents/${name}`))
       .map((path) => join(suiteRoot, ...path.split("/"))),
-    ...REGRESSION_SKILLS.map((skill) =>
+    ...profile.skills.map((skill) =>
       join(suiteRoot, skill, "scripts", "tests", "run_tests.R")),
   ];
 }
 
-/** Fixed files plus the five maintained R implementation directory roots. */
+/** Fixed files plus exactly the active profile's R implementation roots. */
 export function mutableEngineRoots(suiteRoot: string): string[] {
   return [
     ...mutableEngineFiles(suiteRoot),
-    ...REGRESSION_SKILLS.map((skill) =>
+    ...loadRuntimeProfile(suiteRoot).skills.map((skill) =>
       join(suiteRoot, skill, "scripts", "R")),
   ];
 }
@@ -967,7 +970,7 @@ export const ENGINE_RUNTIME_FINGERPRINT_LIMITS = {
 
 /**
  * Hash the complete fixed engine manifest with suite-root-relative labels.
- * Directory discovery is limited to the five named scripts/R roots above;
+ * Directory discovery is limited to the active profile's scripts/R roots;
  * ambient vera-* directories at the suite root are never enumerated.
  */
 export async function fingerprintMutableEngineRuntime(

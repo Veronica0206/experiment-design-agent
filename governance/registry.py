@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from governance.runtime_profile import RuntimeProfileError, load_runtime_profile
+
 
 REGISTRY_PATH = Path(__file__).with_name("agents.json")
 SCHEMA_VERSION = 1
@@ -69,6 +71,10 @@ def _string_list(value: Any, field: str, *, allow_empty: bool) -> list[str]:
 
 
 def validate_registry(value: Any) -> dict[str, Any]:
+    try:
+        active_domains = set(load_runtime_profile()["domains"])
+    except RuntimeProfileError as exc:
+        raise RegistryError(f"invalid installed runtime profile: {exc}") from exc
     if (PLANNING_DOMAINS & EVIDENCE_DOMAINS
             or PLANNING_DOMAINS | EVIDENCE_DOMAINS != set(DOMAIN_TOOLS)):
         raise RegistryError("every domain executor must have exactly one workflow phase")
@@ -119,6 +125,8 @@ def validate_registry(value: Any) -> dict[str, Any]:
             if role == "reexecutor" and (domain != "verification" or tools != [f"{MCP_PREFIX}*"]):
                 raise RegistryError("reexecutor must retain the exact wildcard grant")
             if role == "domain_executor":
+                if domain not in active_domains:
+                    raise RegistryError("domain executor is unavailable in the installed profile")
                 expected_tools = [f"{MCP_PREFIX}{tool}" for tool in DOMAIN_TOOLS.get(domain, [])]
                 if not expected_tools or tools != expected_tools:
                     raise RegistryError("domain executor tools must exactly match its domain")
@@ -133,8 +141,8 @@ def validate_registry(value: Any) -> dict[str, Any]:
     if coordinators != 1:
         raise RegistryError("registry must contain exactly one coordinator")
     domain_agents = [agent for agent in normalized if agent["role"] == "domain_executor"]
-    if (len(domain_agents) != len(DOMAIN_TOOLS)
-            or {agent["domain"] for agent in domain_agents} != set(DOMAIN_TOOLS)):
+    if (len(domain_agents) != len(active_domains)
+            or {agent["domain"] for agent in domain_agents} != active_domains):
         raise RegistryError("registry must contain exactly one executor for each domain")
     if sum(agent["role"] == "legacy_executor" for agent in normalized) != 1:
         raise RegistryError("registry must contain exactly one legacy executor")
@@ -156,6 +164,15 @@ def validate_registry(value: Any) -> dict[str, Any]:
             if set(agent["allowed_children"]) != executors:
                 raise RegistryError("coordinator must route every and only domain executor")
     return {"schema_version": SCHEMA_VERSION, "agents": normalized}
+
+
+def active_domain_tools() -> dict[str, list[str]]:
+    """Project the independent fixed policy onto reviewed installed domains."""
+    try:
+        return {domain: list(DOMAIN_TOOLS[domain])
+                for domain in load_runtime_profile()["domains"]}
+    except RuntimeProfileError as exc:
+        raise RegistryError(f"invalid installed runtime profile: {exc}") from exc
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:

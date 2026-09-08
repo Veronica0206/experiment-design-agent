@@ -19,8 +19,9 @@ if str(ROOT) not in sys.path:
 
 from governance.registry import (  # noqa: E402
     DOMAIN_TOOLS, MCP_PREFIX, REGISTRY_PATH, RegistryError, load_registry,
-    validate_registry,
+    active_domain_tools, validate_registry,
 )
+from governance.runtime_profile import RuntimeProfileError, load_runtime_profile
 
 EXPECTED_SKILL_NAMES = {
     "vera-doe-designing",
@@ -29,7 +30,7 @@ EXPECTED_SKILL_NAMES = {
     "vera-master-experiment-designing",
     "vera-meta-analyzing",
 }
-MINIMUM_CLAUDE_CODE = (2, 1, 197)
+MINIMUM_CLAUDE_CODE = (2, 1, 233)
 EXPECTED_AGENT_MODEL = "claude-sonnet-5"
 EXPECTED_AGENT_TOOLS = {"mcp__experiment-design__*"}
 R_INTEGRITY_PROOF_BOUNDARY = (
@@ -40,12 +41,17 @@ REQUIRED_RUNTIME_FILES = {
     ".github/workflows/public-assurance.yml",
     ".claude/launch.json",
     "governance/agents.json",
+    "governance/runtime-profiles.json",
+    "governance/runtime_profile.py",
+    "governance/runtime_profile.mjs",
     "governance/r-package-integrity.json",
     "mcp-server/launch-server.sh",
     "tools/run-reviewed-r.sh",
     "tools/run-reviewed-python.sh",
     "tools/run-publication-python.sh",
     "tools/check_publish_source.py",
+    "tools/public_release_policy.py",
+    "tools/prepare_public_release.py",
     "tools/check_diff_credentials.py",
     "tools/reviewed_python_runner.py",
     "tools/sanitize_python_environment.py",
@@ -144,7 +150,8 @@ def valid_domain_tool_policy(registry: object, launcher_document: object) -> boo
     ):
         return False
     launcher_policy = launcher_document.get("domain_tools")
-    if not isinstance(launcher_policy, dict) or set(launcher_policy) != set(DOMAIN_TOOLS):
+    python_policy = active_domain_tools()
+    if not isinstance(launcher_policy, dict) or set(launcher_policy) != set(python_policy):
         return False
     if any(
         not isinstance(domain, str)
@@ -155,7 +162,6 @@ def valid_domain_tool_policy(registry: object, launcher_document: object) -> boo
         for domain, tools in launcher_policy.items()
     ):
         return False
-    python_policy = {domain: list(tools) for domain, tools in DOMAIN_TOOLS.items()}
     return _registry_domain_tool_policy(registry) == python_policy == launcher_policy
 
 
@@ -528,6 +534,10 @@ def valid_claude_check_semantics(bootstrap: str) -> bool:
         "unrecognized Claude Code product/version output",
         "EXPDESIGN_CLAUDE must be an absolute path",
         "select_reviewed_claude()",
+        "settings.env?.CLAUDE_CODE_FORK_SUBAGENT !== \"0\"",
+        "process.env.CLAUDE_CODE_FORK_SUBAGENT !== \"0\"",
+        "disabled(settings.env?.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)",
+        "disabled(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)",
     }
     return (
         all(fragment in bootstrap for fragment in required_fragments)
@@ -553,6 +563,9 @@ def valid_release_entrypoints(makefile: str) -> bool:
         r'^\s*@tools/run-publication-python\.sh "\$\(CURDIR\)/tools/'
         r'validate_public_distribution\.py" --public-clone "\$\(CURDIR\)"\s*$',
         r"^\s*@cd mcp-server && npm run test:public-lifecycle\s*$",
+        r'^\s*@\$\(PYTHON_RUN\) tools/prepare_public_release\.py --check "\$\(CURDIR\)"\s*$',
+        r'^\s*@cd mcp-server && EXPDESIGN_PYTHON="\$\(PYTHON\)" npm run test:public-engine\s*$',
+        r"^\s*@tools/run-reviewed-r\.sh vera-experiment-designing/scripts/tests/run_tests\.R\s*$",
         r"^\s*@\$\(MAKE\) check-claude-version\s*$",
         r"^\s*@\$\(MAKE\) validate-python-lock\s*$",
         r"^\s*@\$\(MAKE\) harness-release-check\s*$",
@@ -627,6 +640,12 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
         "public-distribution": [
             checkout_step,
             setup_node_step,
+            {"uses": setup_python, "with": {"python-version": "3.11"}},
+            {"run": "sudo apt-get update\nsudo apt-get install -y --no-install-recommends r-base r-cran-jsonlite"},
+            {"run": '\n'.join([
+                '"$pythonLocation/bin/python" -I -E -s -S -B -m venv agent-harness/.venv',
+                'agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock',
+            ])},
             {"run": "make public-check"},
         ],
         "node-boundaries": [
@@ -652,23 +671,10 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
                 "with": {"python-version": "${{ matrix.python }}"},
             },
             {"run": "\n".join([
-                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_gates.py',
-                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_verification.py',
+                '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_response_budget.py',
                 '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_audit.py',
                 '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_artifact_download.py',
                 '"$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py --public-only',
-            ])},
-        ],
-        "governance-hooks": [
-            checkout_step,
-            {
-                "uses": setup_python,
-                "with": {"python-version": "3.14"},
-            },
-            {"run": "\n".join([
-                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_enforce_verification.py',
-                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_coordinator_verification.py',
-                '"$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_verification_ledger.py',
             ])},
         ],
         "supply-chain": [
@@ -702,7 +708,6 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
                 "matrix": {"python": ["3.9", "3.14"]},
             },
         },
-        "governance-hooks": {},
         "supply-chain": {},
     }
 
@@ -828,8 +833,8 @@ def valid_publish_sync_guards(
         'EXPECTED_FULL_NAME = "Veronica0206/experiment-design-agent"',
         'EXPECTED_BRANCH = "main"',
         '"visibility": "public"',
-        'part.casefold().startswith("vera-")',
-        'path.name.casefold().endswith(".skill.enc")',
+        'from public_release_policy import public_path_error',
+        'error = public_path_error(relative)',
         'mode.add_argument("--public-clone", type=Path)',
         'mode.add_argument("--public-workflow", type=Path)',
         "EXPECTED_PUBLIC_ASSURANCE_SHA256",
@@ -868,6 +873,11 @@ def fail(message: str, failures: list[str]) -> None:
 
 def main() -> int:
     failures: list[str] = []
+    try:
+        profile = load_runtime_profile()
+    except RuntimeProfileError as exc:
+        fail(f"invalid installed runtime profile: {exc}", failures)
+        return 1
     registry: object = None
     try:
         registry = load_registry(REGISTRY_PATH)
@@ -890,11 +900,26 @@ def main() -> int:
             )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         fail(f"hook domain-tool policy could not be validated: {exc}", failures)
-    discovered_skills = {path.parent.name for path in ROOT.glob("vera-*/SKILL.md")}
-    missing_skills, unexpected_skills = inventory_delta(discovered_skills, EXPECTED_SKILL_NAMES)
-    if missing_skills or unexpected_skills:
-        fail(f"skill inventory mismatch; missing={missing_skills}, unexpected={unexpected_skills}", failures)
-    skills = [ROOT / name for name in sorted(EXPECTED_SKILL_NAMES)]
+    if profile["name"] == "complete":
+        discovered_skills = {path.parent.name for path in ROOT.glob("vera-*/SKILL.md")}
+        missing_skills, unexpected_skills = inventory_delta(discovered_skills, EXPECTED_SKILL_NAMES)
+        if missing_skills or unexpected_skills:
+            fail(f"skill inventory mismatch; missing={missing_skills}, unexpected={unexpected_skills}", failures)
+        skills = [ROOT / name for name in sorted(EXPECTED_SKILL_NAMES)]
+    else:
+        # The public edition distributes an executable engine, not protected skill
+        # prompts/manifests. Verify that engine without weakening complete mode.
+        skills = []
+        engine = ROOT / "vera-experiment-designing"
+        for relative in (
+            "scripts/R/config.R", "scripts/R/sample_size.R", "scripts/R/bayesian.R",
+            "scripts/R/frequentist.R", "scripts/R/ppos.R", "scripts/R/run_framework.R",
+            "scripts/tests/run_tests.R", "LICENSE.txt",
+        ):
+            if not is_regular_runtime_file(engine / relative):
+                fail(f"public engine file must be regular: {relative}", failures)
+        if any(ROOT.glob("vera-*/SKILL.md")):
+            fail("public engine installation must not contain protected skill instructions", failures)
 
     agent_root = ROOT / ".claude" / "agents"
     discovered_agents = {path.name for path in agent_root.glob("*.md")}
@@ -993,9 +1018,9 @@ def main() -> int:
 
     try:
         settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        if settings != {"hooks": {}}:
+        if settings != {"hooks": {}, "env": {"CLAUDE_CODE_FORK_SUBAGENT": "0"}}:
             fail(
-                ".claude/settings.json must leave verification hooks agent-scoped in frontmatter",
+                ".claude/settings.json must require foreground mode and leave verification hooks agent-scoped in frontmatter",
                 failures,
             )
     except Exception as exc:
@@ -1011,8 +1036,8 @@ def main() -> int:
         configured = semantic_version(match.group(1)) if match else None
         if configured is None or configured < MINIMUM_CLAUDE_CODE:
             fail(
-                "tools/bootstrap.sh must require Claude Code 2.1.197+ for "
-                "Claude Sonnet 5 agent compatibility",
+                "tools/bootstrap.sh must require Claude Code 2.1.233+ for "
+                "the reviewed foreground dispatch and child-result protocol",
                 failures,
             )
         if not valid_claude_check_semantics(bootstrap):
@@ -1059,7 +1084,7 @@ def main() -> int:
         if not valid_public_assurance_workflow(public_workflow):
             fail(
                 "public assurance workflow must remain read-only, SHA-pinned, "
-                "public-safe, and explicit about its missing-engine boundary",
+                "public-safe, and run the supported public engine",
                 failures,
             )
     except Exception as exc:

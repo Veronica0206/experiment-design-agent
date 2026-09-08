@@ -16,9 +16,25 @@ def main() -> int:
             raise ValueError("hook input must be a JSON object")
         event = data.get("hook_event_name")
         if event == "UserPromptSubmit":
-            capture_prompt(data)
+            prior_count = capture_prompt(data)
+            if prior_count:
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": (
+                        f"This unresolved request has {prior_count} prior user message(s). "
+                        "For Agent.prompt send a JSON object with type clarified_user_request, "
+                        "prior_user_messages containing those exact user messages in order, "
+                        "and current_user_message containing the exact latest user message. "
+                        "Include no assistant/tool text. The host checks every message and "
+                        "normalizes the JSON envelope before execution."
+                    ),
+                }}))
         elif event == "PreToolUse":
-            authorize_agent_dispatch(data)
+            updated_input = authorize_agent_dispatch(data)
+            if updated_input != data.get("tool_input"):
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": event, "updatedInput": updated_input,
+                }}))
         else:
             raise ValueError("unsupported prompt-binding hook event")
     except Exception as exc:

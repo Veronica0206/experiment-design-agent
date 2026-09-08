@@ -25,7 +25,8 @@ SEPARATOR = "\n\n---\n\n"
 def run(mode: str, data: dict, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["sh", str(LAUNCHER), mode, SCOPE], input=json.dumps(data),
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True,
+        env={"CLAUDE_CODE_FORK_SUBAGENT": "0", **env},
     )
 
 
@@ -261,7 +262,8 @@ with tempfile.TemporaryDirectory() as directory:
     ))
     atomic_processes = [subprocess.Popen(
         ["sh", str(LAUNCHER), "bind", SCOPE], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**env, "CLAUDE_CODE_FORK_SUBAGENT": "0"},
     ) for _ in range(2)]
     atomic_results = [process.communicate(atomic_event) for process in atomic_processes]
     atomic_codes = [process.returncode for process in atomic_processes]
@@ -338,7 +340,7 @@ with tempfile.TemporaryDirectory() as directory:
         run("capture", prompt_capture(bounded, f"bounded prompt {index}"), env)
         run("enforce", {
             **bounded, "hook_event_name": "Stop", "agent_type": SCOPE,
-            "last_assistant_message": 'CLARIFICATION_REQUEST {"fields":["analysis_method"]}',
+            "last_assistant_message": SAFE_FAILURE,
         }, env)
     after_retention = sorted(Path(directory).rglob("*"))
     binding_json = list((Path(directory) / "prompt-bindings").glob("*.json"))
@@ -558,6 +560,223 @@ with tempfile.TemporaryDirectory() as directory:
     check("coordinator_rejects_subagent_stop_identity",
           coordinator_subagent_stop.returncode == 2,
           coordinator_subagent_stop.stderr)
+
+def stop(base: dict, text: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return run("enforce", {**base, "hook_event_name": "Stop", "agent_type": SCOPE,
+                           "last_assistant_message": text}, env)
+
+
+def clarified(prior: list[str], current: str) -> str:
+    return json.dumps({"type": "clarified_user_request", "prior_user_messages": prior,
+                       "current_user_message": current}, ensure_ascii=True,
+                      separators=(",", ":"))
+
+
+def native_response(content: str, agent_id: str = "a4d2c8f1e0b3a297") -> list[dict]:
+    return [{"type": "text", "text": content}, {"type": "text", "text": (
+        f"agentId: {agent_id} (use SendMessage with to: '{agent_id}', "
+        "summary: '<5-10 word recap>' to continue this agent)"
+        "\n<usage>subagent_tokens: 123\ntool_uses: 2\nduration_ms: 456</usage>"
+    )}]
+
+
+with tempfile.TemporaryDirectory() as directory:
+    env = dict(os.environ, EXPDESIGN_HOOK_LEDGER_DIR=directory)
+    base = {"session_id": "runtime-mode", "prompt_id": "first"}
+    for fork_mode in (None, "1", "false"):
+        effective = {**env}
+        effective.pop("CLAUDE_CODE_FORK_SUBAGENT", None)
+        if fork_mode is not None:
+            effective["CLAUDE_CODE_FORK_SUBAGENT"] = fork_mode
+        result = subprocess.run(["sh", str(LAUNCHER), "capture", SCOPE],
+                                input=json.dumps(prompt_capture(base, "study")),
+                                capture_output=True, text=True, env=effective)
+        check(f"incompatible_effective_fork_mode_{fork_mode}_blocks_before_capture",
+              result.returncode == 2 and "CLAUDE_CODE_FORK_SUBAGENT=0" in result.stderr,
+              result.stderr)
+
+    for disabled in ("1", "true", " YES ", "On"):
+        result = run("capture", prompt_capture(base, "study"), {
+            **env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": disabled,
+        })
+        check(f"background_disabled_{disabled.strip()}_blocks_before_capture",
+              result.returncode == 2 and "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" in result.stderr,
+              result.stderr)
+    for disabled in ("0", "false", " NO ", "Off"):
+        result = run("capture", prompt_capture(base, "study"), {
+            **env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": disabled,
+        })
+        check(f"background_enabled_{disabled.strip()}_permits_capture",
+              result.returncode == 0, result.stderr)
+
+    first = {"session_id": "clarification", "prompt_id": "first"}
+    second = {**first, "prompt_id": "second"}
+    third = {**first, "prompt_id": "third"}
+    original = "Design a two-arm study; power 0.8, alpha 0.05. Private code PRIVATE-48392."
+    reply = "Binary endpoint."
+    final_reply = "Control 0.2; treatment 0.35."
+    question = 'CLARIFICATION_REQUEST {"fields":["endpoint_type"]}'
+    captured = run("capture", prompt_capture(first, original), env)
+    questioned = stop(first, question, env)
+    next_capture = run("capture", prompt_capture(second, reply), env)
+    check("router_clarification_keeps_bound_user_context",
+          captured.returncode == questioned.returncode == next_capture.returncode == 0
+          and "1 prior user message" in next_capture.stdout,
+          (captured.stderr, questioned.stderr, next_capture.stderr))
+    for label, request in (
+        ("latest_only", reply),
+        ("mutated_prior", clarified([original + " altered"], reply)),
+        ("omitted_prior", clarified([], reply)),
+        ("mutated_current", clarified([original], reply + " altered")),
+        ("assistant_injection", clarified([original, question], reply)),
+    ):
+        rejected = run("bind", dispatch(second, request), env)
+        check(f"clarification_{label}_rejected", rejected.returncode == 2, rejected.stderr)
+    compact = clarified([original], reply)
+    pretty = json.dumps(json.loads(compact), indent=2)
+    accepted = run("bind", dispatch(second, pretty), env)
+    update = json.loads(accepted.stdout).get("hookSpecificOutput", {}).get("updatedInput", {})
+    check("host_normalizes_only_the_verified_envelope_before_execution",
+          accepted.returncode == 0 and update.get("prompt") == compact,
+          (accepted.stderr, accepted.stdout))
+    child_question = 'CLARIFICATION_REQUEST {"fields":["null_param","alt_param"]}'
+    recorded = run("record", batch(second, [child(
+        "single-endpoint-designer", native_response(child_question),
+    )]), env)
+    child_stop = stop(second, child_question, env)
+    third_capture = run("capture", prompt_capture(third, final_reply), env)
+    check("child_clarification_extends_the_same_user_request",
+          recorded.returncode == child_stop.returncode == third_capture.returncode == 0
+          and "2 prior user message" in third_capture.stdout,
+          (recorded.stderr, child_stop.stderr, third_capture.stderr))
+    reordered = run("bind", dispatch(third, clarified([reply, original], final_reply)), env)
+    phase_switch = run("bind", dispatch(
+        third, clarified([original, reply], final_reply), child_agent="meta-analysis-analyst",
+    ), env)
+    check("clarification_reordering_and_phase_switch_rejected",
+          reordered.returncode == phase_switch.returncode == 2,
+          (reordered.stderr, phase_switch.stderr))
+    final_dispatch = run("bind", dispatch(third, clarified([original, reply], final_reply)), env)
+    report = "VERIFIED complete study report"
+    final_record = run("record", batch(third, [child(
+        "single-endpoint-designer", native_response(report),
+    )]), env)
+    files = [path for path in Path(directory).rglob("*") if path.is_file()]
+    check("clarification_state_never_persists_raw_user_messages",
+          all(original.encode() not in path.read_bytes()
+              and reply.encode() not in path.read_bytes()
+              and stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files))
+    completed = stop(third, report, env)
+    fresh = {**first, "prompt_id": "unrelated"}
+    fresh_capture = run("capture", prompt_capture(fresh, "New independent request"), env)
+    fresh_dispatch = run("bind", dispatch(fresh, "New independent request"), env)
+    check("successful_request_clears_clarification_context_for_next_request",
+          final_dispatch.returncode == final_record.returncode == completed.returncode
+          == fresh_capture.returncode == fresh_dispatch.returncode == 0
+          and not list((Path(directory) / "prompt-bindings").glob("episode-*.json")),
+          (final_dispatch.stderr, final_record.stderr, completed.stderr,
+           fresh_capture.stderr, fresh_dispatch.stderr))
+
+    failed_first = {"session_id": "failure-clears", "prompt_id": "first"}
+    run("capture", prompt_capture(failed_first, original), env)
+    stop(failed_first, question, env)
+    failed_reply = {**failed_first, "prompt_id": "reply"}
+    run("capture", prompt_capture(failed_reply, reply), env)
+    terminal = stop(failed_reply, SAFE_FAILURE, env)
+    after_failure = {**failed_first, "prompt_id": "fresh"}
+    run("capture", prompt_capture(after_failure, "New request"), env)
+    unbound = run("bind", dispatch(after_failure, "New request"), env)
+    check("failure_clears_pending_clarification_context",
+          terminal.returncode == unbound.returncode == 0,
+          (terminal.stderr, unbound.stderr))
+
+    old = {"session_id": "old-version", "prompt_id": "first"}
+    run("capture", prompt_capture(old, original), env)
+    old_file = next(path for path in (Path(directory) / "prompt-bindings").glob("*.json")
+                    if json.loads(path.read_text()).get("metadata", {}).get("session_id")
+                    == "old-version")
+    state = json.loads(old_file.read_text())
+    state["version"] = 2
+    old_file.write_text(json.dumps(state))
+    rejected = run("bind", dispatch(old, original), env)
+    check("old_binding_version_fails_closed_without_migration",
+          rejected.returncode == 2 and "context mismatch" in rejected.stderr,
+          rejected.stderr)
+
+    bounded_results = []
+    for index in range(16):
+        bounded = {"session_id": "clarification-limit", "prompt_id": f"turn-{index}"}
+        captured = run("capture", prompt_capture(bounded, f"reply {index}"), env)
+        completed = stop(bounded, question, env)
+        bounded_results.append((captured.returncode, completed.returncode))
+    terminal = stop(bounded, SAFE_FAILURE, env)
+    check("clarification_turn_limit_blocks_and_value_free_failure_clears",
+          bounded_results == [(0, 0)] * 15 + [(0, 2)] and terminal.returncode == 0,
+          (bounded_results, terminal.stderr))
+    too_large = run("capture", prompt_capture(
+        {"session_id": "byte-limit", "prompt_id": "large"}, "x" * 131073,
+    ), env)
+    check("oversized_user_request_rejected_before_dispatch",
+          too_large.returncode == 2 and "byte limit" in too_large.stderr,
+          too_large.stderr)
+
+    partial = {"session_id": "partial-fanout", "prompt_id": "first"}
+    run("capture", prompt_capture(partial, original), env)
+    run("bind", dispatch(partial, original), env)
+    run("bind", dispatch(partial, original, child_agent="doe-designer"), env)
+    partial_record = run("record", batch(partial, [
+        child("single-endpoint-designer", report), child("doe-designer", question),
+    ]), env)
+    partial_stop = stop(partial, report + SEPARATOR + question, env)
+    partial_next = {**partial, "prompt_id": "reply"}
+    partial_capture = run("capture", prompt_capture(partial_next, reply), env)
+    partial_dispatch = run("bind", dispatch(partial_next, clarified([original], reply)), env)
+    check("mixed_success_and_clarification_retains_only_original_user_context",
+          partial_record.returncode == partial_stop.returncode == partial_capture.returncode
+          == partial_dispatch.returncode == 0,
+          (partial_record.stderr, partial_stop.stderr, partial_capture.stderr,
+           partial_dispatch.stderr))
+
+    for label, contents in (("success", report), ("failure", SAFE_FAILURE),
+                            ("clarification", question)):
+        case = {"session_id": "native-footer", "prompt_id": label}
+        record = run("record", batch(case, [child(
+            "single-endpoint-designer", native_response(contents),
+        )]), env)
+        leaked = stop(case, "\n".join(block["text"] for block in native_response(contents)), env)
+        clean = stop(case, contents, env)
+        check(f"native_footer_{label}_only_child_content_is_canonical",
+              record.returncode == clean.returncode == 0 and leaked.returncode == 2,
+              (record.stderr, leaked.stderr, clean.stderr))
+
+    mixed = {"session_id": "native-footer", "prompt_id": "mixed"}
+    record = run("record", batch(mixed, [
+        child("single-endpoint-designer", native_response(SAFE_FAILURE)),
+        child("doe-designer", native_response(report, "b123")),
+    ]), env)
+    laundering = stop(mixed, SAFE_FAILURE + SEPARATOR + report, env)
+    clean = stop(mixed, SAFE_FAILURE, env)
+    check("native_failed_child_with_successful_sibling_cannot_be_laundered",
+          record.returncode == clean.returncode == 0 and laundering.returncode == 2,
+          (record.stderr, laundering.stderr, clean.stderr))
+    footer = native_response(report)[-1]
+    for label, malformed in (
+        ("footer_only", [footer]),
+        ("embedded_footer", [dict(type="text", text=report + "\n" + footer["text"])]),
+        ("duplicated_footer", [*native_response(report), footer]),
+        ("reordered_footer", [footer, dict(type="text", text=report)]),
+        ("mismatched_agent_id", [dict(type="text", text=report),
+                                 dict(type="text", text=footer["text"].replace("to: 'a", "to: 'b"))]),
+        ("unexpected_usage", [dict(type="text", text=report),
+                              dict(type="text", text=footer["text"].replace("tool_uses: 2", "tool_uses: bad"))]),
+        ("unstructured_string", report + "\n" + footer["text"]),
+        ("structured_content_footer", {"status": "completed", "content": native_response(report)}),
+        ("async_result", {"status": "async_launched", "content": native_response(report)}),
+    ):
+        case = {"session_id": "native-footer", "prompt_id": label}
+        rejected = run("record", batch(case, [child("single-endpoint-designer", malformed)]), env)
+        check(f"ambiguous_native_metadata_{label}_fails_closed", rejected.returncode == 2,
+              rejected.stderr)
 
 print(f"\n--- Results: {passed} passed, {failed} failed ---")
 raise SystemExit(1 if failed else 0)

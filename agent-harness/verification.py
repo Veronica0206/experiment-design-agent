@@ -98,6 +98,7 @@ PUBLIC_CHECK_CATEGORIES = frozenset({
     "output_contract",
     "regression_suite",
     "reproducibility",
+    "response_budget",
     "seed_disclosure",
     "scientific_validation",
 })

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from final_report import canonical_report, privacy_safe_view  # noqa: E402
 from gates import (GateVerdict, MANUAL_CHECKS, check_regression_tests,
                    combined_gate, design_checks_for)  # noqa: E402
 from harness import ExperimentDesignHarness, SAFE_FAILURE_MESSAGE  # noqa: E402
+from mcp_client import MCPClient, PUBLIC_TOOL_ERROR_MESSAGES  # noqa: E402
 from verification import (VerificationIdentity, content_hash,
                           envelope_from_verdict, public_arguments_hash,
                           public_failure_codes)  # noqa: E402
@@ -170,13 +172,13 @@ def check(name, condition, detail=""):
         failed += 1
 
 
-def run_case(responses, results):
+def run_case(responses, results, mcp_factory=FakeMCP):
     with tempfile.TemporaryDirectory() as directory:
         harness = ExperimentDesignHarness(
             anthropic_client=FakeAnthropic(responses),
             log_dir=Path(directory),
         )
-        harness.mcp = FakeMCP(results)
+        harness.mcp = mcp_factory(results)
         harness.audit = AuditLog(Path(directory), "test-run")
         stream = harness.run("design this study")
         events = []
@@ -193,6 +195,146 @@ def finish(stream):
             next(stream)
     except StopIteration as done:
         return done.value
+
+
+class RequestRejectingMCP(FakeMCP):
+    """Exercise the real MCP error parser before returning synthetic evidence."""
+
+    def __init__(self, results, reject_count=1, rejected_tool="sample_size", payload=None):
+        super().__init__(results)
+        self.reject_count = reject_count
+        self.rejected_tool = rejected_tool
+        self.error_parser = MCPClient()
+        self.error_parser._call = lambda *_args, **_kwargs: {
+            "isError": True,
+            "content": [{"type": "text", "text": json.dumps(
+                payload if payload is not None else {"error": {
+                    "code": "invalid_request",
+                    "message": PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"],
+                }}
+            )}],
+        }
+
+    def call_tool(self, name, arguments):
+        if name == self.rejected_tool and self.reject_count:
+            self.reject_count -= 1
+            self.calls.append((name, arguments))
+            return self.error_parser.call_tool(name, arguments)
+        return super().call_tool(name, arguments)
+
+
+events, result, calls = run_case(
+    [response(tool("rejected", "sample_size", {"endpoint_type": "binary"})),
+     response(tool("corrected", "sample_size", GOOD_ARGS)),
+     response(text("ready"))],
+    {"sample_size": SS_RESULT, "run_tests": RT_OK},
+    RequestRejectingMCP,
+)
+check("validated_request_rejection_can_be_corrected_without_verifying_rejected_call",
+      result.stopped == "end_turn"
+      and result.gate_verdicts == ["PASS_PARTIAL"]
+      and [name for name, _ in calls] == ["sample_size", "sample_size", "run_tests"]
+      and any(event.get("event") == "tool_request_rejected" for event in events),
+      (result, calls))
+
+events, result, calls = run_case(
+    [response(tool("rejected-1", "sample_size", {})),
+     response(tool("rejected-2", "sample_size", {})),
+     response(tool("must-not-execute", "sample_size", GOOD_ARGS))],
+    {}, lambda results: RequestRejectingMCP(results, reject_count=10),
+)
+check("request_correction_budget_is_bounded_without_regression_calls",
+      result.final_answer == SAFE_FAILURE_MESSAGE
+      and not result.gate_verdicts and len(calls) == 2
+      and all(name == "sample_size" for name, _ in calls),
+      (result, calls))
+
+for label, rejection_count in (("rejected", 10), ("otherwise_successful", 1)):
+    events, result, calls = run_case(
+        [response(tool("initial-rejection", "sample_size", {})),
+         response(tool("correction-a", "sample_size", GOOD_ARGS),
+                  tool("correction-b", "sample_size", dict(GOOD_ARGS, alt_param=0.5)))],
+        {"sample_size": SS_RESULT, "run_tests": RT_OK},
+        lambda results: RequestRejectingMCP(results, reject_count=rejection_count),
+    )
+    check(label + "_correction_fanout_is_rejected_before_execution",
+          result.final_answer == SAFE_FAILURE_MESSAGE
+          and len(calls) == 1 and not result.canonical_report_bindings
+          and not result.gate_verdicts,
+          (result, calls))
+
+events, result, calls = run_case(
+    [response(tool("ambiguous-a", "sample_size", {}), tool("ambiguous-b", "sample_size", {})),
+     response(tool("unbound-correction", "sample_size", GOOD_ARGS))],
+    {"sample_size": SS_RESULT, "run_tests": RT_OK},
+    lambda results: RequestRejectingMCP(results, reject_count=2),
+)
+check("correction_cannot_guess_between_two_rejected_requests",
+      result.final_answer == SAFE_FAILURE_MESSAGE
+      and len(calls) == 2 and not result.gate_verdicts,
+      (result, calls))
+
+events, result, calls = run_case(
+    [response(tool("needs-input", "sample_size", {})),
+     response(text('CLARIFICATION_REQUEST {"fields":["null_param","alt_param"]}'))],
+    {}, RequestRejectingMCP,
+)
+check("rejected_request_can_elicit_missing_inputs_without_claiming_a_result",
+      result.final_answer.startswith("CLARIFICATION_REQUEST")
+      and not result.gate_verdicts and len(calls) == 1,
+      result)
+
+events, result, calls = run_case(
+    [response(tool("request-a", "sample_size", {})),
+     response(tool("unrelated-config", "validate_config", GOOD_ARGS)),
+     response(text("ready"))],
+    {"validate_config": {"valid": True, "configuration_report": "configuration-only"}},
+    RequestRejectingMCP,
+)
+check("unrelated_success_cannot_clear_a_rejected_analysis",
+      result.final_answer == SAFE_FAILURE_MESSAGE, result)
+
+events, result, calls = run_case(
+    [response(tool("invalid-config", "validate_config", {})),
+     response(tool("corrected-config", "validate_config", GOOD_ARGS)),
+     response(text("ready"))],
+    {"validate_config": {"valid": True, "configuration_report": "configuration-only"}},
+    lambda results: RequestRejectingMCP(results, rejected_tool="validate_config"),
+)
+check("configuration_request_rejection_can_be_corrected",
+      result.final_answer == "configuration-only"
+      and [name for name, _ in calls] == ["validate_config", "validate_config"],
+      (result, calls))
+
+for label, payload in (
+    ("unknown_error", {"error": {"code": "private-detail", "message": "PRIVATE-SENTINEL"}}),
+    ("forged_invalid_request", {"error": {"code": "invalid_request", "message": "PRIVATE-SENTINEL"}}),
+):
+    events, result, calls = run_case(
+        [response(tool("terminal", "sample_size", GOOD_ARGS)),
+         response(tool("must-not-correct", "sample_size", GOOD_ARGS))],
+        {"run_tests": RT_OK},
+        lambda results: RequestRejectingMCP(results, payload=payload),
+    )
+    check(label + "_remains_terminal_and_private",
+          result.final_answer == SAFE_FAILURE_MESSAGE
+          and result.gate_verdicts == ["INTERNAL_ERROR"]
+          and not any(event.get("event") == "tool_request_rejected" for event in events)
+          and "PRIVATE-SENTINEL" not in str(events),
+          (result, events))
+
+events, result, calls = run_case(
+    [response(tool("forged-untyped", "sample_size", GOOD_ARGS)),
+     response(tool("must-not-correct", "sample_size", GOOD_ARGS))],
+    {"sample_size": {"_test_passthrough": True, "error": {
+        "code": "invalid_request", "message": PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"],
+    }}, "run_tests": RT_OK},
+)
+check("untyped_result_cannot_impersonate_a_validated_request_rejection",
+      result.final_answer == SAFE_FAILURE_MESSAGE
+      and result.gate_verdicts == ["INTERNAL_ERROR"]
+      and not any(event.get("event") == "tool_request_rejected" for event in events),
+      (result, events))
 
 
 events, result, calls = run_case(

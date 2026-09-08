@@ -548,6 +548,31 @@ mixed_design = privacy_safe_view("factorial_design", {
 check("design_projection_skips_drop_sentinel_values",
       mixed_design == {"design": [{"factor_1": 1}, {}]}
       and "object at" not in str(mixed_design))
+metadata_design_raw = {"design": [{
+    "Private B": -1, "Private A": 1,
+    "RUN": 2, "Std_Order": 1, "Point_Type": "AXIAL",
+}]}
+for design_tool in ("factorial_design", "rsm_design"):
+    metadata_design = privacy_safe_view(design_tool, metadata_design_raw)
+    check(f"{design_tool}_metadata_is_literal_not_fictitious_factor",
+          metadata_design == {"design": [{
+              "factor_1": 1, "factor_2": -1,
+              "point_type": "axial", "run": 2, "std_order": 1,
+          }]}
+          and privacy_safe_view(design_tool, metadata_design) == metadata_design
+          and "factor_3" not in metadata_design["design"][0])
+rsm_reverse_columns = privacy_safe_view("rsm_design", {"design": [
+    {"Private B": -1, "Private A": 1, "point_type": "factorial",
+     "run": 1, "std_order": 2},
+    {"Private B": 1, "Private A": -1, "point_type": "factorial",
+     "run": 2, "std_order": 1},
+]})
+rsm_standard_rows = sorted(
+    rsm_reverse_columns["design"], key=lambda row: row["std_order"],
+)
+check("rsm_public_standard_order_uses_projected_factor_order",
+      [(row["factor_1"], row["factor_2"]) for row in rsm_standard_rows]
+      == [(-1, 1), (1, -1)])
 factorial_views = []
 for factor_count in range(1, 13):
     # Reverse insertion order demonstrates that arbitrary private names retain

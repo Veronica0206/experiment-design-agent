@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from public_release_policy import PUBLIC_ENGINE_FILES
+
 MANIFEST = "publish-manifest.json"
 LICENSE_NAMES = {"license", "license.md", "license.txt"}
 APPROVED_GIT_PATHS = {
@@ -46,6 +49,8 @@ def fail(message: str) -> int:
 
 
 def _forbidden_proprietary_path(relative: str) -> str | None:
+    if relative in PUBLIC_ENGINE_FILES:
+        return None
     path = PurePosixPath(relative)
     lowered = path.name.lower()
     if lowered == "skill.md" or lowered.endswith(".skill"):

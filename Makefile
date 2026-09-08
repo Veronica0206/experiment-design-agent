@@ -5,6 +5,7 @@ R_SUITES := vera-experiment-designing vera-master-experiment-designing \
             vera-doe-designing vera-indirect-comparing vera-meta-analyzing
 PYTHON ?= $(abspath agent-harness/.venv/bin/python)
 PYTHON_RUN = EXPDESIGN_PYTHON="$(PYTHON)" tools/run-reviewed-python.sh
+NPM_INSTALL ?= npm ci --no-audit --no-fund
 
 .PHONY: test test-r test-py test-integration build deps validate-skills \
 	validate-config validate-r-lock validate-python-lock audit-deps check-claude-version \
@@ -25,6 +26,7 @@ test-py:
 	@$(PYTHON_RUN) agent-harness/tests/test_multi_agent.py
 	@$(PYTHON_RUN) agent-harness/tests/test_streamlit_surface.py
 	@$(PYTHON_RUN) agent-harness/tests/test_mcp_client.py
+	@$(PYTHON_RUN) agent-harness/tests/test_response_budget.py
 	@$(PYTHON_RUN) agent-harness/tests/test_audit.py
 	@$(PYTHON_RUN) agent-harness/tests/test_artifact_download.py
 	@$(PYTHON_RUN) hooks/tests/test_enforce_verification.py
@@ -48,16 +50,22 @@ build:
 deps:
 	@cd mcp-server && npm ci
 
-# Runnable in the public portfolio distribution. This checks only the strict
-# public path policy, TypeScript build, npm non-publication guard, and the
-# lifecycle checks that stop at the missing-engine preflight. It does not claim
-# that the omitted statistical engines or full release suite exist.
+# The exported single-endpoint edition runs real statistical and MCP checks.
+# Full-source tests remain in release-check; no missing suite is skipped there.
 public-check:
 	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-workflow "$(CURDIR)/.github/workflows/public-assurance.yml"
 	@tools/run-publication-python.sh "$(CURDIR)/tools/validate_public_distribution.py" --public-clone "$(CURDIR)"
-	@cd mcp-server && npm ci
+	@$(PYTHON_RUN) tools/prepare_public_release.py --check "$(CURDIR)"
+	@$(MAKE) validate-python-lock
+	@$(PYTHON_RUN) tools/validate_manifests.py
+	@cd mcp-server && $(NPM_INSTALL)
 	@cd mcp-server && npm run test:public-lifecycle
-	@echo "== public-check: PASS (source-review surface only; analysis engines not tested) =="
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/run_tests.R
+	@tools/run-reviewed-r.sh vera-experiment-designing/scripts/tests/public_packaging.R
+	@$(PYTHON_RUN) agent-harness/tests/test_runtime_profile.py
+	@$(PYTHON_RUN) tools/tests/test_public_release.py
+	@cd mcp-server && EXPDESIGN_PYTHON="$(PYTHON)" npm run test:public-engine
+	@echo "== public-check: PASS (single-endpoint engine, verification and public boundaries) =="
 
 validate-skills:
 	@$(PYTHON_RUN) tools/validate_skills.py .

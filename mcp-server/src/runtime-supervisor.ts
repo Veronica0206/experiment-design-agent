@@ -209,9 +209,10 @@ function canonicalTargetCwd(cwd: SpawnOptions["cwd"]): string {
 }
 
 /**
- * Spawn a runtime directly for standalone servers, or through the authenticated
- * detached wrapper used by MCPClient forced-shutdown cleanup. The wrapper uses
- * the exact stdio descriptors and working directory requested for the target.
+ * Keep a wrapper alive as the detached process-group leader until the runtime
+ * and its descendants have finished. A host registry additionally authenticates
+ * the group for MCPClient forced-shutdown cleanup. The wrapper preserves the
+ * exact stdio descriptors and working directory requested for the target.
  */
 export function spawnRuntimeProcess(
   executable: string,
@@ -224,7 +225,8 @@ export function spawnRuntimeProcess(
   const requestedTargetEnvironment = { ...(options.env ?? {}) };
   const registry = configuration(requestedTargetEnvironment) ?? configuration(process.env);
   const targetEnvironment = stripSupervisorEnvironment(requestedTargetEnvironment);
-  if (!registry) {
+  if (!registry && (!options.detached ||
+      (process.platform !== "linux" && process.platform !== "darwin"))) {
     return spawn(executable, args, { ...options, env: targetEnvironment });
   }
 
@@ -233,10 +235,12 @@ export function spawnRuntimeProcess(
   // These values belong only to the authenticated Node wrapper. The final
   // runtime receives requestedTargetEnvironment after the internal names are
   // stripped, so target allowlists never need to carry supervisor secrets.
-  wrapperEnvironment[REGISTRY_DIR_ENV] = registry.directory;
-  wrapperEnvironment[REGISTRY_TOKEN_ENV] = registry.token;
-  wrapperEnvironment[REGISTRY_DEV_ENV] = String(registry.dev);
-  wrapperEnvironment[REGISTRY_INO_ENV] = String(registry.ino);
+  if (registry) {
+    wrapperEnvironment[REGISTRY_DIR_ENV] = registry.directory;
+    wrapperEnvironment[REGISTRY_TOKEN_ENV] = registry.token;
+    wrapperEnvironment[REGISTRY_DEV_ENV] = String(registry.dev);
+    wrapperEnvironment[REGISTRY_INO_ENV] = String(registry.ino);
+  }
   wrapperEnvironment[SERVER_PID_ENV] = String(process.pid);
   wrapperEnvironment[NONCE_ENV] = nonce;
   wrapperEnvironment[TARGET_CWD_ENV] = canonicalTargetCwd(options.cwd);
@@ -256,9 +260,9 @@ export function spawnRuntimeProcess(
     ],
     {
       ...options,
-      // The wrapper and host now share one kernel-pinned registry identity.
-      // The original target cwd is restored only after this identity is checked.
-      cwd: registry.directory,
+      // When present, the registry identity is pinned by the wrapper's cwd.
+      // Standalone wrappers need no registry files or host cleanup credentials.
+      cwd: registry?.directory ?? wrapperEnvironment[TARGET_CWD_ENV],
       detached: true,
       env: wrapperEnvironment,
     },
@@ -343,6 +347,25 @@ function assertProcessGroupLeader(): string {
   throw new Error("runtime supervisor is unavailable on this platform");
 }
 
+/** Parse a process-table row, including unrelated kernel threads with PGID 0. */
+export function parseLinuxProcessGroupStat(raw: string): number {
+  const commandEnd = raw.lastIndexOf(")");
+  if (commandEnd < 0) {
+    throw new Error("runtime supervisor process table row is malformed");
+  }
+  const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
+  if (fields.length <= 2 || !/^[0-9]+$/.test(fields[2])) {
+    throw new Error("runtime supervisor process group is malformed");
+  }
+  const group = Number(fields[2]);
+  // Kernel threads can belong to group 0. It cannot match this wrapper's
+  // positive PID; rejecting it would kill healthy targets during /proc scans.
+  if (!Number.isSafeInteger(group) || group < 0) {
+    throw new Error("runtime supervisor process group is malformed");
+  }
+  return group;
+}
+
 function linuxProcessGroup(pid: string): number | undefined {
   const path = `/proc/${pid}/stat`;
   const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
@@ -361,20 +384,7 @@ function linuxProcessGroup(pid: string): number | undefined {
     if (count > MAX_PROC_STAT_BYTES) {
       throw new Error("runtime supervisor process table row exceeded its bound");
     }
-    const raw = bytes.subarray(0, count).toString("utf8").trim();
-    const commandEnd = raw.lastIndexOf(")");
-    if (commandEnd < 0) {
-      throw new Error("runtime supervisor process table row is malformed");
-    }
-    const fields = raw.slice(commandEnd + 1).trim().split(/\s+/);
-    if (fields.length <= 2 || !/^[0-9]+$/.test(fields[2])) {
-      throw new Error("runtime supervisor process group is malformed");
-    }
-    const group = Number(fields[2]);
-    if (!Number.isSafeInteger(group) || group <= 0) {
-      throw new Error("runtime supervisor process group is malformed");
-    }
-    return group;
+    return parseLinuxProcessGroupStat(bytes.subarray(0, count).toString("utf8").trim());
   } finally {
     closeSync(fd);
   }
@@ -584,7 +594,6 @@ function closeRegistryEntry(
 
 function runSupervisor(modeIndex: number): void {
   const registry = configuration(process.env);
-  if (!registry) throw new Error("runtime supervisor registry configuration is absent");
   const serverPid = positivePid(process.env[SERVER_PID_ENV], "runtime server pid");
   const nonce = process.env[NONCE_ENV];
   if (!nonce || !NONCE_PATTERN.test(nonce)) {
@@ -605,9 +614,9 @@ function runSupervisor(modeIndex: number): void {
       realpathSync(targetCwd) !== targetCwd || !statSync(targetCwd).isDirectory()) {
     throw new Error("runtime supervisor target working directory is malformed");
   }
-  const registryDirectory = validatePrivateRegistryDirectory(registry);
+  const registryDirectory = registry ? validatePrivateRegistryDirectory(registry) : undefined;
   const stopPath = STOP_BASENAME;
-  if (stopRequested(stopPath)) {
+  if (registry && stopRequested(stopPath)) {
     throw new Error("runtime supervisor host is stopping");
   }
 
@@ -615,7 +624,7 @@ function runSupervisor(modeIndex: number): void {
   const authenticatedFields = [
     1, serverPid, process.pid, nonce, startIdentity,
   ] as const;
-  const entry = openRegistryEntry(entryPath, {
+  const entry = registry ? openRegistryEntry(entryPath, {
     version: 1,
     server_pid: serverPid,
     pid: process.pid,
@@ -624,16 +633,16 @@ function runSupervisor(modeIndex: number): void {
     auth: createHmac("sha256", registry.token)
       .update(JSON.stringify(authenticatedFields), "utf8")
       .digest("hex"),
-  });
-  assertRegistryDirectoryCurrent(registryDirectory);
-  let entryOpen = true;
+  }) : undefined;
+  if (registryDirectory) assertRegistryDirectoryCurrent(registryDirectory);
+  let entryOpen = entry !== undefined;
   let stopping = false;
   let targetSettled = false;
   let target: ChildProcess | undefined;
   let stopPoll: NodeJS.Timeout | undefined;
 
   const unregister = () => {
-    if (!entryOpen) return;
+    if (!entryOpen || entry === undefined) return;
     entryOpen = false;
     closeRegistryEntry(entryPath, entry);
   };
@@ -656,8 +665,9 @@ function runSupervisor(modeIndex: number): void {
     if (stopPoll) clearInterval(stopPoll);
     try {
       // The direct target can exit while a background child remains in this
-      // detached group. Never erase the only host-authenticated kill handle in
-      // that state: retain the lease and kill the complete group instead.
+      // detached group. The wrapper is still its leader, so the PGID cannot be
+      // recycled during this check or kill. Retain any host lease until the
+      // complete group is dead; standalone wrappers require the same cleanup.
       if (remainingProcessGroupMembers().length > 0) {
         killOwnGroup();
         return;
@@ -671,8 +681,8 @@ function runSupervisor(modeIndex: number): void {
   };
 
   try {
-    assertRegistryDirectoryCurrent(registryDirectory);
-    if (stopRequested(stopPath)) {
+    if (registryDirectory) assertRegistryDirectoryCurrent(registryDirectory);
+    if (registry && stopRequested(stopPath)) {
       throw new Error("runtime supervisor host is stopping");
     }
     const targetEnvironment = stripSupervisorEnvironment(process.env);
@@ -684,11 +694,14 @@ function runSupervisor(modeIndex: number): void {
       cwd: targetCwd,
     });
     target.once("error", () => finishTarget(127, null));
-    target.once("close", finishTarget);
+    // React to leader exit even when descendants keep inherited pipes open.
+    target.once("exit", finishTarget);
     stopPoll = setInterval(() => {
       try {
-        assertRegistryDirectoryCurrent(registryDirectory);
-        if (stopRequested(stopPath)) killOwnGroup();
+        if (registryDirectory) assertRegistryDirectoryCurrent(registryDirectory);
+        if (process.ppid !== serverPid || (registry && stopRequested(stopPath))) {
+          killOwnGroup();
+        }
       } catch {
         // Loss of the authenticated registry boundary is terminal.
         killOwnGroup();

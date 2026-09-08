@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 
 
@@ -34,7 +34,10 @@ CONTROL_TIMEOUT_S = 30
 # Leave bounded transport overhead so the client never preempts server policy.
 TOOL_TIMEOUT_S = 450
 STOP_GRACE_S = 5
-MAX_JSONRPC_MESSAGE_BYTES = 5 * 1024 * 1024
+# The repository-controlled Node boundary caps the fully serialized tool-result
+# object at 4 MiB.  A 10 MiB frame ceiling matches the locked SDK stdio buffer
+# and leaves explicit room for the JSON-RPC envelope and escaped text payload.
+MAX_JSONRPC_MESSAGE_BYTES = 10 * 1024 * 1024
 MAX_SERVER_STDERR_BYTES = 64 * 1024
 _STREAM_CHUNK_BYTES = 64 * 1024
 
@@ -68,9 +71,102 @@ _RUNTIME_REGISTRY_MAX_BYTES = 4096
 _RUNTIME_REGISTRY_WAIT_S = 5
 _RUNTIME_STOP_PAYLOAD = b"stop\n"
 
+# The long-lived Node process is a confidentiality boundary: it must not see
+# provider credentials, proxy configuration, package-manager settings, native
+# loader controls, or arbitrary feature flags from the host application. Keep
+# this list aligned with mcp-server/launch-server.sh, which closes the same
+# boundary for direct MCP launches that do not pass through this Python client.
+_CONTROLLED_SERVER_PATH = (
+    "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:"
+    "/opt/local/bin:/Library/Frameworks/R.framework/Resources/bin"
+)
+_SERVER_EXECUTABLE_OVERRIDES = (
+    "EXPDESIGN_NODE",
+    "EXPDESIGN_RSCRIPT",
+    "EXPDESIGN_PYTHON",
+)
+_SERVER_ABSOLUTE_PATHS = ("EXPDESIGN_RUNS_DIR",)
+_SERVER_ABSOLUTE_PATH_LISTS = ("EXPDESIGN_ALLOWED_READ_ROOTS",)
+_SERVER_POSITIVE_INTEGER_SETTINGS = (
+    "EXPDESIGN_ARTIFACT_LOCK_WAIT_MS",
+    "EXPDESIGN_ARTIFACT_MAX_LEASE_SECONDS",
+    "EXPDESIGN_ARTIFACT_RETENTION_DAYS",
+    "EXPDESIGN_ARTIFACT_MAX_DIRS",
+)
+
+
+def _controlled_server_environment(
+    host_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the complete non-secret environment passed to the MCP launcher.
+
+    Values are copied only by exact reviewed name. Deterministic locale, time,
+    temporary-directory, home, and executable-search defaults are supplied by
+    this host instead of inherited from an ambient application environment.
+    Runtime-registry authentication fields are deliberately absent here; the
+    host creates and adds them only after this function returns.
+    """
+    source = os.environ if host_environment is None else host_environment
+    controlled_home = "/var/empty" if Path("/var/empty").is_dir() else "/"
+    environment = {
+        "PATH": _CONTROLLED_SERVER_PATH,
+        "HOME": controlled_home,
+        "TMPDIR": "/tmp",
+        "TMP": "/tmp",
+        "TEMP": "/tmp",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+    }
+
+    for name in _SERVER_EXECUTABLE_OVERRIDES:
+        value = source.get(name)
+        if value is None:
+            continue
+        if not value or not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path")
+        environment[name] = value
+
+    for name in _SERVER_ABSOLUTE_PATHS:
+        value = source.get(name)
+        if value is None:
+            continue
+        if not value or not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path")
+        environment[name] = value
+
+    for name in _SERVER_ABSOLUTE_PATH_LISTS:
+        value = source.get(name)
+        if value is None:
+            continue
+        paths = value.split(os.pathsep)
+        if not paths or any(not path or not os.path.isabs(path) for path in paths):
+            raise ValueError(f"{name} must contain only absolute paths")
+        environment[name] = value
+
+    for name in _SERVER_POSITIVE_INTEGER_SETTINGS:
+        value = source.get(name)
+        if value is None:
+            continue
+        if not value.isascii() or not value.isdigit() or int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        environment[name] = value
+
+    return environment
+
 
 class MCPToolError(RuntimeError):
     """Raised when a tool call fails (server-side error or bad output)."""
+
+
+class MCPInvalidRequestError(MCPToolError):
+    """A validated public input rejection, with no statistical result."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Tool request failed [invalid_request]: "
+            + PUBLIC_TOOL_ERROR_MESSAGES["invalid_request"]
+        )
 
 
 class _RuntimeGroupRegistry:
@@ -517,21 +613,9 @@ class MCPClient:
         try:
             registry = _RuntimeGroupRegistry()
             self._runtime_registry = registry
-            server_env = dict(os.environ)
-            # Absolute interpreter selection is handled by the audited launcher.
-            # Do not let Node preload code or search caller-controlled module roots.
-            server_env.pop("NODE_OPTIONS", None)
-            server_env.pop("NODE_PATH", None)
-            for name in (
-                "EXPDESIGN_RUNTIME_REGISTRY_DIR",
-                "EXPDESIGN_RUNTIME_REGISTRY_TOKEN",
-                "EXPDESIGN_RUNTIME_REGISTRY_DEV",
-                "EXPDESIGN_RUNTIME_REGISTRY_INO",
-                "EXPDESIGN_RUNTIME_SERVER_PID",
-                "EXPDESIGN_RUNTIME_NONCE",
-                "EXPDESIGN_RUNTIME_TARGET_CWD",
-            ):
-                server_env.pop(name, None)
+            server_env = _controlled_server_environment()
+            # Only this host may mint registry authentication fields. Ambient
+            # values with these names were never copied into server_env.
             server_env.update(registry.environment())
             self._proc = subprocess.Popen(
                 ["/bin/sh", str(SERVER_LAUNCHER)],
@@ -678,6 +762,8 @@ class MCPClient:
         # reflect arbitrary SDK/handler text, which may contain local paths.
         if resp.get("isError"):
             code, message = self._validated_public_tool_error(text)
+            if code == "invalid_request":
+                raise MCPInvalidRequestError()
             raise MCPToolError(f"Tool request failed [{code}]: {message}")
 
         if not content:

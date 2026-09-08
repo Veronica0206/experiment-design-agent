@@ -1,196 +1,134 @@
 # Experiment Design Agent
 
-> **Public portfolio distribution:** This repository contains the public
-> multi-agent orchestration, verification, and interface layer. The proprietary
-> statistical engines required for numerical analyses are not distributed, so
-> the public clone is not an end-to-end runnable product.
+A runnable agent for single-endpoint study planning, backed by an open R
+statistical engine and enforced result verification.
 
-Experiment Design Agent is a coordinated team of statistical specialists that
-helps researchers plan studies, evaluate complex trial designs, construct
-experiments and randomization plans, and synthesize comparative evidence.
+The **public single-endpoint edition** includes configuration validation,
+sample-size calculations, frequentist and Bayesian operating characteristics,
+and supported predictive probability of success (PPOS) calculations. Numerical
+results come from R; the language model requests inputs and invokes tools.
 
-You can start with a research question in plain language. A coordinator directs
-the request to the most relevant specialist and returns a structured report
-that separates assumptions, results, automated checks, reproducibility
-information where applicable, and remaining limitations.
+A separate complete installation adds other statistical domains. Its private
+engines and proprietary skill instructions are excluded from the public edition.
 
-## How the complete system works
+## Public capabilities
 
-In an authorized complete installation, a request follows this path:
+| Capability | Public edition |
+|---|---|
+| Validate study assumptions and resolve supported configuration | Included |
+| Single-arm and controlled single-endpoint sample size | Included |
+| Frequentist/Bayesian operating characteristics and supported PPOS | Included |
+| Reproducible worked examples, R regression tests and agent verification | Included |
+| Master protocols, DOE/A/B tools, randomization, indirect comparison, meta-analysis | Separate complete installation |
 
-```mermaid
-flowchart LR
-    U["User"] --> C["Coordinator"]
-    C --> S["Six specialist sub-agents"]
-    S --> M["MCP tool interface"]
-    M --> E["Proprietary statistical engines<br/>(not distributed)"]
-    E --> G["Verification and privacy gates"]
-    G --> R["Canonical report<br/>with verification status"]
+The public MCP server advertises exactly `validate_config`, `sample_size`,
+`simulate_design`, and `run_tests`. It refuses unsupported tool names. Its
+coordinator can dispatch only `single-endpoint-designer`.
+
+See the [R engine documentation](vera-experiment-designing/README.md) for supported
+endpoints, assumptions, method restrictions, optional packages, and examples.
+
+## Start with the R engine
+
+R calculations and examples run without a model account or API key. The engine
+was tested with R 4.5.3; `renv.lock` records the complete development environment.
+The agent bridge requires `jsonlite`; `survival` is normally supplied with R.
+`Exact` is optional and its absence is surfaced by the relevant method checks.
+
+From the repository root, after installing these R dependencies:
+
+```sh
+Rscript --vanilla vera-experiment-designing/scripts/tests/run_tests.R
+Rscript --vanilla vera-experiment-designing/scripts/tests/public_packaging.R
 ```
 
-## What it helps you do
+The [worked examples](vera-experiment-designing/README.md#examples) use the same
+six-file engine as the agent. The quick demonstration mode reduces simulation
+budgets and is not a study-planning recommendation.
 
-The following describes what the complete system does in an authorized
-installation; these capabilities are not executable from the public clone
-alone.
+## Run the agent
 
-- Plan single-endpoint studies and estimate the required sample size.
-- Simulate operating characteristics, power, and Go/Consider/No-Go behavior.
-- Evaluate basket, umbrella, and platform master protocols.
-- Size A/B tests and construct factorial or response-surface designs.
-- Generate reproducible simple, blocked, or stratified randomization plans.
-- Perform Bucher indirect comparisons or matching-adjusted indirect
-  comparisons (MAIC).
-- Pool evidence across studies with fixed- or random-effects meta-analysis.
+Install Node.js 20 or newer and Python 3.9–3.12 (the locked dependency set is
+exercised locally with 3.9 and in public CI with 3.11). Create the locked Python
+environment and build the MCP server:
 
-## Meet the agent team
+```sh
+python3 -m venv agent-harness/.venv
+agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock
+cd mcp-server
+npm ci --no-audit --no-fund
+npm run build
+```
 
-The recommended experience uses one coordinator and six specialist sub-agents.
-The coordinator selects the narrowest specialist that can answer the question;
-when a request contains genuinely independent tasks, it can return more than
-one specialist report.
+Return to the repository root. For the local web interface, configure your own
+`ANTHROPIC_API_KEY` in your environment, then run:
 
-| Agent | What it helps with | Typical outputs |
-|---|---|---|
-| **Experiment Design Coordinator** (`experiment-design-coordinator`) | Selects the appropriate specialist, requests missing information, and coordinates independent deliverables | Clarifying questions when needed, followed by one or more specialist reports |
-| **Single-Endpoint Study Designer** (`single-endpoint-designer`) | Single-arm or controlled binary, continuous, time-to-event, and incidence-rate studies in signal-detection, proof-of-concept, or confirmatory settings | Resolved assumptions, sample-size tables, achieved power, critical values, operating characteristics, and optional predictive probability of success (PPOS) |
-| **Master Protocol Designer** (`master-protocol-designer`) | Basket, umbrella, and platform protocols with multiple arms, subgroups, stages, or adaptive decisions | Simulated power and error rates, family-wise error rate, arm or subgroup decisions, sample-size summaries, and downloadable operating-characteristic tables or plots |
-| **Design of Experiments Specialist** (`doe-designer`) | Two-arm A/B experiments, full or fractional factorial screening, and response-surface design | Per-arm and total A/B sample size, design matrices, generators, resolution and alias information, central composite designs, or Box–Behnken designs |
-| **Randomization Planner** (`randomization-planner`) | Seeded simple, permuted-block, or stratified allocation for two or more arms, including unequal ratios | Allocation summary and a private treatment-assignment artifact |
-| **Indirect Comparison Analyst** (`indirect-comparison-analyst`) | One aggregate-data Bucher comparison or one MAIC analysis using individual-level data and published target information | Effect estimate, standard error, confidence interval, resolved method inputs, and effective-sample-size or balance diagnostics where applicable |
-| **Meta-Analysis Analyst** (`meta-analysis-analyst`) | Fixed- or random-effects synthesis for binary, continuous, time-to-event, and incidence-rate evidence | Pooled effect and confidence interval, study-level effects, Q, I², tau², and transparent counts of included or excluded studies |
+```sh
+tools/run-reviewed-python.sh -m streamlit run agent-harness/streamlit_app.py --server.headless true --server.address 127.0.0.1 --server.port 8501
+```
 
-## Example questions
+The interface is unauthenticated and stays bound to localhost. Do not put API
+keys in repository files. The bundled MCP tools and automated checks do not
+require a model-provider call; natural-language coordination does.
 
-- “How many users per arm do I need to detect a three-percentage-point
-  conversion-rate improvement in a two-sided A/B test?”
-- “How many participants do I need for a controlled binary-endpoint
-  proof-of-concept study?”
-- “What are the operating characteristics of this basket trial under the null
-  and alternative response scenarios?”
-- “Evaluate a two-stage umbrella protocol and report its arm-level power and
-  error rates.”
-- “Create a Resolution IV fractional-factorial design for six two-level
-  factors.”
-- “Build a central composite design for studying curvature across three process
-  factors.”
-- “Generate a reproducible 2:1 stratified randomization plan for 180
-  participants.”
-- “Estimate treatment A versus treatment C through a common comparator using
-  the Bucher method.”
-- “Reweight this trial’s individual-level data to the published target
-  population using MAIC.”
-- “Pool these log hazard ratios with a random-effects model and report
-  heterogeneity.”
+For Claude Code, use the project MCP configuration and run the coordinator as
+the main agent:
 
-If essential information is missing—such as the endpoint, design type, null and
-alternative assumptions, alpha, power, allocation ratio, analysis method, or
-data source—the agent asks for the specific missing fields instead of inventing
-them.
+```sh
+tools/bootstrap.sh --check-claude-version
+claude --agent experiment-design-coordinator
+```
 
-## What you receive
+The installed-host contract requires Claude Code 2.1.233 or newer and the
+provided foreground-mode settings. This version/configuration check does not
+exercise an authenticated model conversation.
 
-Depending on the question, the final report can include:
+## Verification
 
-- The assumptions and effective settings used for the analysis.
-- Sample-size, power, operating-characteristic, or evidence-synthesis tables.
-- Go/Consider/No-Go probabilities or arm-level decision summaries.
-- Factorial or response-surface design matrices.
-- Effect estimates, confidence intervals, heterogeneity measures, and
-  assumption checks.
-- Reproducibility information where available, including the effective random
-  seed for stochastic work.
-- A verification status and an explicit list of items that still require human
-  review.
-- Private, opaque artifact handles for sensitive assignments or row-level
-  outputs, rather than reproducing those records in conversational text.
+From a clean public clone with the dependencies above installed:
 
-See the [captured canonical report examples](docs/examples/README.md) for
-illustrative outputs produced from synthetic inputs by an authorized complete
-installation.
-
-## Result assurance and privacy
-
-- Reported values come from statistical analysis engines; the language model
-  does not invent numerical results.
-- Reproducibility information is reported where available. Same-seed replay is
-  applied only to supported stochastic workflows and workload ranges.
-- Unsupported, ambiguous, or internally inconsistent requests are rejected or
-  clarified rather than silently converted to a nearby method.
-- Results are withheld when required checks fail. Currently, all presentable
-  statistical-analysis reports are labelled **Partially verified** because
-  some endpoint-specific formula checks and complete assessment of the chosen
-  configuration still require human review.
-- Participant assignments, individual-level input data, identifiers, strata,
-  row-level weights, and local file paths are kept out of the narrative report.
-
-These safeguards support consistency, reproducibility, and honest reporting.
-They do not establish that a method is scientifically optimal for a particular
-program, and they do not replace independent statistical, clinical, ethical,
-or regulatory review.
-
-## Current scope and limitations
-
-- The agent supports the method families listed above and does not claim an
-  unsupported method under a familiar label.
-- The indirect-comparison specialist handles one Bucher comparison or one MAIC
-  analysis per request. It does not perform network meta-analysis or a
-  multi-edge Bucher chain.
-- An estimate produced by indirect comparison or meta-analysis is not
-  automatically promoted into a future study’s effect assumption, prior, null,
-  alternative, or decision threshold. The user must confirm that use in a new
-  step.
-- Evidence-analysis requests and prospective study-design requests are handled
-  in separate user steps rather than combined into one automatic pipeline.
-- Prospective time-to-event study-design calculations use the supported
-  exponential model; Cox proportional hazards is not offered there.
-- Incidence-rate design calculations use the supported Poisson model;
-  negative-binomial design calculations are not currently offered.
-- Master-protocol analyses evaluate a specified basket, umbrella, or platform
-  design. They are not an unrestricted automatic protocol optimizer.
-- Monte Carlo precision limits or workload caps may add further limitations to
-  the report.
-
-## Availability
-
-This public repository supports portfolio and source review of the distributed
-agent surface. At executable startup, the MCP server checks for the required
-private engine installation before connecting the MCP transport. If that
-installation is unavailable, the server exits with a fixed, path-free error:
-no MCP connection is established and no tools are advertised. A successful
-build or public-tree check therefore does not establish that analyses can run
-or that the complete internal release suite has passed. Full execution is
-available only through an authorized installation containing those engines.
-
-The public tree also includes the Python harness and
-`agent-harness/streamlit_app.py` for interface review. The Streamlit UI can be
-launched locally after its public dependencies are installed, but it is
-unauthenticated and must remain bound to `127.0.0.1`; it is not a publicly
-hosted demo. Analysis attempts from an incomplete public clone cannot complete
-because the MCP server refuses startup as described above.
-
-In a public clone, the intentionally limited check is:
-
-```bash
+```sh
 make public-check
 ```
 
-It validates the public path policy, installs and compiles the distributed MCP
-interface, confirms that the npm package remains non-publishable, and exercises
-the public-safe lifecycle through the fail-closed missing-engine preflight. It
-does not execute or attest the omitted statistical engines.
+This checks the exact public source inventory, public agent permissions,
+malformed-profile rejection, R numerical regressions, relocatable examples,
+process lifecycle, and real MCP configuration/sample-size/simulation requests.
+It also checks regression attestations, replay and canonical reports with the
+other statistical engines absent. No model API key is required.
 
-This project is a research and design-support tool. Final study decisions remain
-the responsibility of qualified domain experts.
+Each result is bound to the installed profile and executable source/runtime
+fingerprints. A missing required file, failed regression, inconsistent output,
+or failed required replay withholds the result. The runtime does not reduce its
+required checks because an engine happens to be missing.
+
+Reports retain **Partially verified** status where method-boundary checks or
+complete assessment of study assumptions still require human review. Passing
+software checks does not establish suitability for a particular study.
+
+## Public and complete installations
+
+`governance/runtime-profiles.json` selects one of two reviewed profiles:
+
+- `single-endpoint`: the public engine and one domain specialist.
+- `complete`: all five engine modules and six domain specialists.
+
+The public exporter selects `single-endpoint` and projects its agent registry
+and native coordinator permissions. Editing an environment variable cannot
+change the installed profile. The complete working source keeps the `complete`
+profile and its full `make release-check` gate, including its separate reviewed
+R package-tree attestation. Public CI is not that complete-installation gate.
+
+For release preparation and the explicit file boundary, see
+[PUBLIC-RELEASE.md](docs/PUBLIC-RELEASE.md) and [PUBLISHING.md](docs/PUBLISHING.md).
 
 ## License
 
-Except where otherwise noted, the files distributed in this public repository
-are licensed under the [Mozilla Public License 2.0](LICENSE) (`MPL-2.0`).
-Copyright 2026 Veronica Liu.
+The agent/harness source is under [MPL 2.0](LICENSE), except where otherwise
+noted. The explicitly distributed `vera-experiment-designing` R module carries
+its existing [GNU GPL version 3 license](vera-experiment-designing/LICENSE.txt).
+See [LICENSES.md](LICENSES.md) for the file boundaries and third-party notices.
 
-This license applies only to files actually distributed in this public
-repository. Proprietary statistical skill packages, private datasets,
-credentials, private generated analysis artifacts not present in this
-repository, and trademarks are not included in this distribution or licensed
-by it. Third-party dependencies remain subject to their own license terms.
+Only distributed files are included in this release. Proprietary skill
+instructions, other engines, private datasets, generated analysis artifacts,
+credentials and trademarks are outside its scope.

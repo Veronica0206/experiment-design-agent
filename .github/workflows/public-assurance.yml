@@ -29,7 +29,19 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: mcp-server/package-lock.json
-      - name: Validate the public source-review distribution
+      - name: Install Python for the locked harness
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install public R dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends r-base r-cran-jsonlite
+      - name: Install locked Python dependencies
+        run: |
+          "$pythonLocation/bin/python" -I -E -s -S -B -m venv agent-harness/.venv
+          agent-harness/.venv/bin/python -I -E -s -B -m pip install --no-compile --require-hashes -r agent-harness/requirements.lock
+      - name: Validate the runnable public single-endpoint edition
         run: make public-check
 
   node-boundaries:
@@ -76,30 +88,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Verify schema, gate, report, audit, and artifact contracts
         run: |
-          "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_gates.py
-          "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_verification.py
+          "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_response_budget.py
           "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_audit.py
           "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_artifact_download.py
           "$pythonLocation/bin/python" -I -E -s -S -B agent-harness/tests/test_mcp_client.py --public-only
-
-  governance-hooks:
-    name: Governance and hooks
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Check out reviewed source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - name: Install current Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.14"
-      - name: Verify governance and enforcement hooks
-        run: |
-          "$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_enforce_verification.py
-          "$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_coordinator_verification.py
-          "$pythonLocation/bin/python" -I -E -s -S -B hooks/tests/test_verification_ledger.py
 
   supply-chain:
     name: Dependencies and credential patterns

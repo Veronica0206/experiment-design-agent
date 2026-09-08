@@ -1350,6 +1350,17 @@ v = check_factorial(
 )
 check("factorial_malformed_factor_value_fails_closed", not v.passed, str(v))
 
+metadata_factorial = full_factorial_fixture([2, 2], center_points=0)
+for index, row in enumerate(metadata_factorial["design"], start=1):
+    row["RUN"] = index
+    row["Std_Order"] = index
+v = check_factorial(
+    metadata_factorial, full_factorial_request(metadata_factorial),
+)
+check("factorial_shared_metadata_columns_are_not_factors", v.passed
+      and v.checks.get("factor_columns_match_n_factors") is True
+      and v.checks.get("factor_matrix_numeric_and_rectangular") is True, str(v))
+
 for single_levels in (2, 3):
     single_factor = full_factorial_fixture(
         [single_levels], center_points=2,
@@ -1652,19 +1663,287 @@ check("fractional_run_count_must_match_fraction",
       and v.checks.get("fractional_run_count_matches_fraction") is False, str(v))
 
 # ── check_rsm ──────────────────────────────────────────────────────
-ccd = {"type": "central_composite", "n_factors": 2, "alpha": 1.4142,
-       "n_factorial": 4, "n_axial": 4, "n_center": 5, "n_runs": 13,
-       "design": [{"A": 0, "B": 0}] * 13}
-v = check_rsm(ccd, {})
-check("ccd_counts_pass", v.passed, str(v))
-v = check_rsm(dict(ccd, n_runs=12), {})
+
+
+def ccd_fixture(n_factors=2, fraction=0, centers=None,
+                alpha_type="rotatable", alpha=None):
+    centers = n_factors if centers is None else centers
+    n_factorial = 2 ** (n_factors - fraction)
+    if fraction == 0:
+        factorial_vectors = list(product((-1, 1), repeat=n_factors))
+    elif n_factors == 3 and fraction == 1:
+        factorial_vectors = [
+            (left, right, left * right)
+            for left, right in product((-1, 1), repeat=2)
+        ]
+    else:
+        raise AssertionError("test fixture supports only full CCD or 3-factor half fraction")
+    alpha = (
+        1 if alpha_type == "face" else n_factorial ** 0.25
+    ) if alpha is None else alpha
+    names = [chr(ord("A") + index) for index in range(n_factors)]
+
+    def row(vector, point_type):
+        return {**dict(zip(names, vector)), "point_type": point_type}
+
+    factorial_rows = [row(vector, "factorial") for vector in factorial_vectors]
+    axial_rows = []
+    for index in range(n_factors):
+        for sign in (-1, 1):
+            vector = [0] * n_factors
+            vector[index] = sign * alpha
+            axial_rows.append(row(vector, "axial"))
+    center_rows = [row([0] * n_factors, "center") for _ in range(centers)]
+    design = factorial_rows + axial_rows + center_rows
+    rank = {"factorial": 0, "axial": 1, "edge": 2, "center": 3}
+    design.sort(key=lambda item: (
+        rank[item["point_type"]], *(item[name] for name in names),
+    ))
+    for index, design_row in enumerate(design, start=1):
+        design_row["std_order"] = index
+        design_row["run"] = index
+    return {
+        "type": "central_composite", "n_factors": n_factors,
+        "alpha": alpha, "alpha_type": alpha_type,
+        "n_factorial": n_factorial, "n_axial": 2 * n_factors,
+        "n_center": centers, "n_runs": len(design), "design": design,
+    }
+
+
+def bbd_fixture(n_factors=3, centers=None):
+    centers = n_factors if centers is None else centers
+    names = [chr(ord("A") + index) for index in range(n_factors)]
+    design = []
+    for left in range(n_factors):
+        for right in range(left + 1, n_factors):
+            for left_sign, right_sign in product((-1, 1), repeat=2):
+                vector = [0] * n_factors
+                vector[left] = left_sign
+                vector[right] = right_sign
+                design.append({
+                    **dict(zip(names, vector)), "point_type": "edge",
+                })
+    design.extend({
+        **dict(zip(names, [0] * n_factors)), "point_type": "center",
+    } for _ in range(centers))
+    rank = {"factorial": 0, "axial": 1, "edge": 2, "center": 3}
+    design.sort(key=lambda item: (
+        rank[item["point_type"]], *(item[name] for name in names),
+    ))
+    for index, design_row in enumerate(design, start=1):
+        design_row["std_order"] = index
+        design_row["run"] = index
+    n_edge = 4 * (n_factors * (n_factors - 1) // 2)
+    return {
+        "type": "box_behnken", "n_factors": n_factors,
+        "n_edge": n_edge, "n_center": centers,
+        "n_runs": len(design), "design": design,
+    }
+
+
+ccd_args = {"n_factors": 2}
+ccd = ccd_fixture()
+v = check_rsm(ccd, ccd_args)
+check("ccd_geometry_and_effective_defaults_pass", v.passed, str(v))
+
+fractional_ccd_args = {
+    "n_factors": 3, "fraction": 1, "center_points": 1,
+    "alpha": "face", "randomize": True, "seed": 7,
+}
+fractional_ccd = ccd_fixture(
+    n_factors=3, fraction=1, centers=1, alpha_type="face",
+)
+random.Random(7).shuffle(fractional_ccd["design"])
+for index, design_row in enumerate(fractional_ccd["design"], start=1):
+    design_row["run"] = index
+fractional_ccd["seed"] = 7
+v = check_rsm(fractional_ccd, fractional_ccd_args)
+check("fractional_randomized_ccd_request_binding_passes", v.passed, str(v))
+
+v = check_rsm(dict(ccd, n_runs=12), ccd_args)
 check("ccd_count_mismatch_fails", not v.passed, str(v))
-v = check_rsm(dict(ccd, n_axial=3, n_runs=12), {})
-check("ccd_axial_not_2k_fails", not v.passed, str(v))
-v = check_rsm({"type": "box_behnken", "n_edge": 12, "n_center": 3,
-               "n_runs": 15, "design": [{"A": 0, "B": 0, "C": 0}] * 15}, {})
-check("bbd_counts_pass", v.passed, str(v))
-check("rsm_empty_fails", not check_rsm({}, {}).passed)
+v = check_rsm(dict(ccd, n_factors=3), ccd_args)
+check("ccd_result_n_factors_must_match_request", not v.passed, str(v))
+v = check_rsm(dict(ccd, type="box_behnken"), ccd_args)
+check("ccd_type_must_match_request", not v.passed, str(v))
+v = check_rsm(dict(ccd, alpha_type="face", alpha=1), ccd_args)
+check("ccd_alpha_mode_and_value_must_match_request", not v.passed, str(v))
+v = check_rsm(ccd, {**ccd_args, "center_points": 3})
+check("ccd_center_count_must_match_request", not v.passed
+      and v.checks.get("ccd_declared_counts_match_request") is False, str(v))
+v = check_rsm(fractional_ccd, {**fractional_ccd_args, "seed": 8})
+check("ccd_seed_echo_must_match_randomized_request", not v.passed, str(v))
+unexpected_seed_ccd = dict(ccd, seed=42)
+v = check_rsm(unexpected_seed_ccd, ccd_args)
+check("ccd_nonrandomized_result_must_not_claim_seed", not v.passed
+      and v.checks.get("rsm_randomization_seed_matches_request") is False, str(v))
+v = check_rsm(ccd, {**ccd_args, "seed": 7})
+check("ccd_request_cannot_supply_inert_seed", not v.passed
+      and v.checks.get("rsm_seed_requires_randomization") is False, str(v))
+missing_order_ccd = ccd_fixture()
+for row in missing_order_ccd["design"]:
+    row.pop("run")
+    row.pop("std_order")
+v = check_rsm(missing_order_ccd, ccd_args)
+check("ccd_missing_run_order_metadata_fails_closed", not v.passed
+      and v.checks.get("rsm_run_order_metadata_complete") is False, str(v))
+unshuffled_randomized_ccd = {
+    **fractional_ccd,
+    "design": sorted(
+        (dict(row) for row in fractional_ccd["design"]),
+        key=lambda row: row["std_order"],
+    ),
+}
+for index, row in enumerate(unshuffled_randomized_ccd["design"], start=1):
+    row["run"] = index
+v = check_rsm(unshuffled_randomized_ccd, fractional_ccd_args)
+check("ccd_randomize_true_requires_nonstandard_run_order", not v.passed
+      and v.checks.get("rsm_randomization_state_matches_request") is False,
+      str(v))
+forged_order_ccd = ccd_fixture()
+forged_order_ccd["seed"] = 7
+forged_order_ccd["design"][0]["std_order"] = 2
+forged_order_ccd["design"][1]["std_order"] = 1
+v = check_rsm(
+    forged_order_ccd,
+    {"n_factors": 2, "randomize": True, "seed": 7},
+)
+check("ccd_forged_nonidentity_std_order_cannot_claim_randomization",
+      not v.passed
+      and v.checks.get("rsm_std_order_matches_canonical_rows") is False,
+      str(v))
+v = check_rsm(fractional_ccd, {**fractional_ccd_args, "fraction": 0})
+check("ccd_fraction_must_match_factorial_core", not v.passed, str(v))
+irregular_fraction = {
+    **fractional_ccd,
+    "design": [dict(row) for row in fractional_ccd["design"]],
+}
+first_factorial = next(
+    row for row in irregular_fraction["design"]
+    if row["point_type"] == "factorial"
+)
+first_factorial["A"] = first_factorial["B"] = first_factorial["C"] = -1
+v = check_rsm(irregular_fraction, fractional_ccd_args)
+check("ccd_fractional_core_must_be_regular", not v.passed
+      and v.checks.get("ccd_factorial_core_geometry") is False, str(v))
+
+resolution_two_ccd = ccd_fixture(
+    n_factors=3, fraction=1, centers=1, alpha_type="face",
+)
+resolution_two_vectors = [
+    (-1, -1, -1), (-1, -1, 1), (1, 1, -1), (1, 1, 1),
+]
+for row, vector in zip(
+    (row for row in resolution_two_ccd["design"]
+     if row["point_type"] == "factorial"),
+    resolution_two_vectors,
+):
+    row["A"], row["B"], row["C"] = vector
+v = check_rsm(
+    resolution_two_ccd,
+    {"n_factors": 3, "fraction": 1, "center_points": 1, "alpha": "face"},
+)
+check("ccd_resolution_two_fraction_fails_main_effect_estimability", not v.passed
+      and v.checks.get("ccd_factorial_core_geometry") is True
+      and v.checks.get("ccd_factorial_main_effects_estimable") is False,
+      str(v))
+
+all_zero_ccd = ccd_fixture()
+for row in all_zero_ccd["design"]:
+    row["A"] = row["B"] = 0
+v = check_rsm(all_zero_ccd, ccd_args)
+check("all_zero_ccd_fails_geometry", not v.passed
+      and v.checks.get("ccd_factorial_core_geometry") is False
+      and v.checks.get("ccd_axial_geometry") is False, str(v))
+
+wrong_labels = ccd_fixture()
+wrong_labels["design"][0]["point_type"] = "center"
+v = check_rsm(wrong_labels, ccd_args)
+check("ccd_actual_point_type_counts_must_match", not v.passed
+      and v.checks.get("ccd_point_type_counts_match") is False, str(v))
+
+non_object_design = dict(ccd, design=[*ccd["design"][:-1], "not-a-row"])
+v = check_rsm(non_object_design, ccd_args)
+check("rsm_non_object_row_fails_closed", not v.passed
+      and v.checks.get("rsm_design_rows_are_objects") is False, str(v))
+missing_column = ccd_fixture()
+del missing_column["design"][0]["B"]
+v = check_rsm(missing_column, ccd_args)
+check("rsm_missing_factor_column_fails_closed", not v.passed
+      and v.checks.get("rsm_factor_matrix_numeric_and_rectangular") is False, str(v))
+nonnumeric_column = ccd_fixture()
+nonnumeric_column["design"][0]["B"] = "zero"
+v = check_rsm(nonnumeric_column, ccd_args)
+check("rsm_nonnumeric_factor_column_fails_closed", not v.passed
+      and v.checks.get("rsm_factor_matrix_numeric_and_rectangular") is False, str(v))
+nonfinite_column = ccd_fixture()
+nonfinite_column["design"][0]["B"] = float("nan")
+v = check_rsm(nonfinite_column, ccd_args)
+check("rsm_nonfinite_factor_column_fails_closed", not v.passed
+      and v.checks.get("rsm_factor_matrix_numeric_and_rectangular") is False, str(v))
+
+metadata_ccd = ccd_fixture()
+for index, row in enumerate(metadata_ccd["design"], start=1):
+    row["RUN"] = row.pop("run")
+    row["Std_Order"] = row.pop("std_order")
+    row["Point_Type"] = row.pop("point_type").upper()
+v = check_rsm(metadata_ccd, ccd_args)
+check("rsm_metadata_columns_are_casefolded_not_factors", v.passed
+      and v.checks.get("rsm_factor_columns_match_result") is True, str(v))
+
+reverse_column_ccd = ccd_fixture()
+reverse_column_ccd["design"] = [
+    {
+        "B": row["B"], "A": row["A"],
+        "point_type": row["point_type"],
+        "std_order": row["std_order"], "run": row["run"],
+    }
+    for row in reverse_column_ccd["design"]
+]
+v = check_rsm(reverse_column_ccd, ccd_args)
+check("rsm_factor_insertion_order_does_not_change_public_standard_order",
+      v.passed, str(v))
+
+insertion_bound_ccd = ccd_fixture()
+insertion_bound_ccd["design"] = [
+    {
+        "B": row["B"], "A": row["A"],
+        "point_type": row["point_type"],
+    }
+    for row in insertion_bound_ccd["design"]
+]
+rank = {"factorial": 0, "axial": 1, "edge": 2, "center": 3}
+insertion_bound_ccd["design"].sort(key=lambda row: (
+    rank[row["point_type"]], row["B"], row["A"],
+))
+for index, row in enumerate(insertion_bound_ccd["design"], start=1):
+    row["std_order"] = index
+    row["run"] = index
+v = check_rsm(insertion_bound_ccd, ccd_args)
+check("rsm_std_order_cannot_bind_private_factor_insertion_order",
+      not v.passed
+      and v.checks.get("rsm_std_order_matches_canonical_rows") is False,
+      str(v))
+
+bbd_args = {"n_factors": 3, "design": "bbd"}
+bbd = bbd_fixture()
+v = check_rsm(bbd, bbd_args)
+check("bbd_geometry_and_effective_defaults_pass", v.passed, str(v))
+
+all_zero_bbd = bbd_fixture()
+for row in all_zero_bbd["design"]:
+    row["A"] = row["B"] = row["C"] = 0
+v = check_rsm(all_zero_bbd, bbd_args)
+check("all_zero_bbd_fails_geometry", not v.passed
+      and v.checks.get("bbd_edge_geometry") is False, str(v))
+
+v = check_rsm(bbd, {**bbd_args, "alpha": "face"})
+check("bbd_rejects_inert_alpha_setting", not v.passed
+      and v.checks.get("bbd_inapplicable_parameters_absent") is False, str(v))
+v = check_rsm(bbd_fixture(2), {"n_factors": 2, "design": "bbd"})
+check("bbd_requires_three_to_five_factors", not v.passed
+      and v.checks.get("bbd_n_factors_supported") is False, str(v))
+check("rsm_empty_fails", not check_rsm({}, ccd_args).passed)
 
 # ── design_checks_for mapping ──────────────────────────────────────
 vs = design_checks_for("sample_size", {"endpoint_type": "binary",
