@@ -11,15 +11,28 @@ results come from R; the language model requests inputs and invokes tools.
 A separate complete installation adds other statistical domains. Its private
 engines and proprietary skill instructions are excluded from the public edition.
 
-## Public capabilities
+## Statistical code available now
 
-| Capability | Public edition |
-|---|---|
-| Validate study assumptions and resolve supported configuration | Included |
-| Single-arm and controlled single-endpoint sample size | Included |
-| Frequentist/Bayesian operating characteristics and supported PPOS | Included |
-| Reproducible worked examples, R regression tests and agent verification | Included |
-| Master protocols, DOE/A/B tools, randomization, indirect comparison, meta-analysis | Separate complete installation |
+**The single-endpoint study-design section (`vera-experiment-designing`) is
+currently the only statistical module with R implementation code included in
+this public repository.** Its selected [R core](vera-experiment-designing/scripts/R/)
+can run directly or through the agent.
+
+| Section / module | Statistical code in this public repository |
+| --- | --- |
+| Single-endpoint study design — [vera-experiment-designing](vera-experiment-designing/README.md) | **Available now:** selected R core, worked examples, and regression tests |
+| Master protocols — `vera-master-experiment-designing` | Not included; separate complete installation |
+| DOE / A/B testing — `vera-doe-designing` | Not included; separate complete installation |
+| Indirect comparison — `vera-indirect-comparing` | Not included; separate complete installation |
+| Meta-analysis — `vera-meta-analyzing` | Not included; separate complete installation |
+| Randomization | Not included; separate complete installation |
+
+The available module supports **binary, continuous, time-to-event, and
+incidence-rate endpoints**, with single-arm and controlled designs. It includes
+configuration validation, sample-size calculation, frequentist and Bayesian
+analysis, operating-characteristic simulation, and supported PPOS calculations.
+The [supported-calculations table](vera-experiment-designing/README.md#supported-calculations)
+describes the implemented models and their restrictions.
 
 The public MCP server advertises exactly `validate_config`, `sample_size`,
 `simulate_design`, and `run_tests`. It refuses unsupported tool names. Its
@@ -42,7 +55,7 @@ Rscript --vanilla vera-experiment-designing/scripts/tests/run_tests.R
 Rscript --vanilla vera-experiment-designing/scripts/tests/public_packaging.R
 ```
 
-The [worked examples](vera-experiment-designing/README.md#examples) use the same
+The [worked examples](vera-experiment-designing/README.md#examples-and-template) use the same
 six-file engine as the agent. The quick demonstration mode reduces simulation
 budgets and is not a study-planning recommendation.
 

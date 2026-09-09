@@ -1,8 +1,8 @@
 {
   "authorization": {
-    "approved_at": "2026-09-09T00:30:30.532409+00:00",
+    "approved_at": "2026-09-09T01:39:10.410878+00:00",
     "approved_by": "Veronica0206 (explicit publication request in this task)",
-    "purpose": "Publish the two verified statistical follow-up fixes, regression coverage, and Hono advisory patch discovered during release validation, preserving existing public repository history and the exact selected-engine boundary."
+    "purpose": "Publish the requested README clarification identifying currently available public statistical code, supported endpoints, and excluded sections, preserving repository history and the existing selected-engine boundary."
   },
   "files": {
     ".claude/agents/design-verifier.md": "97effe403ff5a09ec90c118c70c9dc885f32f7b239da9362c5e71ce6571f4129",
@@ -18,7 +18,7 @@
     "LICENSE": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
     "LICENSES.md": "bfb55963e9bc9ae1051d4f355d59c26acf4ef45f6e13d94a4d23a7aad5a89ec2",
     "Makefile": "bd287bb422e4ca9be6a33b65f62ae5321a3f3cd8b6268095bb00946c365b03bf",
-    "README.md": "192731dd1358ebc60aee065f2f5897d3ed9e510faf48e3cf6e8b5fd178875e84",
+    "README.md": "dfad7499a12306f6f92d1061d825a0b48a3b6ad5d7b0c9cb9a6af82e8bc2f188",
     "agent-harness/artifact_download.py": "4b147e91481dbe25feffe45047df3275af3e5451a24f9a7b04c6f928a4dc0676",
     "agent-harness/audit.py": "c399a26562135b8e4fa4bdcf3ce9f1b9748e4d34c02044c0cf33cb98fd780c6c",
     "agent-harness/final_report.py": "29a6d17b19ef16545327165cf02b46729e64d11784ff1c5d6cfbb7630ff84c12",
@@ -102,7 +102,7 @@
     "mcp-server/tests/response-budget-server.mjs": "9c48252804155a22b318562e78f2ffd27458fba47e5787dc897c22173c7d9f12",
     "mcp-server/tests/server-shutdown-helper.mjs": "a4b97367922da589ef16c1314c51639e0621e55b2f11f3300a087b784b956818",
     "mcp-server/tsconfig.json": "0de7830748f6529e32d6cee419e432962d9a554e5d0f994302475aa4b9fa08ed",
-    "release-inventory.json": "8f650cc94f8f7e75bc687b954e212e8ee80fd4c59fa4d3a609a3582a85c41ef9",
+    "release-inventory.json": "f749f0b328f7a059d3dd72fdf619012e418cf0e66dd42ff2fe0f235085a43ff1",
     "renv.lock": "3a12ed4fb6cb980c81d4f0befa9078019a437cd7bd799cd3e49322b693d169c2",
     "tools/audit_dependency_advisories.py": "9eca33e67172d8a5f0bf8428bd1ffe88525776a7fda955714e3bd3081b410026",
     "tools/bootstrap.sh": "51041092826fe135218247e50aa661e2b0e21b367737a328cecbf2016036cbdf",
@@ -132,7 +132,7 @@
     "tools/validate_r_lock.R": "4464d5afa5988ccd7a663a777e238d608b5ecd9e98b944ac4bc6147e3bcfaa7c",
     "tools/validate_skills.py": "060892b1c26f043a17caa87bcce5113a176eae233af6f89a1ca3a7ff112e58fc",
     "vera-experiment-designing/LICENSE.txt": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
-    "vera-experiment-designing/README.md": "7a34393cb25b7e551419d4ec15f7678221e08a8836fa07d15ad4e1b9ce450444",
+    "vera-experiment-designing/README.md": "1a02c4e59e7dc3759770081e95b34c971c871b91978735a6ae0eaa717f226fde",
     "vera-experiment-designing/examples/analysis-template.R": "0085826af35c738baafe11a90b93d1927d3167c92d90a3d3abc97db0f891dcda",
     "vera-experiment-designing/examples/study-planning.R": "76d924e948460d3b8df104c8a46638d630175b89b0e8a7d3b1252717645fede2",
     "vera-experiment-designing/scripts/R/bayesian.R": "f6ba107fdcb051dc1b842808f5da22e3c41237fb24798414ebcd430dd3f3bc34",

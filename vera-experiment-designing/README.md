@@ -6,6 +6,13 @@ probability of success (PPOS). The public agent and the full installation use
 these same R source files. The R engine can also run directly without an LLM,
 an API key, or another VERA statistical module.
 
+**Availability:** this is the single-endpoint study-design section, and its
+selected R core is currently the only statistical module published in this
+repository. Binary, continuous, time-to-event, and incidence-rate endpoints are
+supported in single-arm and controlled designs, within the models listed below.
+See the [repository availability table](../README.md#statistical-code-available-now)
+for the other sections and their public-release status.
+
 ## Requirements
 
 - R. The release checks were run with R 4.5.3.
