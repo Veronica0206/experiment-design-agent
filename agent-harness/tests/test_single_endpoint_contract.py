@@ -17,7 +17,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "agent-harness"))
 from final_report import (
-    SINGLE_ENDPOINT_RESULT_CONTRACT, canonical_report, privacy_safe_view,
+    SINGLE_ENDPOINT_RESULT_CONTRACT, _select_oc_anchor, canonical_report, privacy_safe_view,
     single_endpoint_contract_errors,
 )
 from gates import GateVerdict, MANUAL_CHECKS, combined_gate, design_checks_for
@@ -127,6 +127,78 @@ check("prior_label_comes_from_resolved_result_not_an_invented_default",
       "prior" not in config and simulation["ppos"]["prior_method"] == "binary_jeffreys"
       and "Prior method: binary_jeffreys" in rendered
       and "Supplied assumptions" in rendered and "Omitted engine defaults" in rendered)
+
+# R unique() retains the exact configured anchors beside nearby sequence values.
+# Exercise their actual serialized values through the canonical report.
+anchor_arguments = {
+    "config": {
+        "endpoint_type": "binary", "study_type": "poc", "design": "single_arm",
+        "null_param": 0.15, "alt_param": 0.35, "alphas": [0.025], "powers": [0.8],
+    },
+    "n_oc": 40, "B_oc": 32, "seed": 73,
+}
+anchor_result = run_r("simulate_design", anchor_arguments)
+check("real_r_oc_preserves_exact_anchors_beside_near_duplicates",
+      all(sum(row["true_param"] == anchor for row in anchor_result["oc"]) == 1
+          and sum(math.isclose(row["true_param"], anchor, rel_tol=1e-12, abs_tol=1e-12)
+                  for row in anchor_result["oc"]) > 1
+          for anchor in (0.15, 0.35)))
+anchor_gate = combined_gate(*design_checks_for(
+    "simulate_design", anchor_arguments, anchor_result,
+), GateVerdict(passed=True, blocked=list(MANUAL_CHECKS)))
+anchor_identity = VerificationIdentity.from_call(
+    "simulate_design", anchor_arguments, anchor_result, "call-near-duplicate-anchors",
+)
+anchor_report = canonical_report(
+    "simulate_design", anchor_arguments, anchor_result,
+    envelope_from_verdict(anchor_identity, anchor_gate).to_dict(),
+)
+check("real_r_near_duplicate_anchors_reach_canonical_design_assessment",
+      anchor_gate.passed and "### Design-performance assessment" in anchor_report
+      and "Not assessed:" not in anchor_report)
+
+# Exact equality has priority; fallback chooses the nearest supported value
+# without making row order or equal-distance ties into scientific authority.
+exact = {"true_param": 0.15}
+nearby = {"true_param": math.nextafter(0.15, 1)}
+check("anchor_exact_match_wins_over_near_duplicate_in_either_order",
+      all(_select_oc_anchor(rows, 0.15) is exact
+          for rows in ([nearby, exact], [exact, nearby])))
+check("anchor_duplicate_exact_rows_are_ambiguous",
+      _select_oc_anchor([exact, dict(exact), nearby], 0.15) is None)
+nearest = {"true_param": 0.25 + 2 ** -43}
+farther = {"true_param": 0.25 - 2 ** -41}
+check("anchor_fallback_uses_unique_nearest_within_tolerance",
+      all(_select_oc_anchor(rows, 0.25) is nearest
+          for rows in ([farther, nearest], [nearest, farther])))
+tie_left = {"true_param": 0.25 - 2 ** -43}
+check("anchor_fallback_equal_distance_ties_are_ambiguous",
+      all(_select_oc_anchor(rows, 0.25) is None
+          for rows in ([tie_left, nearest], [nearest, tie_left])))
+check("anchor_fallback_rejects_values_outside_tolerance",
+      _select_oc_anchor([{"true_param": 0.250001}], 0.25) is None)
+
+# Both exact anchors must remain distinct even when they are within tolerance.
+close_anchors = [exact, nearby]
+check("distinct_nearby_assumptions_keep_their_exact_rows",
+      _select_oc_anchor(close_anchors, exact["true_param"]) is exact
+      and _select_oc_anchor(close_anchors, nearby["true_param"]) is nearby)
+for name, null, alternative in (
+    ("one_row_cannot_represent_two_distinct_assumptions", 0.25 - 2 ** -43, 0.25 + 2 ** -43),
+    ("identical_assumptions_are_not_two_anchors", 0.25, 0.25),
+):
+    changed_args = copy.deepcopy(anchor_arguments)
+    changed_args["config"].update(null_param=null, alt_param=alternative)
+    changed = copy.deepcopy(anchor_result)
+    shared = copy.deepcopy(changed["oc"][0])
+    shared["true_param"] = 0.25
+    changed["oc"] = [shared]
+    changed["workload"]["scenario_count"] = 1
+    changed["workload"]["simulated_units"] = changed["B_used"] * 40
+    changed["workload"]["posterior_evaluation_upper_bound"] = changed["B_used"]
+    changed_report = report("simulate_design", changed_args, changed)
+    check(name, "### Design-performance assessment" not in changed_report
+          and "distinct, unambiguous null and alternative OC anchors" in changed_report)
 
 for type_name, container, item in (
     ("sample_size_row", "sample_size", 0),

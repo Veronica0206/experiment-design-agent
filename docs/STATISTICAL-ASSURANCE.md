@@ -1,7 +1,8 @@
 # Statistical assurance for the public engine
 
 This document describes the statistical contracts of the public single-endpoint
-engine and the corrections tracked as R1–R7. It distinguishes reproducible
+engine, the corrections tracked as R1–R7, and their numerical/reporting
+follow-ups. It distinguishes reproducible
 calculation from the separate judgment that a proposed study is scientifically
 appropriate. The public MCP profile exposes `validate_config`, `sample_size`,
 `simulate_design`, and `run_tests`.
@@ -128,6 +129,17 @@ The status is `finite` when the analytic mean exists. The median and equal-tail
 target probability from a Beta CDF. The relation is supported by R's official
 [F distribution documentation](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/Fdist.html).
 
+The ratio CDF uses the smaller logistic boundary. For positive log-odds it
+evaluates the complementary Beta boundary with swapped shapes and reversed
+tail, avoiding a boundary that rounds to one. With both shapes `.01`, treatment
+rate `1e18`, control rate `1`, and target `1`, the probability is approximately
+`.6695997136756292`, rather than `1`. If the small boundary is below R's smallest
+positive normal double (`.Machine$double.xmin`), calculation fails explicitly;
+it does not interpret boundary underflow or reduced subnormal precision as
+certainty. A target of zero retains its exact
+support-boundary probability. The CDF's tail convention follows R's
+[Beta distribution documentation](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/Beta.html).
+
 Standalone decisions use `hr_mean`/`rr_mean` and their corresponding status,
 median, and interval fields. PPOS uses `hr_post_mean`/`rr_post_mean`,
 `hr_post_mean_status`/`rr_post_mean_status`, `hr_post_median`/`rr_post_median`,
@@ -144,6 +156,13 @@ R grids accept 1–64 values. Binary probabilities lie in `[0,1]`, hazards are
 positive, and incidence rates are nonnegative. Controlled binary/continuous
 `delta` defaults to `go_target-null_param`; an explicit value overrides it.
 Supplying `delta` where it has no defined effect is rejected.
+
+Exact deduplication can retain a grid value next to a configured anchor, such
+as `.15` and `.15000000000000002`. The readable report prefers the exact anchor
+row, then a unique nearest row within tolerance if no exact row exists. An
+ambiguous match remains unassessed. Distinct configured assumptions are not
+merged, and near-duplicate grid values do not suppress an available exact
+anchor's design-performance assessment.
 
 Outer simulation reports Go, Consider, and No-Go probabilities with Monte Carlo
 standard errors, 95% Wilson intervals, replicate counts, and a worst-case

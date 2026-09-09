@@ -1137,6 +1137,25 @@ def _report_table(headers: list[str], rows: list[list[str]]) -> str:
     ])
 
 
+def _select_oc_anchor(rows: list[dict[str, Any]], anchor: float) -> dict[str, Any] | None:
+    """Prefer a unique exact anchor, otherwise a unique nearest row in tolerance.
+
+    OC rows have already passed the scientific result contract. An exact
+    duplicate or an equal-distance tie is ambiguous regardless of row order.
+    """
+    exact = [row for row in rows if row["true_param"] == anchor]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    nearby = [row for row in rows if math.isclose(
+        row["true_param"], anchor, rel_tol=1e-12, abs_tol=1e-12,
+    )]
+    if not nearby:
+        return None
+    distance = min(abs(row["true_param"] - anchor) for row in nearby)
+    nearest = [row for row in nearby if abs(row["true_param"] - anchor) == distance]
+    return nearest[0] if len(nearest) == 1 else None
+
+
 def _single_endpoint_readable_result(
     tool: str, assumptions: dict[str, Any], result: dict[str, Any],
     envelope: dict[str, Any],
@@ -1221,16 +1240,14 @@ def _single_endpoint_readable_result(
         config = assumptions.get("config") or {}
         null = config.get("null_param")
         alternative = config.get("alt_param")
-        anchors: list[dict[str, Any]] = []
-        if _number(null) is not _DROP and _number(alternative) is not _DROP:
-            for anchor in (null, alternative):
-                found = [row for row in rows if math.isclose(
-                    row["true_param"], anchor, rel_tol=1e-12, abs_tol=1e-12,
-                )]
-                if len(found) == 1:
-                    anchors.append(found[0])
-        if len(anchors) == 2:
-            p_null, p_alt = [row["p_go"] for row in anchors]
+        row_null = row_alt = None
+        if (_number(null) is not _DROP and _number(alternative) is not _DROP
+                and null != alternative):
+            row_null = _select_oc_anchor(rows, null)
+            row_alt = _select_oc_anchor(rows, alternative)
+        if (row_null is not None and row_alt is not None
+                and row_null["true_param"] != row_alt["true_param"]):
+            p_null, p_alt = row_null["p_go"], row_alt["p_go"]
             direction_met = p_alt > p_null
             separation_met = p_alt >= 3 * p_null if p_null > 0 else p_alt > 0
             assessment = (
@@ -1254,7 +1271,10 @@ def _single_endpoint_readable_result(
                 "criteria. An unfavorable result is retained for design review.",
             ])
         else:
-            assessment = "Not assessed: the exact null and alternative OC anchors were unavailable."
+            assessment = (
+                "Not assessed: distinct, unambiguous null and alternative OC anchors "
+                "were unavailable."
+            )
         ppos = result.get("ppos")
         if ppos is not None:
             sections.extend([

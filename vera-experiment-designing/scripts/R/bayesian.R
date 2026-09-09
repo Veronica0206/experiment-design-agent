@@ -101,8 +101,27 @@ gamma_ratio_probability <- function(shape_trt, rate_trt, shape_ctrl, rate_ctrl,
       !is.numeric(target) || length(target) != 1L || !is.finite(target) || target < 0 ||
       !is.logical(lower.tail) || length(lower.tail) != 1L || is.na(lower.tail))
     stop("Gamma ratio requires positive finite shapes/rates and a nonnegative target", call. = FALSE)
-  boundary <- plogis(log(target) + log(rate_trt) - log(rate_ctrl))
-  .qdf_probability(pbeta(boundary, shape_trt, shape_ctrl, lower.tail = lower.tail), "scaled_beta_prime")
+  # A positive Gamma ratio cannot be below zero; this is a mathematical
+  # endpoint, not numerical saturation of a strictly positive target.
+  if (target == 0)
+    return(.qdf_probability(if (lower.tail) 0 else 1, "scaled_beta_prime"))
+  log_odds <- log(target) + log(rate_trt) - log(rate_ctrl)
+  # I_x(a,b) = 1 - I_(1-x)(b,a). Evaluate the smaller logistic boundary
+  # directly, with swapped shapes and the reversed tail when x is near one.
+  # Constructing x first can round it to one while the omitted Beta tail is
+  # still substantial for small shape parameters.
+  boundary <- plogis(-abs(log_odds))
+  # Reject subnormal boundaries too: their relative precision degrades near
+  # zero, and platform logistic implementations can flush them to zero early.
+  if (!is.finite(boundary) || boundary < .Machine$double.xmin)
+    stop("Gamma ratio probability boundary underflowed its supported precision",
+         call. = FALSE)
+  probability <- if (log_odds > 0) {
+    pbeta(boundary, shape_ctrl, shape_trt, lower.tail = !lower.tail)
+  } else {
+    pbeta(boundary, shape_trt, shape_ctrl, lower.tail = lower.tail)
+  }
+  .qdf_probability(probability, "scaled_beta_prime")
 }
 
 gamma_ratio_summary <- function(shape_trt, rate_trt, shape_ctrl, rate_ctrl,

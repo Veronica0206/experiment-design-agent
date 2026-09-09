@@ -72,6 +72,65 @@ test("gamma_ratio_finite_mean_matches_inverse_gamma_moment", {
   stopifnot(result$mean_status == "finite", abs(result$mean - 2.5) < 1e-12,
             abs(result$probability - pf(2 / ((3/4)*(5/2)), 6, 8)) < 1e-12)
 })
+test("gamma_ratio_saturated_boundary_preserves_both_beta_tails", {
+  # Independently high-precision checked counterexample from the follow-up
+  # review: the old logistic boundary rounded to one and falsely implied GO.
+  lower <- gamma_ratio_probability(.01, 1e18, .01, 1)$probability
+  upper <- gamma_ratio_probability(.01, 1e18, .01, 1, lower.tail = FALSE)$probability
+  stopifnot(abs(lower - .6695997136756292) < 2e-14,
+            abs(upper - .3304002863243708) < 2e-14,
+            abs(lower + upper - 1) < 2e-15,
+            classify_decision(lower)$decision == "CONSIDER")
+  # Asymmetric high-precision references also expose an incorrect shape swap
+  # that equal-shape tests would not catch.
+  asymmetric_upper <- gamma_ratio_probability(.01,1e18,.3,1,lower.tail=FALSE)$probability
+  asymmetric_lower <- gamma_ratio_probability(.01,1e-18,.3,1)$probability
+  stopifnot(abs(asymmetric_upper/1.2894346381216462e-7-1) < 1e-13,
+            abs(asymmetric_lower-.6419786530269519) < 2e-14)
+})
+test("gamma_ratio_reciprocal_small_shapes_preserve_tail_identity", {
+  for (shapes in list(c(.01, .01), c(.01, .03), c(.03, .01))) {
+    for (rate_ratio in c(1e-18, 1, 1e18)) for (target in c(.25, 1, 4)) {
+      for (lower_tail in c(TRUE, FALSE)) {
+        direct <- gamma_ratio_probability(shapes[1], rate_ratio, shapes[2], 1,
+                                            target, lower_tail)$probability
+        inverse <- gamma_ratio_probability(shapes[2], 1, shapes[1], rate_ratio,
+                                             1/target, !lower_tail)$probability
+        stopifnot(direct > 0, direct < 1, abs(direct-inverse) < 2e-14)
+      }
+    }
+  }
+})
+test("gamma_ratio_exponential_tail_has_known_closed_form", {
+  # Independent exponential-ratio survival: r_ctrl/(r_ctrl + target*r_trt).
+  # The small upper tail must survive even when its complement rounds to one.
+  expected <- 1e-18 / (1 + 1e-18)
+  upper <- gamma_ratio_probability(1, 1e18, 1, 1, lower.tail = FALSE)$probability
+  lower_inverse <- gamma_ratio_probability(1, 1, 1, 1e18)$probability
+  stopifnot(abs(upper/expected-1) < 1e-13,
+            abs(lower_inverse/expected-1) < 1e-13)
+})
+test("gamma_ratio_boundary_underflow_is_not_reported_as_certainty", {
+  for (rates in list(c(1e300,1e-300), c(1e-300,1e300), c(1e308,1e-308), c(1e-308,1e308))) {
+    for (lower_tail in c(TRUE,FALSE)) {
+      # At shapes .0001 and rates 1e308/1e-308 the correct lower probability
+      # is approximately .56612, so accepting an underflowed 0/1 is unsafe.
+      error <- tryCatch(gamma_ratio_probability(.0001,rates[1],.0001,rates[2],
+                                                lower.tail=lower_tail), error=identity)
+      stopifnot(inherits(error,"error"), grepl("boundary underflowed",conditionMessage(error)))
+    }
+  }
+  # Apply the same supported-range boundary whether plogis produces a
+  # subnormal value or flushes it to zero on the current R/platform build.
+  for (lower_tail in c(TRUE,FALSE)) {
+    stopifnot(fails(gamma_ratio_probability(.0001,exp(709),.0001,1,lower.tail=lower_tail)),
+              fails(gamma_ratio_probability(.0001,1,.0001,exp(709),lower.tail=lower_tail)))
+    supported <- gamma_ratio_probability(.0001,exp(708),.0001,1,lower.tail=lower_tail)$probability
+    stopifnot(is.finite(supported),supported>0,supported<1)
+  }
+  stopifnot(gamma_ratio_probability(.01,1e300,.01,1e-300,target=0)$probability == 0,
+            gamma_ratio_probability(.01,1e300,.01,1e-300,target=0,lower.tail=FALSE)$probability == 1)
+})
 test("gamma_ratio_summaries_are_invariant_to_exposure_units", {
   baseline <- gamma_ratio_summary(.5, 12, 2.5, 14)
   rescaled <- gamma_ratio_summary(.5, 1200, 2.5, 1400)

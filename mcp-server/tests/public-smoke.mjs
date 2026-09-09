@@ -102,6 +102,16 @@ try {
   check("public_oc_operation_budget_is_explicit", anchored.workload.scenario_count === anchored.oc.length
     && anchored.workload.simulated_units === 225 * 32 * anchored.oc.length);
 
+  const nearAnchors = await call("simulate_design", {
+    config: { ...config, null_param: 0.15, alt_param: 0.35 }, seed: 31415, B_oc: 32,
+  });
+  check("public_near_duplicate_grid_preserves_verified_exact_anchors", verified(nearAnchors)
+    && [0.15, 0.35].every(value => nearAnchors.oc.some(row => row.true_param === value))
+    && nearAnchors._verification.checks.reproducibility === true);
+  check("public_near_duplicate_grid_retains_design_assessment",
+    nearAnchors._verification.report.includes("### Design-performance assessment")
+    && !nearAnchors._verification.report.includes("Not assessed:"));
+
   const continuousConfig = { endpoint_type: "continuous", study_type: "confirmatory", design: "controlled",
     null_param: 0, alt_param: 0.4, sd: 1, alloc_ratio: 2, alphas: [0.025], powers: [0.8] };
   const continuousValidation = await call("validate_config", continuousConfig);

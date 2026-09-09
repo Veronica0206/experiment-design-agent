@@ -4,6 +4,19 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## 2026-09-08 statistical follow-up corrections
+
+- Evaluate Gamma-ratio probabilities from the smaller Beta boundary, avoiding
+  false certainty when the other boundary rounds to one. Reject boundaries
+  beyond the supported floating-point range explicitly.
+- Prefer exact configured OC anchors in readable reports, then an unambiguous
+  nearest match within tolerance. Preserve design assessments when the grid
+  also contains nearby floating-point values.
+- Add extreme-ratio tail regressions and actual R-to-report and public MCP
+  coverage for the `.15/.35` near-duplicate grid case.
+- Update the Hono override to `4.13.5` after the release audit identified
+  advisories in the previous pin; regenerate its locked artifact integrity.
+
 ## 2026-09-08 statistical review corrections
 
 - Share a versioned single-endpoint result contract across execution,
