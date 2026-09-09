@@ -639,15 +639,20 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
     setup_node_step = {
         "uses": setup_node,
         "with": {
-            "node-version": "20",
+            "node-version": "24",
             "cache": "npm",
             "cache-dependency-path": "mcp-server/package-lock.json",
         },
+    }
+    bind_node_step = {
+        "run": 'node -e \'if (process.versions.node.split(".")[0] !== "24") '
+        'process.exit(1); console.log("EXPDESIGN_NODE=" + process.execPath)\' >> "$GITHUB_ENV"',
     }
     expected_steps = {
         "public-distribution": [
             checkout_step,
             setup_node_step,
+            bind_node_step,
             {"uses": setup_python, "with": {"python-version": "3.11"}},
             {"run": "sudo apt-get update\nsudo apt-get install -y --no-install-recommends r-base r-cran-jsonlite"},
             {"run": '\n'.join([
@@ -660,6 +665,7 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
         "node-boundaries": [
             checkout_step,
             setup_node_step,
+            bind_node_step,
             {
                 "working-directory": "mcp-server",
                 "run": "npm ci --no-audit --no-fund",
@@ -692,6 +698,7 @@ def valid_public_assurance_workflow(workflow: str) -> bool:
                 "with": {"persist-credentials": False, "fetch-depth": 0},
             },
             setup_node_step,
+            bind_node_step,
             {
                 "working-directory": "mcp-server",
                 "run": "npm audit --omit=dev --audit-level=high",

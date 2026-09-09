@@ -31,6 +31,16 @@ from verification import content_hash, public_arguments_hash  # noqa: E402
 import verification_policy  # noqa: E402
 
 
+# Helper subprocesses must follow an explicit governed runtime selection even
+# when the reviewed Python launcher has replaced PATH with its fixed safe path.
+NODE_PROBE = os.environ.get("EXPDESIGN_NODE")
+if NODE_PROBE is None:
+    NODE_PROBE = shutil.which("node")
+if (not NODE_PROBE or not Path(NODE_PROBE).is_absolute()
+        or not Path(NODE_PROBE).is_file() or not os.access(NODE_PROBE, os.X_OK)):
+    raise RuntimeError("integration probes require an executable absolute Node.js path")
+
+
 passed = failed = 0
 
 
@@ -496,6 +506,14 @@ with MCPClient() as client:
           server_checks.get("artifact_integrity") is True
           and all(value is not False for value in server_checks.values()), server_checks)
     public_provenance = master.get("_provenance", {})
+    if os.environ.get("EXPDESIGN_NODE") is not None:
+        probe_version = subprocess.run(
+            [NODE_PROBE, "--version"], capture_output=True, text=True, timeout=10,
+        )
+        check("explicit_node_selection_matches_server_provenance",
+              probe_version.returncode == 0
+              and public_provenance.get("node_version") == probe_version.stdout.strip(),
+              (public_provenance.get("node_version"), probe_version.stdout.strip()))
     artifact_hashes = master.get("_private_provenance", {}).get("artifact_hashes", {})
     check("public_provenance_is_non_oracular",
           public_provenance.get("artifact_count") == len(artifact_hashes)
@@ -1330,7 +1348,7 @@ console.log(JSON.stringify({
 }));
 '''
 integrity = subprocess.run(
-    ["node", "--input-type=module", "-e", integrity_script], cwd=suite,
+    [NODE_PROBE, "--input-type=module", "-e", integrity_script], cwd=suite,
     capture_output=True, text=True,
 )
 integrity_result = json.loads(integrity.stdout) if integrity.returncode == 0 else {}
@@ -1359,7 +1377,7 @@ if hasattr(os, "mkfifo"):
           console.log(JSON.stringify({{regular: regular.length > 0, fifoRejected}}));
         '''
         safe_read = subprocess.run(
-            ["node", "--input-type=module", "-e", safe_read_script], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", safe_read_script], cwd=suite,
             capture_output=True, text=True, timeout=10,
             env=dict(
                 os.environ,
@@ -1554,13 +1572,13 @@ with tempfile.TemporaryDirectory() as directory:
             'await releaseManagedArtifactDir(p);'
         )
         proc_a = subprocess.Popen(
-            ["node", "--input-type=module", "-e", script_a], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", script_a], cwd=suite,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         assert proc_a.stdout is not None
         active_path = proc_a.stdout.readline().strip()
         proc_b = subprocess.run(
-            ["node", "--input-type=module", "-e", script_b], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", script_b], cwd=suite,
             capture_output=True, text=True,
         )
         remaining_out, remaining_err = proc_a.communicate(timeout=10)
@@ -1584,7 +1602,7 @@ with tempfile.TemporaryDirectory() as directory:
             EXPDESIGN_ARTIFACT_LOCK_WAIT_MS="150",
         )
         live_contender = subprocess.run(
-            ["node", "--input-type=module", "-e", script_b], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", script_b], cwd=suite,
             capture_output=True, text=True, env=lock_env, timeout=5,
         )
         live_owner = json.loads(owner.read_text(encoding="utf-8")) if owner.exists() else {}
@@ -1602,7 +1620,7 @@ with tempfile.TemporaryDirectory() as directory:
         os.utime(owner, (old_seconds, old_seconds))
         os.utime(lock, (old_seconds, old_seconds))
         dead_contender = subprocess.run(
-            ["node", "--input-type=module", "-e", script_b], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", script_b], cwd=suite,
             capture_output=True, text=True, env=lock_env, timeout=5,
         )
         dead_owner = json.loads(owner.read_text(encoding="utf-8")) if owner.exists() else {}
@@ -1623,7 +1641,7 @@ with tempfile.TemporaryDirectory() as directory:
             'await releaseManagedArtifactDir(a);'
         )
         handoff = subprocess.run(
-            ["node", "--input-type=module", "-e", handoff_script], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", handoff_script], cwd=suite,
             capture_output=True, text=True,
         )
         handoff_result = json.loads(handoff.stdout) if handoff.returncode == 0 else {}
@@ -1638,7 +1656,7 @@ with tempfile.TemporaryDirectory() as directory:
             'try{await access(p)}catch{exists=false}; console.log(JSON.stringify({exists}));'
         )
         aborted = subprocess.run(
-            ["node", "--input-type=module", "-e", abort_script], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", abort_script], cwd=suite,
             capture_output=True, text=True,
         )
         aborted_result = json.loads(aborted.stdout) if aborted.returncode == 0 else {}
@@ -1657,7 +1675,7 @@ with tempfile.TemporaryDirectory() as directory:
             '.filter(x=>x.isDirectory()&&!x.name.startsWith(".")).map(x=>x.name).sort()));'
         )
         custom = subprocess.run(
-            ["node", "--input-type=module", "-e", custom_script], cwd=suite,
+            [NODE_PROBE, "--input-type=module", "-e", custom_script], cwd=suite,
             capture_output=True, text=True,
         )
         custom_dirs = json.loads(custom.stdout) if custom.returncode == 0 else []

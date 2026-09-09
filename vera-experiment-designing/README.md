@@ -1,10 +1,12 @@
 # VERA experiment-designing: public R engine
 
-This module provides executable single-endpoint study planning, Bayesian and
-frequentist summaries, operating-characteristic simulation, and predictive
-probability of success (PPOS). The public agent and the full installation use
-these same R source files. The R engine can also run directly without an LLM,
-an API key, or another VERA statistical module.
+This module provides single-endpoint configuration validation, sample-size
+calculations, operating-characteristic simulation for Bayesian GO / CONSIDER /
+NO-GO decision rules, and supported predictive probability of success (PPOS)
+calculations. The direct R API also provides Bayesian posterior summaries and
+frequentist sensitivity analyses. The public agent and the full installation
+use these same R source files. The R engine can also run directly without an
+LLM, an API key, or another VERA statistical module.
 
 **Availability:** this is the single-endpoint study-design section, and its
 selected R core is currently the only statistical module published in this
@@ -27,16 +29,16 @@ for the other sections and their public-release status.
 From the repository root, check the installation and run a small synthetic example:
 
 ```sh
-Rscript vera-experiment-designing/scripts/R/validate_framework.R
+Rscript --vanilla vera-experiment-designing/scripts/R/validate_framework.R
 QDF_EXAMPLE_QUICK=1 QDF_OUTPUT_DIR=/tmp/vera-study-example \
-  Rscript vera-experiment-designing/examples/study-planning.R
+  Rscript --vanilla vera-experiment-designing/examples/study-planning.R
 ```
 
 The second command runs single-arm, controlled 1:1, and controlled 2:1 binary
 examples. Each scenario calls the shared engine and saves CSV tables and PDF
 plots in a separate output folder. The scripts resolve modules relative to
 their own location, so they can also be invoked by absolute path from another
-working directory.
+working directory. Quick mode is for demonstration, not final study planning.
 
 ## Supported calculations
 
@@ -52,8 +54,11 @@ the study stage as `signal_detection`, `poc`, or `confirmatory`. Alpha values ar
 one-sided. The configuration validates endpoint-specific parameters, treatment:control
 allocation ratios of at least 1, prior parameters, decision thresholds, and PPOS inputs.
 
-Operating characteristics estimate decision probabilities across specified true
-parameter values. PPOS integrates future-study conditional power over posterior
+`compute_oc()`, used by the public `simulate_design` tool, estimates the
+repeated-sampling frequencies of Bayesian GO / CONSIDER / NO-GO decisions across
+specified true parameter values. These decisions use the configured posterior
+probability thresholds. Frequentist sensitivity tests are separate direct R
+analyses. PPOS integrates future-study conditional power over posterior
 uncertainty from the supplied earlier-study summaries. It is a model-based
 assurance calculation, not a claim that a study will succeed. Monte Carlo
 diagnostics accompany the main simulation estimates; quick-mode budgets are
@@ -68,6 +73,15 @@ approximations. Configuration validation does not replace choosing an appropriat
 model and assumptions for a real study.
 
 ## Use the R API
+
+The direct R API exposes the engine's analysis functions. The public agent
+exposes four [MCP tools](../mcp-server/README.md): `validate_config`,
+`sample_size`, `simulate_design`, and `run_tests`.
+
+Results released through the governed MCP/agent path are bound to the installed
+profile and executable source/runtime fingerprints. Direct R calls use the same
+statistical implementation, but do not automatically receive the MCP/agent
+verification and canonical-reporting guarantees.
 
 From the repository root:
 
@@ -121,7 +135,7 @@ For example:
 
 ```sh
 QDF_EXAMPLE_QUICK=1 QDF_OUTPUT_DIR=/tmp/vera-worked-examples \
-  Rscript vera-experiment-designing/scripts/R/examples.R
+  Rscript --vanilla vera-experiment-designing/scripts/R/examples.R
 ```
 
 The template finds `scripts/R` relative to its installed location. If you copy
@@ -137,17 +151,29 @@ files instead of maintaining separate statistical implementations.
 Run from the repository root:
 
 ```sh
-Rscript vera-experiment-designing/scripts/tests/run_tests.R
-Rscript vera-experiment-designing/scripts/tests/public_packaging.R
+Rscript --vanilla vera-experiment-designing/scripts/tests/run_tests.R
+Rscript --vanilla vera-experiment-designing/scripts/tests/test_planning_consistency.R
+Rscript --vanilla vera-experiment-designing/scripts/tests/test_posterior_contract.R
+Rscript --vanilla vera-experiment-designing/scripts/tests/public_packaging.R
 ```
 
-The first command runs 31 regression checks, including one against the public
-agent dispatcher. Keep the module in the repository layout for that suite.
-The second checks an isolated copy containing only the public core and examples:
-execution from another directory, all example scenarios, a relocated template,
-CSV reproducibility, and explicit PPOS simulation budgets. It needs only R.
+| Suite | What it checks |
+| --- | --- |
+| `run_tests.R` | The 31-check endpoint regression suite, including the public agent dispatcher. Keep the module in the repository layout for this suite. |
+| `test_planning_consistency.R` | Agreement between sizing, fixed-N power and PPOS analysis methods; numerical conditional-power calculations; arm-size minima and achieved power after rounding. |
+| `test_posterior_contract.R` | Objective-prior behavior, posterior probabilities and ratio summaries, numerical tail boundaries, and reproducible Bayesian OC decisions. |
+| `public_packaging.R` | An isolated copy containing only the public core and examples: execution from another directory, all example scenarios, a relocated template, CSV reproducibility, and explicit PPOS simulation budgets. This suite needs only R. |
+
 The optional `Exact` integration is exercised when that package is installed;
-the suite also tests missing-package and calculation-failure reporting.
+the endpoint regression suite also tests missing-package and calculation-failure
+reporting.
+
+For the broader public-installation check, including Python, Node, R, packaging,
+and MCP boundaries, run from the repository root:
+
+```sh
+make public-check
+```
 
 ## License
 

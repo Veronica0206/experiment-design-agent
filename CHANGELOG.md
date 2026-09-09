@@ -4,6 +4,16 @@ Engine (R) history lives in each skill's `docs/changelog.md`. This file covers
 the cross-cutting components: `agent-harness/`, `hooks/`, `.claude/agents/`,
 `mcp-server/`, and suite-level tooling.
 
+## 2026-09-08 README onboarding and Node runtime
+
+- Identify Bayesian GO / CONSIDER / NO-GO rules as the subject of public OC
+  simulation, and separate direct R analyses from governed MCP verification.
+- Put a runnable example, platform-specific R prerequisites, all four R test
+  suites, explicit Python selection, and workspace-trust guidance in the README.
+- Move public Node CI to supported Node.js 24 LTS and bind its absolute
+  executable for governed launchers. Validate the runtime binding as part of
+  the CI policy; integration helper probes respect the same selection.
+
 ## 2026-09-08 statistical follow-up corrections
 
 - Evaluate Gamma-ratio probabilities from the smaller Beta boundary, avoiding

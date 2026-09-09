@@ -438,6 +438,25 @@ checks = {
     }, "experiment-designer"),
 }
 
+# Installing a supported Node version is insufficient if governed subprocesses
+# silently select a different absolute interpreter. Protect both steps per job.
+for job_name in ("public-distribution", "node-boundaries", "supply-chain"):
+    for mutation in ("legacy_node20", "missing_runtime_binding", "ambient_runtime_binding"):
+        changed_workflow = module.yaml.safe_load(public_workflow)
+        steps = changed_workflow["jobs"][job_name]["steps"]
+        if mutation == "legacy_node20":
+            node_step = next(step for step in steps if step.get("uses", "").startswith("actions/setup-node@"))
+            node_step["with"]["node-version"] = "20"
+        else:
+            binding = next(step for step in steps if step.get("name") == "Bind governed Node.js runtime")
+            if mutation == "missing_runtime_binding":
+                steps.remove(binding)
+            else:
+                binding["run"] = 'echo "EXPDESIGN_NODE=node" >> "$GITHUB_ENV"'
+        checks[f"public_{job_name}_{mutation}_rejected"] = (
+            not module.valid_public_assurance_workflow(module.yaml.safe_dump(changed_workflow))
+        )
+
 bootstrap_text = (MODULE_PATH.parents[1] / "tools" / "bootstrap.sh").read_text(
     encoding="utf-8"
 )

@@ -13,7 +13,10 @@ complete-installation tools.
 ## Build and installation prerequisites
 
 Build the MCP interface after installing the dependencies documented in the
-root README. The selected profile must have all its required engine files;
+root README, which recommends the tested Node.js 24 LTS target. Keep its
+`EXPDESIGN_NODE` binding so the governed launchers use the Node installation
+selected for setup, including installations outside their fixed search paths.
+The selected profile must have all its required engine files;
 a successful compilation alone does not verify an analysis.
 
 ```bash
@@ -69,8 +72,8 @@ approved specialist set and combines only verified canonical reports. The
 legacy **experiment-designer** remains available as a compatibility surface,
 restricted to the installed profile's tools. `design-verifier` is an optional fresh re-execution surface governed
 by the same engine and fail-closed policy; it is not an independent methodology
-audit. Accept the workspace-trust prompt for the suite folder before the first
-run: agent-scoped frontmatter hooks (the verification ledger and the Stop gate)
+audit. Review the repository before accepting its workspace-trust prompt.
+Agent-scoped frontmatter hooks (the verification ledger and the Stop gate)
 do not execute from an untrusted folder, and an allowing hook leaves no trace in
 the transcript. `hooks/README.md` describes how to confirm that the hooks fired.
 

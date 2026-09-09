@@ -23,12 +23,15 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Install Node.js 20
+      - name: Install Node.js 24
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: mcp-server/package-lock.json
+      - name: Bind governed Node.js runtime
+        run: |
+          node -e 'if (process.versions.node.split(".")[0] !== "24") process.exit(1); console.log("EXPDESIGN_NODE=" + process.execPath)' >> "$GITHUB_ENV"
       - name: Install Python for the locked harness
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -54,12 +57,15 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Install Node.js 20
+      - name: Install Node.js 24
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: mcp-server/package-lock.json
+      - name: Bind governed Node.js runtime
+        run: |
+          node -e 'if (process.versions.node.split(".")[0] !== "24") process.exit(1); console.log("EXPDESIGN_NODE=" + process.execPath)' >> "$GITHUB_ENV"
       - name: Install locked Node dependencies
         working-directory: mcp-server
         run: npm ci --no-audit --no-fund
@@ -104,12 +110,15 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install Node.js 20
+      - name: Install Node.js 24
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: mcp-server/package-lock.json
+      - name: Bind governed Node.js runtime
+        run: |
+          node -e 'if (process.versions.node.split(".")[0] !== "24") process.exit(1); console.log("EXPDESIGN_NODE=" + process.execPath)' >> "$GITHUB_ENV"
       - name: Audit production dependencies
         working-directory: mcp-server
         run: npm audit --omit=dev --audit-level=high
